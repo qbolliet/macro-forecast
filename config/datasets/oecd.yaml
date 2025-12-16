@@ -1,0 +1,578 @@
+# Configuration des requêtes OECD
+# Ce fichier définit les paramètres pour chaque dataflow à interroger
+
+# Configuration globale
+global:
+  agency: "OECD"
+  version: "1.0"
+  sdmx_version: "v1"  # v1 ou v2
+
+# Liste des pays communs
+countries_groups:
+  oecd_full: &oecd_full
+    - AUS
+    - AUT
+    - BEL
+    - CAN
+    - CHL
+    - COL
+    - CZE
+    - DNK
+    - EST
+    - FIN
+    - FRA
+    - DEU
+    - GRC
+    - HUN
+    - ISL
+    - IRL
+    - ISR
+    - ITA
+    - JPN
+    - KOR
+    - LVA
+    - LTU
+    - LUX
+    - MEX
+    - NLD
+    - NZL
+    - NOR
+    - POL
+    - PRT
+    - SVK
+    - SVN
+    - ESP
+    - SWE
+    - CHE
+    - TUR
+    - GBR
+    - USA
+  
+  aggregates: &aggregates
+    - G-7
+    - OECDE
+    - G-20
+    - OECD
+    - NMEC
+    - EA19
+  
+  emerging: &emerging
+    - ARG
+    - BRA
+    - CHN
+    - IND
+    - IDN
+    - RUS
+    - SAU
+    - ZAF
+
+# Définition des requêtes par dataflow
+dataflows:
+  
+  # Key Short-term Economic Indicators (KEI)
+  kei:
+    dataflow: "KEI"
+    description: "Key Short-term Economic Indicators"
+    
+    # Définition des dimensions (ordre important)
+    dimensions:
+      # 0: Indicateurs
+      - name: "INDICATOR"
+        position: 0
+        values:
+          - PRINTO01      # Industrial Production
+          - SLRTTO01      # Retail trade (Volume)
+          - SLRTCR03      # Passenger Car Registration
+          - ODCNPI03      # Permit Issued for Dwellings
+          - LRHUTTTT      # Monthly Unemployment Rate (All Persons)
+          - LCEAMN01      # Hourly Earning : Manufacturing
+          - CPALTT01      # Consumer Prices
+          - MABMM301      # Broad Money
+          - IRSTCI01      # Overnight Interbank Rate
+          - IR3TIB01      # 3 Month Interbank Rate
+          - IRLTLT01      # Long-term Interest Rate
+          - CCUSMA02      # Exchange rates, National currency per US dollar
+          - XTEXVA01      # Exports in goods
+          - XTIMVA01      # Imports in goods
+          - B6BLTT02      # Current account as % of GDP
+          - LFEMTTTT      # Labour Force Survey - Employment
+          - NAEXKP06      # Exports of goods and services
+          - NAEXKP03      # Government Final Consumption Expenditure
+          - NAEXKP01      # Gross Domestic Product - Final
+          - NAEXKP04      # Gross Fixed Capital Formation
+          - NAEXKP07      # Imports of goods and services
+          - NAEXKP02      # Private Final Consumption Expenditure
+          - SPASTT01      # Share Prices
+          - ULQEUL01      # Unit Labour Costs
+      
+      # 1: Pays
+      - name: "LOCATION"
+        position: 1
+        values:
+          - *oecd_full
+          - *aggregates
+          - *emerging
+      
+      # 2: Fréquence et ajustement
+      - name: "FREQUENCY"
+        position: 2
+        values:
+          - "ST.M"
+          - "Q"
+    
+    # Filtres temporels
+    time_filter:
+      start_period: null  # null = depuis le début
+      end_period: null    # null = jusqu'à maintenant
+  
+  # Main Economic Indicators Cyclical Indicators (MEI_CLI)
+  mei_cli:
+    dataflow: "MEI_CLI"
+    description: "Main Economic Indicators Cyclical Indicators"
+    
+    dimensions:
+      # 0: Indicateurs
+      - name: "INDICATOR"
+        position: 0
+        values:
+          - LOLITOAA      # Leading Indicator
+          - LORSGPRT      # GDP Ratio to trend
+      
+      # 1: Pays
+      - name: "LOCATION"
+        position: 1
+        values:
+          - AUS
+          - AUT
+          - BEL
+          - CAN
+          - CHL
+          - CZE
+          - DNK
+          - EST
+          - FIN
+          - FRA
+          - DEU
+          - GRC
+          - HUN
+          - ISL
+          - IRL
+          - ISR
+          - ITA
+          - JPN
+          - KOR
+          - LUX
+          - MEX
+          - NLD
+          - NZL
+          - NOR
+          - POL
+          - PRT
+          - SVK
+          - SVN
+          - ESP
+          - SWE
+          - CHE
+          - TUR
+          - GBR
+          - USA
+          - EA19
+          - G-7
+          - OECDE
+          - OECD
+          - BRA
+          - CHN
+          - IND
+          - IDN
+          - RUS
+          - ZAF
+      
+      # 2: Fréquence
+      - name: "FREQUENCY"
+        position: 2
+        values:
+          - "M"
+    
+    time_filter:
+      start_period: null
+      end_period: null
+  
+  # Monthly Financial Indicators (MEI_FIN)
+  mei_fin:
+    dataflow: "MEI_FIN"
+    description: "Monthly Financial Indicators"
+    
+    dimensions:
+      # 0: Indicateurs
+      - name: "INDICATOR"
+        position: 0
+        values:
+          - MANM          # Narrow Money
+          - SP            # Share Prices
+          - CCRETT01      # Relative consumer Prices
+          - CCRETT02      # Relative unit labor cost
+          - IR3TIB        # Short term interest rates
+      
+      # 1: Pays
+      - name: "LOCATION"
+        position: 1
+        values:
+          - AUS
+          - AUT
+          - BEL
+          - CAN
+          - CHL
+          - COL
+          - CZE
+          - DNK
+          - EST
+          - FIN
+          - FRA
+          - DEU
+          - GRC
+          - HUN
+          - ISL
+          - IRL
+          - ISR
+          - ITA
+          - JPN
+          - KOR
+          - LVA
+          - LUX
+          - MEX
+          - NLD
+          - NZL
+          - NOR
+          - POL
+          - PRT
+          - SVK
+          - SVN
+          - ESP
+          - SWE
+          - CHE
+          - TUR
+          - GBR
+          - USA
+          - EA19
+          - NMEC
+          - BRA
+          - CHN
+          - CRI
+          - IND
+          - IDN
+          - RUS
+          - ZAF
+      
+      # 2: Fréquence
+      - name: "FREQUENCY"
+        position: 2
+        values:
+          - "M"
+          - "Q"
+    
+    time_filter:
+      start_period: null
+      end_period: null
+  
+  # Business Tendency and Consumer Opinion Surveys (MEI_BTS_COS)
+  mei_bts_cos:
+    dataflow: "MEI_BTS_COS"
+    description: "Business Tendency and Consumer Opinion Surveys"
+    
+    dimensions:
+      # 0: Indicateurs
+      - name: "INDICATOR"
+        position: 0
+        values:
+          # Manufacturing
+          - BSPRTE        # Production > Tendency
+          - BSPRFT        # Production > Future Tendency
+          - BSFGLV        # Finished goods stocks > Level
+          - BSOBLV        # Order books > Level
+          - BSXRLV        # Export orders books > Level
+          - BSSPFT        # Selling prices > Future tendency
+          - BSEMFT        # Employment > Future Tendency
+          - BSCI          # Confidence indicators
+          - BSCURT        # Capacity Utilisation > Rate
+          # Construction
+          - BCBUTE        # Business situation > Tendency
+          - BCCI          # Confidence indicators
+          - BCOBLV        # Order books > Level
+          - BCEMFT        # Employment > Future tendency
+          - BCSPFT        # Selling Prices > Future tendency
+          # Retail trade
+          - BRBUTE        # Business situation > Tendency
+          - BRBUFT        # Business situation > Future Tendency
+          - BRCI          # Confidence indicators
+          - BRVSLV        # Volume of stocks > Level
+          - BREMFT        # Employment > Future tendency
+          - BRODFT        # Order intentions > Future tendency
+          # Services
+          - BVBUTE        # Business situation > Tendency
+          - BVCI          # Confidence indicators
+          - BVDETE        # Demand evolution > Tendency
+          - BVDEFT        # Demand evolution > Future tendency
+          - BVEMTE        # Employment > Tendency
+          - BVEMFT        # Employment > Future tendency
+          # Consumer
+          - CSESFT        # Economic situation > Future tendency
+          - CSINFT        # Prices > Future tendency
+          - CSCI          # Confidence indicators
+          - CSCICP02      # Confidence indicators (alt code)
+      
+      # 1: Pays
+      - name: "LOCATION"
+        position: 1
+        values:
+          - AUS
+          - AUT
+          - BEL
+          - CHL
+          - COL
+          - CZE
+          - DNK
+          - EST
+          - FIN
+          - FRA
+          - DEU
+          - GRC
+          - HUN
+          - IRL
+          - ISR
+          - ITA
+          - JPN
+          - KOR
+          - LVA
+          - LTU
+          - LUX
+          - MEX
+          - NLD
+          - NZL
+          - NOR
+          - POL
+          - PRT
+          - SVK
+          - SVN
+          - ESP
+          - SWE
+          - CHE
+          - TUR
+          - GBR
+          - USA
+          - EA19
+          - NMEC
+          - BRA
+          - CHN
+          - CRI
+          - IND
+          - IDN
+          - RUS
+          - ZAF
+      
+      # 2: Fréquence et ajustement
+      - name: "FREQUENCY"
+        position: 2
+        values:
+          - "BLSA.Q"
+          - "M"
+    
+    time_filter:
+      start_period: null
+      end_period: null
+  
+  # Producer Price Indices (MEI_PRICES_PPI)
+  mei_prices_ppi:
+    dataflow: "MEI_PRICES_PPI"
+    description: "Producer Price Indices"
+    
+    dimensions:
+      # 0: Indicateurs
+      - name: "INDICATOR"
+        position: 0
+        values:
+          - PIEATI01      # Industrial activities > Total
+          - PIEAFD01      # Manufacture of food products > Total
+          - PIEAMP01      # Manufacturing > Total
+          - PIEAMI01      # Mining and quarrying > Total
+          - PITGCG01      # Consumer goods > Total
+          - PITGCD01      # Durable consumer goods > Total
+          - PITGIG01      # Intermediate goods > Total
+          - PITGVG01      # Investment goods > Total
+          - PITGND01      # Non durable consumer goods > Total
+      
+      # 1: Pays
+      - name: "LOCATION"
+        position: 1
+        values:
+          - *oecd_full
+          - EA19
+          - EU27_2020
+          - G-7
+          - OECDE
+          - OECD
+          - NMEC
+          - BRA
+          - CHN
+          - CRI
+          - IND
+          - RUS
+          - ZAF
+      
+      # 2: Fréquence et type
+      - name: "FREQUENCY"
+        position: 2
+        values:
+          - "IXOB.Q"
+          - "M"
+    
+    time_filter:
+      start_period: null
+      end_period: null
+  
+  # Main Economic Indicators (MEI) - National Accounts
+  mei:
+    dataflow: "MEI"
+    description: "Main Economic Indicators - National Accounts"
+    
+    dimensions:
+      # Note: ordre différent pour cette base!
+      # 0: Pays
+      - name: "LOCATION"
+        position: 0
+        values:
+          - AUS
+          - AUT
+          - BEL
+          - CAN
+          - CHL
+          - CZE
+          - DNK
+          - EST
+          - FIN
+          - FRA
+          - DEU
+          - GRC
+          - HUN
+          - ISL
+          - IRL
+          - ISR
+          - ITA
+          - JPN
+          - KOR
+          - LVA
+          - LUX
+          - MEX
+          - NLD
+          - NZL
+          - NOR
+          - POL
+          - PRT
+          - SVK
+          - SVN
+          - ESP
+          - SWE
+          - CHE
+          - TUR
+          - GBR
+          - USA
+          - EA19
+          - OECD
+      
+      # 1: Indicateurs
+      - name: "INDICATOR"
+        position: 1
+        values:
+          - NAEXKP01      # GDP - Final
+          - NAEXKP02      # Private Final Consumption
+          - NAEXKP03      # Government Final Consumption
+          - NAEXKP04      # Gross Fixed Capital Formation
+          - NAEXKP05      # Changes in inventories
+          - NAEXKP06      # Exports of goods and services
+          - NAEXKP07      # Imports of goods and services
+          - LRHUTTTT      # Monthly unemployment rate
+      
+      # 2: Fréquence et ajustement
+      - name: "FREQUENCY"
+        position: 2
+        values:
+          - "STSA.Q"
+          - "M"
+    
+    time_filter:
+      start_period: null
+      end_period: null
+  
+  # Consumer Price Index (PRICES_CPI)
+  prices_cpi:
+    dataflow: "PRICES_CPI"
+    description: "Consumer Price Index"
+    
+    dimensions:
+      # 0: Pays
+      - name: "LOCATION"
+        position: 0
+        values:
+          - *oecd_full
+          - *aggregates
+          - *emerging
+          - ARG
+          - CRI
+          - SAU
+      
+      # 1: Indicateurs
+      - name: "INDICATOR"
+        position: 1
+        values:
+          - CPHPTT01      # Harmonised Prices > All items
+          - CPHPEN01      # Harmonised Prices > Energy
+          - CPHPLA01      # All items less food, energy, tobacco
+          - CPHPSE01      # Harmonised Prices > Services
+      
+      # 2: Fréquence et type
+      - name: "FREQUENCY"
+        position: 2
+        values:
+          - "IXOB.Q"
+          - "M"
+    
+    time_filter:
+      start_period: null
+      end_period: null
+  
+  # Analytical House Price Indicators (HOUSE_PRICES)
+  house_prices:
+    dataflow: "HOUSE_PRICES"
+    description: "Analytical House Price Indicators"
+    
+    dimensions:
+      # 0: Pays
+      - name: "LOCATION"
+        position: 0
+        values:
+          - *oecd_full
+          - EA
+          - OECD
+          - BRA
+          - BGR
+          - CHN
+          - CRI
+          - IND
+          - IDN
+          - ROU
+          - RUS
+          - SAU
+          - ZAF
+      
+      # 1: Indicateurs
+      - name: "INDICATOR"
+        position: 1
+        values:
+          - RHP           # Real House Prices
+          - HPI           # House Price Index
+          - RPI           # Rent Prices
+          - HPI_RPI       # Price to rent ratio
+          - HPI_YDH       # Price to income ratio
+    
+    time_filter:
+      start_period: null
+      end_period: null
