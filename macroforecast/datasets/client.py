@@ -71,6 +71,7 @@ class APIClient:
         Returns:
             Configured requests Session object
         """
+        # Création d'une session request
         session = requests.Session()
         
         # Configuration de la stratégie de retry
@@ -81,12 +82,16 @@ class APIClient:
             allowed_methods=["HEAD", "GET", "OPTIONS"],
         )
         
+        # Initialisation de l'adapter avec la stratégie de retry
         adapter = HTTPAdapter(max_retries=retry_strategy)
+
+        # Ajout de l'adapter à la session
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         
         return session
     
+    # Méthode de requête "GET"
     def get(
         self,
         endpoint: str,
@@ -106,6 +111,7 @@ class APIClient:
         Raises:
             requests.exceptions.RequestException: On request failure
         """
+        # Construction de l'URL de requête
         url = urljoin(self.base_url + "/", endpoint.lstrip("/"))
         
         # Fusion des headers
@@ -113,8 +119,10 @@ class APIClient:
         if headers:
             request_headers.update(headers)
         
+        # Logging
         logger.debug(f"GET request to {url} with params: {params}")
         
+        # Exécusion de la requête
         try:
             response = self.session.get(
                 url,
@@ -133,14 +141,17 @@ class APIClient:
             logger.error(f"Request failed: {e}")
             raise
     
+    # Méthode de fermeture de la session
     def close(self):
         """Close the session and clean up resources."""
         self.session.close()
     
+    # Entrée dans le client
     def __enter__(self):
         """Context manager entry."""
         return self
     
+    # Sortie du client
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
         self.close()
