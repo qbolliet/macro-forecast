@@ -12,8 +12,8 @@ import json
 import pandas as pd
 
 # Utilitaires internes au package pour la requête de données au format SDMX
-from .api_client import APIClient
-from .sdmx_url_builder import (
+from .client import APIClient
+from .sdmx import (
     SDMXURLBuilder,
     SDMXDataQuery,
     SDMXVersion,
