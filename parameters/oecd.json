@@ -1,0 +1,136 @@
+{
+  "RATE_LIMIT" : 60,
+  "STRUCTURES": [
+    {
+      "agency": "OECD.SDD.STES",
+      "dataflow": "DSD_KEI@DF_KEI",
+      "num_dimensions": 7,
+      "description": "Key Short-term Economic Indicators",
+      "dimensions": [
+        {"name": "REF_AREA", "position": 0, "description": "Reference area (country)"},
+        {"name": "FREQ", "position": 1, "description": "Frequency"},
+        {"name": "MEASURE", "position": 2, "description": "Measure/Indicator"},
+        {"name": "UNIT_MEASURE", "position": 3, "description": "Unit of measure"},
+        {"name": "ACTIVITY", "position": 4, "description": "Activity"},
+        {"name": "ADJUSTMENT", "position": 5, "description": "Seasonal adjustment"},
+        {"name": "TRANSFORMATION", "position": 6, "description": "Transformation"}
+      ]
+    },
+    {
+      "agency": "OECD.SDD.NAD",
+      "dataflow": "DSD_NAMAIN1@DF_QNA_EXPENDITURE_NATIO_CURR",
+      "num_dimensions": 13,
+      "description": "Quarterly National Accounts - Expenditure - National Currency",
+      "dimensions": [
+        {"name": "FREQ", "position": 0, "description": "Frequency"},
+        {"name": "ADJUSTMENT", "position": 1, "description": "Seasonal adjustment"},
+        {"name": "REF_AREA", "position": 2, "description": "Reference area (country)"},
+        {"name": "SECTOR", "position": 3, "description": "Institutional sector"},
+        {"name": "COUNTERPART_SECTOR", "position": 4, "description": "Counterpart sector"},
+        {"name": "TRANSACTION", "position": 5, "description": "Transaction"},
+        {"name": "INSTR_ASSET", "position": 6, "description": "Instrument and assets"},
+        {"name": "ACTIVITY", "position": 7, "description": "Activity"},
+        {"name": "EXPENDITURE", "position": 8, "description": "Expenditure"},
+        {"name": "UNIT_MEASURE", "position": 9, "description": "Unit of measure"},
+        {"name": "PRICE_BASE", "position": 10, "description": "Price base"},
+        {"name": "TRANSFORMATION", "position": 11, "description": "Transformation"},
+        {"name": "TABLE_IDENTIFIER", "position": 12, "description": "Table identifier"}
+      ]
+    },
+    {
+      "agency": "OECD.SDD.STES",
+      "dataflow": "DSD_STES@DF_CLI",
+      "num_dimensions": 8,
+      "description": "Composite Leading Indicators",
+      "dimensions": [
+        {"name": "REF_AREA", "position": 0, "description": "Reference area (country)"},
+        {"name": "FREQ", "position": 1, "description": "Frequency"},
+        {"name": "MEASURE", "position": 2, "description": "Measure/Indicator"},
+        {"name": "UNIT_MEASURE", "position": 3, "description": "Unit of measure"},
+        {"name": "ACTIVITY", "position": 4, "description": "Activity"},
+        {"name": "ADJUSTMENT", "position": 5, "description": "Seasonal adjustment"},
+        {"name": "ASSESSMENT", "position": 6, "description": "Assessment"},
+        {"name": "TRANSFORMATION", "position": 7, "description": "Transformation"}
+      ]
+    },
+    {
+      "agency": "OECD.SDD.TPS",
+      "dataflow": "DSD_PRICES@DF_PRICES_HICP",
+      "num_dimensions": 6,
+      "description": "Harmonised Index of Consumer Prices",
+      "dimensions": [
+        {"name": "FREQ", "position": 0, "description": "Frequency"},
+        {"name": "REF_AREA", "position": 1, "description": "Reference area (country)"},
+        {"name": "MEASURE", "position": 2, "description": "Measure"},
+        {"name": "COICOP", "position": 3, "description": "Classification of individual consumption by purpose"},
+        {"name": "UNIT_MEASURE", "position": 4, "description": "Unit of measure"},
+        {"name": "TRANSFORMATION", "position": 5, "description": "Transformation"}
+      ]
+    },
+    {
+      "agency": "OECD.SDD.TPS",
+      "dataflow": "DSD_PRICES@DF_PRICES_PPI",
+      "num_dimensions": 7,
+      "description": "Producer Price Index",
+      "dimensions": [
+        {"name": "FREQ", "position": 0, "description": "Frequency"},
+        {"name": "REF_AREA", "position": 1, "description": "Reference area (country)"},
+        {"name": "MEASURE", "position": 2, "description": "Measure"},
+        {"name": "ACTIVITY", "position": 3, "description": "Activity"},
+        {"name": "MIG", "position": 4, "description": "Main industrial groupings"},
+        {"name": "UNIT_MEASURE", "position": 5, "description": "Unit of measure"},
+        {"name": "TRANSFORMATION", "position": 6, "description": "Transformation"}
+      ]
+    },
+    {
+      "agency": "OECD.SDD.NAD",
+      "dataflow": "DSD_NAAG@DF_NAAG_I",
+      "num_dimensions": 12,
+      "description": "National Accounts - Annual Growth rates",
+      "dimensions": [
+        {"name": "FREQ", "position": 0, "description": "Frequency"},
+        {"name": "REF_AREA", "position": 1, "description": "Reference area (country)"},
+        {"name": "SECTOR", "position": 2, "description": "Institutional sector"},
+        {"name": "COUNTERPART_SECTOR", "position": 3, "description": "Counterpart sector"},
+        {"name": "TRANSACTION", "position": 4, "description": "Transaction"},
+        {"name": "INSTR_ASSET", "position": 5, "description": "Instrument and assets"},
+        {"name": "ACTIVITY", "position": 6, "description": "Activity"},
+        {"name": "EXPENDITURE", "position": 7, "description": "Expenditure"},
+        {"name": "UNIT_MEASURE", "position": 8, "description": "Unit of measure"},
+        {"name": "PRICE_BASE", "position": 9, "description": "Price base"},
+        {"name": "TRANSFORMATION", "position": 10, "description": "Transformation"},
+        {"name": "TABLE_IDENTIFIER", "position": 11, "description": "Table identifier"}
+      ]
+    },
+    {
+      "agency": "OECD.SDD.STES",
+      "dataflow": "DSD_BTS@DF_BCI",
+      "num_dimensions": 7,
+      "description": "Business Confidence Indicators",
+      "dimensions": [
+        {"name": "REF_AREA", "position": 0, "description": "Reference area (country)"},
+        {"name": "FREQ", "position": 1, "description": "Frequency"},
+        {"name": "MEASURE", "position": 2, "description": "Measure/Indicator"},
+        {"name": "UNIT_MEASURE", "position": 3, "description": "Unit of measure"},
+        {"name": "ACTIVITY", "position": 4, "description": "Activity/Sector"},
+        {"name": "ADJUSTMENT", "position": 5, "description": "Seasonal adjustment"},
+        {"name": "TRANSFORMATION", "position": 6, "description": "Transformation"}
+      ]
+    },
+    {
+      "agency": "OECD.SDD.STES",
+      "dataflow": "DSD_BTS@DF_CCI",
+      "num_dimensions": 7,
+      "description": "Consumer Confidence Indicators",
+      "dimensions": [
+        {"name": "REF_AREA", "position": 0, "description": "Reference area (country)"},
+        {"name": "FREQ", "position": 1, "description": "Frequency"},
+        {"name": "MEASURE", "position": 2, "description": "Measure/Indicator"},
+        {"name": "UNIT_MEASURE", "position": 3, "description": "Unit of measure"},
+        {"name": "ACTIVITY", "position": 4, "description": "Activity"},
+        {"name": "ADJUSTMENT", "position": 5, "description": "Seasonal adjustment"},
+        {"name": "TRANSFORMATION", "position": 6, "description": "Transformation"}
+      ]
+    }
+  ]
+}
