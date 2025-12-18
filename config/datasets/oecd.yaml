@@ -55,6 +55,15 @@ countries_groups:
     - OECD
     - NMEC
     - EA19
+
+  g7: &g7
+    - CAN
+    - FRA
+    - DEU
+    - ITA
+    - JPN
+    - GBR
+    - USA
   
   emerging: &emerging
     - ARG
@@ -109,9 +118,7 @@ dataflows:
       - name: "LOCATION"
         position: 1
         values:
-          - *oecd_full
-          - *aggregates
-          - *emerging
+          - *g7
       
       # 2: Fréquence et ajustement
       - name: "FREQUENCY"
@@ -142,50 +149,7 @@ dataflows:
       - name: "LOCATION"
         position: 1
         values:
-          - AUS
-          - AUT
-          - BEL
-          - CAN
-          - CHL
-          - CZE
-          - DNK
-          - EST
-          - FIN
-          - FRA
-          - DEU
-          - GRC
-          - HUN
-          - ISL
-          - IRL
-          - ISR
-          - ITA
-          - JPN
-          - KOR
-          - LUX
-          - MEX
-          - NLD
-          - NZL
-          - NOR
-          - POL
-          - PRT
-          - SVK
-          - SVN
-          - ESP
-          - SWE
-          - CHE
-          - TUR
-          - GBR
-          - USA
-          - EA19
-          - G-7
-          - OECDE
-          - OECD
-          - BRA
-          - CHN
-          - IND
-          - IDN
-          - RUS
-          - ZAF
+          - *g7
       
       # 2: Fréquence
       - name: "FREQUENCY"
@@ -217,51 +181,7 @@ dataflows:
       - name: "LOCATION"
         position: 1
         values:
-          - AUS
-          - AUT
-          - BEL
-          - CAN
-          - CHL
-          - COL
-          - CZE
-          - DNK
-          - EST
-          - FIN
-          - FRA
-          - DEU
-          - GRC
-          - HUN
-          - ISL
-          - IRL
-          - ISR
-          - ITA
-          - JPN
-          - KOR
-          - LVA
-          - LUX
-          - MEX
-          - NLD
-          - NZL
-          - NOR
-          - POL
-          - PRT
-          - SVK
-          - SVN
-          - ESP
-          - SWE
-          - CHE
-          - TUR
-          - GBR
-          - USA
-          - EA19
-          - NMEC
-          - BRA
-          - CHN
-          - CRI
-          - IND
-          - IDN
-          - RUS
-          - ZAF
+          - *g7
       
       # 2: Fréquence
       - name: "FREQUENCY"
@@ -324,51 +244,8 @@ dataflows:
       - name: "LOCATION"
         position: 1
         values:
-          - AUS
-          - AUT
-          - BEL
-          - CHL
-          - COL
-          - CZE
-          - DNK
-          - EST
-          - FIN
-          - FRA
-          - DEU
-          - GRC
-          - HUN
-          - IRL
-          - ISR
-          - ITA
-          - JPN
-          - KOR
-          - LVA
-          - LTU
-          - LUX
-          - MEX
-          - NLD
-          - NZL
-          - NOR
-          - POL
-          - PRT
-          - SVK
-          - SVN
-          - ESP
-          - SWE
-          - CHE
-          - TUR
-          - GBR
-          - USA
-          - EA19
-          - NMEC
-          - BRA
-          - CHN
-          - CRI
-          - IND
-          - IDN
-          - RUS
-          - ZAF
-      
+          - *g7
+          
       # 2: Fréquence et ajustement
       - name: "FREQUENCY"
         position: 2
@@ -404,19 +281,7 @@ dataflows:
       - name: "LOCATION"
         position: 1
         values:
-          - *oecd_full
-          - EA19
-          - EU27_2020
-          - G-7
-          - OECDE
-          - OECD
-          - NMEC
-          - BRA
-          - CHN
-          - CRI
-          - IND
-          - RUS
-          - ZAF
+          - *g7
       
       # 2: Fréquence et type
       - name: "FREQUENCY"
@@ -440,43 +305,7 @@ dataflows:
       - name: "LOCATION"
         position: 0
         values:
-          - AUS
-          - AUT
-          - BEL
-          - CAN
-          - CHL
-          - CZE
-          - DNK
-          - EST
-          - FIN
-          - FRA
-          - DEU
-          - GRC
-          - HUN
-          - ISL
-          - IRL
-          - ISR
-          - ITA
-          - JPN
-          - KOR
-          - LVA
-          - LUX
-          - MEX
-          - NLD
-          - NZL
-          - NOR
-          - POL
-          - PRT
-          - SVK
-          - SVN
-          - ESP
-          - SWE
-          - CHE
-          - TUR
-          - GBR
-          - USA
-          - EA19
-          - OECD
+          - *g7
       
       # 1: Indicateurs
       - name: "INDICATOR"
@@ -512,12 +341,7 @@ dataflows:
       - name: "LOCATION"
         position: 0
         values:
-          - *oecd_full
-          - *aggregates
-          - *emerging
-          - ARG
-          - CRI
-          - SAU
+          - *g7
       
       # 1: Indicateurs
       - name: "INDICATOR"
@@ -549,19 +373,7 @@ dataflows:
       - name: "LOCATION"
         position: 0
         values:
-          - *oecd_full
-          - EA
-          - OECD
-          - BRA
-          - BGR
-          - CHN
-          - CRI
-          - IND
-          - IDN
-          - ROU
-          - RUS
-          - SAU
-          - ZAF
+          - *g7
       
       # 1: Indicateurs
       - name: "INDICATOR"
