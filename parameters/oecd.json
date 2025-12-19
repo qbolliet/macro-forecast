@@ -1,5 +1,9 @@
 {
-  "RATE_LIMIT" : 60,
+  "RATE_LIMIT": {
+    "requests": 60,
+    "unit": "hours",
+    "count": 1
+  },
   "STRUCTURES": [
     {
       "agency": "OECD.SDD.STES",
