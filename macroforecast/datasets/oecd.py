@@ -83,8 +83,8 @@ class OECDClient:
     # Méthode de requête des données
     def get_data(
         self,
-        agency: str = "OECD",
-        dataflow: str = None,
+        agency: str,
+        dataflow: str,
         version: str = "+",
         dimensions: Optional[Dict[Union[int, str], Union[str, List[str]]]] = None,
         start_period: Optional[str] = None,
@@ -197,9 +197,9 @@ class OECDClient:
         }
         
         # Logging
-        logger.info(f"Récupération des données depuis {dataflow}")
+        logger.info(f"Fetching data from {dataflow}")
         logger.debug(f"Endpoint: {endpoint}")
-        logger.debug(f"Paramètres: {params}")
+        logger.debug(f"Parameters: {params}")
         
         # Exécution de la requête
         response = self.api_client.get(endpoint, params=params, headers=headers)
@@ -210,7 +210,7 @@ class OECDClient:
         elif format in (ResponseFormat.CSV, ResponseFormat.CSV_LABELS):
             df = self._parse_csv_response(response.text)
         else:
-            raise NotImplementedError(f"Format {format} non encore implémenté")
+            raise NotImplementedError(f"Format {format} not yet implemented")
         
         # Vérification des doublons si des wildcards sont utilisés
         if wildcard_positions and on_duplicate != "ignore":
@@ -246,7 +246,7 @@ class OECDClient:
         if self.auto_fetch_structure:
             try:
                 # Logging
-                logger.info(f"Récupération de la structure pour {agency}::{dataflow}")
+                logger.info(f"Fetching structure for {agency}::{dataflow}")
                 # Récupération de la structure par appel API
                 structure = self.get_structure(agency, dataflow)
                 # Enregistrement de la structure
@@ -255,7 +255,7 @@ class OECDClient:
             except Exception as e:
                 # Logging
                 logger.warning(
-                    f"Impossible de récupérer la structure pour {agency}::{dataflow}: {e}"
+                    f"Failed to fetch structure for {agency}::{dataflow}: {e}"
                 )
         
         return None
@@ -388,9 +388,9 @@ class OECDClient:
             # Construction du message
             dup_df = df[duplicates].head(10)
             message = (
-                f"Trouvé {num_duplicates} lignes dupliquées pour les colonnes {check_columns}. "
-                f"Cela peut indiquer que des valeurs non désirées sont incluses via les wildcards (*). "
-                f"Exemples:\n{dup_df.to_string()}"
+                f"Found {num_duplicates} duplicate rows for columns {check_columns}. "
+                f"This may indicate that undesired values are included via wildcards (*). "
+                f"Examples:\n{dup_df.to_string()}"
             )
             # Cas d'erreur
             if on_duplicate == "raise":
@@ -419,7 +419,7 @@ class OECDClient:
             
             # Cas où les données sont vides
             if not dataSets:
-                logger.warning("Aucun dataset trouvé dans la réponse")
+                logger.warning("No datasets found in response")
                 return pd.DataFrame()
             
             # Extraction des dimensions et de leurs valeurs
@@ -494,8 +494,8 @@ class OECDClient:
     # Méthode d'extraction de la structure des métadonnées associées à un flux
     def get_structure(
         self,
-        agency: str = "OECD",
-        dataflow: str = None,
+        agency: str,
+        dataflow: str,
         version: str = "+",
     ) -> DataflowStructure:
         """Retrieve dataflow structure metadata.
@@ -611,8 +611,8 @@ class OECDClient:
             
         except Exception as e:
             # Logging
-            logger.error(f"Erreur lors du parsing de la structure: {e}")
-            raise ValueError(f"Impossible de parser la structure: {e}")
+            logger.error(f"Error parsing structure: {e}")
+            raise ValueError(f"Unable to parse structure: {e}")
     
     # Méthode d'enregistrement de la structure d'un dataflow
     def register_structure(self, structure: DataflowStructure) -> None:

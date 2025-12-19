@@ -237,7 +237,7 @@ class DataflowStructureRegistry:
         # Conversion en chemin
         path = Path(path)
         # Logging
-        logger.info(f"Chargement des structures depuis {path}")
+        logger.info(f"Loading structures from {path}")
         
         # Chargement du fichier json
         with open(path, "r", encoding="utf-8") as f:
@@ -252,7 +252,7 @@ class DataflowStructureRegistry:
             self.register(structure)
         
         # Logging
-        logger.info(f"Chargement de {len(structures_data)} structures")
+        logger.info(f"Loaded {len(structures_data)} structures")
     
     # Méthode de sauvegarde de structures sous la forme d'un fichier json
     def save_to_file(self, path: Union[str, Path]) -> None:
@@ -277,7 +277,7 @@ class DataflowStructureRegistry:
             json.dump(data, f, indent=2, ensure_ascii=False)
         
         # Logging
-        logger.info(f"Sauvegarde de {len(self._structures)} structures vers {path}")
+        logger.info(f"Saved {len(self._structures)} structures to {path}")
     
     # Méthode d'enregistrement des structures
     def register(self, structure: DataflowStructure) -> None:
@@ -291,7 +291,7 @@ class DataflowStructureRegistry:
         # Enregistrement de la structure
         self._structures[key] = structure
         # Logging
-        logger.debug(f"Structure enregistrée: {key}")
+        logger.debug(f"Structure registered: {key}")
     
     # Méthode d'extraction de la structure assciée à un dataflow spécifique
     def get(
@@ -384,9 +384,9 @@ class DataflowStructureRegistry:
                 # Cas où il n'y a pas de structure
                 if structure is None:
                     raise ValueError(
-                        f"Structure non trouvée pour {agency}::{dataflow}. "
-                        f"Impossible de résoudre le nom de dimension '{key}'. "
-                        f"Utilisez des positions numériques ou enregistrez la structure."
+                        f"Structure not found for {agency}::{dataflow}. "
+                        f"Unable to resolve dimension name '{key}'. "
+                        f"Use numeric positions or register the structure."
                     )
                 # Extraction de la position associée à la clé
                 position = structure.get_position(key)
@@ -395,8 +395,8 @@ class DataflowStructureRegistry:
                     # Liste des dimensions disponibles pour le message d'erreur
                     available = [dim.name for dim in structure.dimensions]
                     raise ValueError(
-                        f"Dimension '{key}' non trouvée dans {agency}::{dataflow}. "
-                        f"Dimensions disponibles: {available}"
+                        f"Dimension '{key}' not found in {agency}::{dataflow}. "
+                        f"Available dimensions: {available}"
                     )
                 
                 # Ajout au résultat
@@ -497,6 +497,6 @@ def create_structure_from_api_response(
         
     except Exception as e:
         # Logging
-        logger.error(f"Erreur lors du parsing de la structure: {e}")
-        raise ValueError(f"Impossible de parser la structure: {e}")
+        logger.error(f"Error parsing structure: {e}")
+        raise ValueError(f"Unable to parse structure: {e}")
 
