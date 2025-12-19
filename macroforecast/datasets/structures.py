@@ -496,31 +496,7 @@ def create_structure_from_api_response(
         )
         
     except Exception as e:
+        # Logging
         logger.error(f"Erreur lors du parsing de la structure: {e}")
         raise ValueError(f"Impossible de parser la structure: {e}")
 
-
-# # Instance globale du registre (singleton)
-# _default_registry: Optional[DataflowStructureRegistry] = None
-
-
-# def get_default_registry() -> DataflowStructureRegistry:
-#     """Get the default global registry instance.
-    
-#     Returns:
-#         Default DataflowStructureRegistry instance.
-#     """
-#     global _default_registry
-#     if _default_registry is None:
-#         _default_registry = DataflowStructureRegistry()
-#     return _default_registry
-
-
-# def set_default_registry(registry: DataflowStructureRegistry) -> None:
-#     """Set the default global registry instance.
-    
-#     Args:
-#         registry: DataflowStructureRegistry to use as default.
-#     """
-#     global _default_registry
-#     _default_registry = registry
