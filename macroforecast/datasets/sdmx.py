@@ -278,8 +278,8 @@ class SDMXURLBuilder:
     ) -> str:
         """Build dimension filter for SDMX v1.
         
-        Format: value1+value2.value3+value4
-        Multiple values for same dimension: separated by '+'
+        Format: value1,value2.value3,value4
+        Multiple values for same dimension: separated by ','
         Different dimensions: separated by '.'
         All values: empty string between dots
         
@@ -305,8 +305,8 @@ class SDMXURLBuilder:
         filter_parts = []
         for i in range(total_dims):
             if i in dimensions:
-                # Jonction des valeurs de cette dimension avec '+'
-                filter_parts.append("+".join(dimensions[i]))
+                # Jonction des valeurs de cette dimension avec ','
+                filter_parts.append(",".join(dimensions[i]))
             else:
                 # Dimension non spécifiée = toutes les valeurs (chaîne vide en v1)
                 filter_parts.append("")
@@ -322,7 +322,7 @@ class SDMXURLBuilder:
         """Build dimension filter for SDMX v2.
         
         Format: value1.value2.value3
-        Multiple values for same dimension: separated by '+' (or multiple requests)
+        Multiple values for same dimension: separated by ',' (or multiple requests)
         All values: '*'
         
         Args:
@@ -347,8 +347,8 @@ class SDMXURLBuilder:
         filter_parts = []
         for i in range(total_dims):
             if i in dimensions:
-                # En v2, plusieurs valeurs sont séparées par '+'
-                filter_parts.append("+".join(dimensions[i]))
+                # En v2, plusieurs valeurs sont séparées par ','
+                filter_parts.append(",".join(dimensions[i]))
             else:
                 # Toutes les valeurs = '*'
                 filter_parts.append("*")
