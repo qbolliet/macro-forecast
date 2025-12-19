@@ -540,6 +540,7 @@ class OECDClient:
             raise
     
     # Méthode d'extraction de la structure des métadonnées associées à un flux
+    # /!\ Voir si ne pourrait pas être mis en commun dans le cas de plusieurs sources de données (par exemple en utilisant eurostat)
     def get_structure(
         self,
         agency: str,
@@ -581,6 +582,7 @@ class OECDClient:
         return self.create_structure_from_api_response(agency=agency, dataflow=dataflow, api_response=response.json())
     
     # Fonction utilitaire pour créer une structure à partir des métadonnées API
+    # /!\ Voir si ne pourrait pas être mis en commun dans le cas de plusieurs sources de données (par exemple en utilisant eurostat)
     def create_structure_from_api_response(
         self,
         agency: str,
@@ -672,6 +674,7 @@ class OECDClient:
         self.structure_registry.register(structure)
     
     # Méthode de listing de tous les dataflows disponibles
+    # /!\ Voir si ne pourrait pas être mis en commun dans le cas de plusieurs sources de données (par exemple en utilisant eurostat)
     def list_all_dataflows(self) -> pd.DataFrame:
         """List all available OECD dataflows.
 
