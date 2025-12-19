@@ -215,14 +215,49 @@ class DataflowStructureRegistry:
         >>> position = structure.get_position("REF_AREA")
     """
     
-    def __init__(self, config_path: Optional[Union[str, Path]] = None):
+    # Initialisation
+    def __init__(
+        self,
+        structures_dict: Optional[Dict[str, Any]] = None,
+        config_path: Optional[Union[str, Path]] = None,
+    ):
         # Index des structures par clé (agency::dataflow)
         self._structures: Dict[str, DataflowStructure] = {}
-        
-        # Chargement de la configuration si spécifiée
+
+        # Chargement depuis dictionnaire d'abord
+        if structures_dict:
+            self.load_from_dict(structures_dict)
+
+        # Puis depuis fichier (peut écraser)
         if config_path:
             self.load_from_file(config_path)
     
+    # Méthode de chargement des structures depuis un dictionnaire
+    def load_from_dict(self, data: Dict[str, Any]) -> None:
+        """Load structures from dictionary with STRUCTURES key.
+
+        Args:
+            data: Dictionary containing structures under 'STRUCTURES' key.
+
+        Raises:
+            ValueError: If the data format is invalid.
+        """
+        # Extraction des structures depuis la clé STRUCTURES
+        structures_data = data.get("STRUCTURES", [])
+
+        # Logging
+        logger.info(f"Loading {len(structures_data)} structures from dictionary")
+
+        # Parcours des structures
+        for structure_data in structures_data:
+            # Création de la structure
+            structure = DataflowStructure.from_dict(structure_data)
+            # Enregistrement de la structure
+            self.register(structure)
+
+        # Logging
+        logger.info(f"Loaded {len(structures_data)} structures from dictionary")
+
     # Méthode de construction d'une structure à partir d'un partir d'un fichier json
     def load_from_file(self, path: Union[str, Path]) -> None:
         """Load structures from JSON file.
@@ -243,14 +278,14 @@ class DataflowStructureRegistry:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         
-        # Parcours des structures
-        structures_data = data.get("structures", [])
+        # Parcours des structures (support des deux clés pour compatibilité)
+        structures_data = data.get("STRUCTURES", data.get("structures", []))
         for structure_data in structures_data:
             # Création de la structure
             structure = DataflowStructure.from_dict(structure_data)
             # Enregistrement de la structure
             self.register(structure)
-        
+
         # Logging
         logger.info(f"Loaded {len(structures_data)} structures")
     
@@ -421,82 +456,4 @@ class DataflowStructureRegistry:
         if structure:
             return structure.num_dimensions
         return None
-
-
-# Fonction utilitaire pour créer une structure à partir des métadonnées de API
-# /!\ Voir s'il n'est pas préférable de la déplacer dans oecd.py
-def create_structure_from_api_response(
-    agency: str,
-    dataflow: str,
-    api_response: Dict[str, Any],
-) -> DataflowStructure:
-    """Create a DataflowStructure from OECD API structure response.
-    
-    This function parses the structure metadata returned by the OECD API
-    and creates a DataflowStructure object.
-    
-    Args:
-        agency: Agency identifier.
-        dataflow: Dataflow identifier.
-        api_response: JSON response from structure API endpoint.
-        
-    Returns:
-        DataflowStructure instance.
-        
-    Raises:
-        ValueError: If the response cannot be parsed.
-    """
-    try:
-        # Extraction des dimensions depuis la réponse
-        # La structure varie selon la version de l'API
-        data = api_response.get("data", api_response)
-        structures = data.get("structures", data.get("structure", {}))
-        
-        # Recherche des dimensions
-        dimensions_data = []
-        
-        # Format v1: structure.dimensions.observation
-        if "dimensions" in structures:
-            dims = structures["dimensions"]
-            if "observation" in dims:
-                dimensions_data = dims["observation"]
-            elif isinstance(dims, list):
-                dimensions_data = dims
-        
-        # Format v2: peut varier
-        elif "dataStructures" in data:
-            ds_list = data["dataStructures"]
-            if ds_list:
-                ds = ds_list[0]
-                components = ds.get("dataStructureComponents", {})
-                dim_list = components.get("dimensionList", {})
-                dimensions_data = dim_list.get("dimensions", [])
-        
-        # Construction des DimensionInfo
-        dimensions = []
-        for i, dim_data in enumerate(dimensions_data):
-            dim_id = dim_data.get("id", dim_data.get("name", f"DIM_{i}"))
-            dim_name = dim_data.get("name", dim_id)
-            position = dim_data.get("position", dim_data.get("keyPosition", i))
-            
-            dimensions.append(DimensionInfo(
-                name=dim_id,
-                position=position,
-                description=dim_name if dim_name != dim_id else None,
-            ))
-        
-        # Tri par position
-        dimensions.sort(key=lambda d: d.position)
-        
-        return DataflowStructure(
-            agency=agency,
-            dataflow=dataflow,
-            num_dimensions=len(dimensions),
-            dimensions=dimensions,
-        )
-        
-    except Exception as e:
-        # Logging
-        logger.error(f"Error parsing structure: {e}")
-        raise ValueError(f"Unable to parse structure: {e}")
 
