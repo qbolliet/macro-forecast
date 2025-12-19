@@ -10,6 +10,8 @@ import logging
 from typing import Optional, Dict, List, Any, Union, Literal
 import json
 import warnings
+from pathlib import Path
+import xml.etree.ElementTree as ET
 import pandas as pd
 
 # Utilitaires internes au package pour la requête de données au format SDMX
@@ -26,6 +28,7 @@ from .structures import (
     DataflowStructure,
     DimensionInfo,
 )
+from .rate_limiter import RateLimiter
 
 # Initialisation du logger
 logger = logging.getLogger(__name__)
@@ -69,6 +72,8 @@ class OECDClient:
         sdmx_version: SDMXVersion = SDMXVersion.V2,
         structure_registry: Optional[DataflowStructureRegistry] = None,
         auto_fetch_structure: bool = True,
+        rate_limiter: Optional[RateLimiter] = None,
+        auto_load_rate_limit: bool = True,
     ):
         # Initialisation des attributs
         self.base_url = base_url
@@ -76,10 +81,49 @@ class OECDClient:
         self.auto_fetch_structure = auto_fetch_structure
         self.api_client = APIClient(base_url=base_url, timeout=timeout)
         self.url_builder = SDMXURLBuilder()
-        
+
         # Registre des structures de dataflows
         self.structure_registry = structure_registry or DataflowStructureRegistry()
-    
+
+        # Chargement automatique du rate limiter si demandé
+        if auto_load_rate_limit and rate_limiter is None:
+            rate_limiter = self._load_rate_limiter()
+
+        # Rate limiter pour respecter les limites API
+        self.rate_limiter = rate_limiter
+
+    # Méthode auxiliaire de chargement du rate limiter depuis le fichier de configuration
+    def _load_rate_limiter(self) -> Optional[RateLimiter]:
+        """Load rate limiter from parameters/oecd.json.
+
+        Returns:
+            RateLimiter instance or None if configuration not found.
+        """
+        try:
+            # Construction du chemin vers le fichier de paramètres
+            params_path = Path(__file__).parent.parent.parent / "parameters" / "oecd.json"
+
+            # Vérification de l'existence du fichier
+            if params_path.exists():
+                # Chargement du fichier JSON
+                with open(params_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+
+                # Extraction de la configuration du rate limiter
+                if "RATE_LIMIT" in config:
+                    # Logging
+                    logger.info("Loading rate limiter from parameters/oecd.json")
+                    return RateLimiter.from_dict(config["RATE_LIMIT"])
+
+            # Logging si pas de configuration trouvée
+            logger.debug("No RATE_LIMIT configuration found")
+            return None
+
+        except Exception as e:
+            # Logging de l'erreur
+            logger.warning(f"Could not load rate limiter: {e}")
+            return None
+
     # Méthode de requête des données
     def get_data(
         self,
@@ -149,7 +193,11 @@ class OECDClient:
         # Vérification de la validité du "dataflow"
         if dataflow is None:
             raise ValueError("dataflow is required")
-        
+
+        # Application du rate limiter si configuré
+        if self.rate_limiter:
+            self.rate_limiter.acquire()
+
         # Récupération de la structure du dataflow si nécessaire
         structure = self._ensure_structure(agency=agency, dataflow=dataflow)
         
@@ -623,6 +671,75 @@ class OECDClient:
         """
         self.structure_registry.register(structure)
     
+    # Méthode de listing de tous les dataflows disponibles
+    def list_all_dataflows(self) -> pd.DataFrame:
+        """List all available OECD dataflows.
+
+        Retrieves the complete list of dataflows from OECD SDMX API
+        and parses them into a pandas DataFrame.
+
+        Returns:
+            DataFrame with columns: dataflow, agency, version, name
+
+        Example:
+            >>> client = OECDClient()
+            >>> df = client.list_all_dataflows()
+            >>> df.head()
+        """
+        # Endpoint pour lister tous les dataflows
+        endpoint = "dataflow/all"
+
+        # Headers pour XML
+        headers = {"Accept": "application/xml"}
+
+        # Application du rate limiter si configuré
+        if self.rate_limiter:
+            self.rate_limiter.acquire()
+
+        # Logging
+        logger.info("Fetching list of all OECD dataflows")
+
+        # Exécution de la requête
+        response = self.api_client.get(endpoint, headers=headers)
+
+        # Parsing XML
+        root = ET.fromstring(response.content)
+
+        # Namespaces SDMX
+        namespaces = {
+            'mes': 'http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message',
+            'str': 'http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure',
+            'com': 'http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common'
+        }
+
+        # Extraction des dataflows
+        dataflows = []
+        for df in root.findall('.//str:Dataflow', namespaces):
+            # Extraction des attributs
+            dataflow_id = df.get('id')
+            agency_id = df.get('agencyID')
+            version = df.get('version')
+
+            # Extraction du nom
+            name_elem = df.find('.//com:Name', namespaces)
+            name = name_elem.text if name_elem is not None else None
+
+            # Ajout à la liste
+            dataflows.append({
+                'dataflow': dataflow_id,
+                'agency': agency_id,
+                'version': version,
+                'name': name
+            })
+
+        # Conversion en DataFrame
+        df_result = pd.DataFrame(dataflows)
+
+        # Logging
+        logger.info(f"Found {len(df_result)} dataflows")
+
+        return df_result
+
     # Méthode de fermeture de la session
     def close(self):
         """Close the client and release resources."""
