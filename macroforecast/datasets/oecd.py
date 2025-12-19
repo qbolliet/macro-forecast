@@ -78,7 +78,7 @@ class OECDClient:
         self.url_builder = SDMXURLBuilder()
         
         # Registre des structures de dataflows
-        self.structure_registry = structure_registry or DataflowStructureRegistry()()
+        self.structure_registry = structure_registry or DataflowStructureRegistry()
     
     # Méthode de requête des données
     def get_data(
@@ -92,8 +92,8 @@ class OECDClient:
         last_n_observations: Optional[int] = None,
         format: ResponseFormat = ResponseFormat.CSV_LABELS,
         dimension_at_observation: DimensionAtObservation = DimensionAtObservation.ALL_DIMENSIONS,
-        include_attributes: Optional[str] = None,
-        include_measures: Optional[str] = None,
+        attributes: Optional[str] = None,
+        measures: Optional[str] = None,
         on_duplicate: DuplicateHandling = "warn",
     ) -> pd.DataFrame:
         """Retrieve data from OECD API.
@@ -111,8 +111,8 @@ class OECDClient:
             format: Response format (json, csv, csv_labels, xml).
             dimension_at_observation: How to group observations
                 (AllDimensions for flat, TIME_PERIOD for series).
-            include_attributes: Attributes to include ("dsd", "all", "none").
-            include_measures: Measures to include ("all", "none").
+            attributes: Attributes to include ("dsd", "all", "none").
+            measures: Measures to include ("all", "none").
             on_duplicate: How to handle duplicate rows when wildcards are used:
                 - "ignore": Keep all rows without checking.
                 - "warn": Log a warning if duplicates are found.
@@ -183,8 +183,8 @@ class OECDClient:
             sdmx_version=self.sdmx_version,
             dimension_at_observation=dimension_at_observation,
             num_dimensions=num_dimensions,
-            include_attributes=include_attributes,
-            include_measures=include_measures,
+            attributes=attributes,
+            measures=measures,
         )
         
         # Construction de l'URL et des paramètres
@@ -497,7 +497,7 @@ class OECDClient:
         agency: str = "OECD",
         dataflow: str = None,
         version: str = "+",
-    ) -> Dict[str, Any]:
+    ) -> DataflowStructure:
         """Retrieve dataflow structure metadata.
         
         Args:
