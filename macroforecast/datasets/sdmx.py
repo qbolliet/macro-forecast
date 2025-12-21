@@ -320,17 +320,25 @@ class SDMXURLBuilder:
         num_dimensions: Optional[int] = None,
     ) -> str:
         """Build dimension filter for SDMX v2.
-        
+
+        IMPORTANT: SDMX v2 does not support multiple values per dimension
+        (comma-separated). Each dimension must have exactly one value or use
+        wildcard (*). Use split_dimensions parameter in get_data() to handle
+        multiple values via separate requests.
+
         Format: value1.value2.value3
-        Multiple values for same dimension: separated by ',' (or multiple requests)
         All values: '*'
-        
+
         Args:
             dimensions: Dictionary mapping dimension position to list of values.
+                       Each list must contain exactly ONE value.
             num_dimensions: Total number of dimensions (for padding with '*').
-            
+
         Returns:
             Formatted dimension filter string.
+
+        Raises:
+            ValueError: If any dimension has more than one value.
         """
         # Cas où aucune dimension n'est spécifiée
         if not dimensions:
@@ -338,21 +346,30 @@ class SDMXURLBuilder:
                 # Retourne le bon nombre de wildcards
                 return ".".join(["*"] * num_dimensions)
             return "*"
-        
+
+        # VALIDATION: Vérifier qu'aucune dimension n'a plusieurs valeurs
+        for position, values in dimensions.items():
+            if len(values) > 1:
+                raise ValueError(
+                    f"SDMX v2 does not support multiple values for a single dimension. "
+                    f"Dimension at position {position} has {len(values)} values: {values}. "
+                    f"Use split_dimensions parameter in get_data() to handle multiple values."
+                )
+
         # Détermination du nombre de positions à générer
         max_dim = max(dimensions.keys())
         total_dims = num_dimensions if num_dimensions else max_dim + 1
-        
+
         # Construction du filtre
         filter_parts = []
         for i in range(total_dims):
             if i in dimensions:
-                # En v2, plusieurs valeurs sont séparées par ','
-                filter_parts.append(",".join(dimensions[i]))
+                # Une seule valeur (garanti par validation ci-dessus)
+                filter_parts.append(dimensions[i][0])  # Prendre la première (et unique) valeur
             else:
                 # Toutes les valeurs = '*'
                 filter_parts.append("*")
-        
+
         return ".".join(filter_parts)
     
     # Méthode de construction de la structure de l'URL de requête pour chaque version
