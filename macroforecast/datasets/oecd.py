@@ -1310,7 +1310,7 @@ class OECDClient:
     def filter_updated_queries(
         self,
         queries: List[QueryRequest],
-        updated_since: Union[str, datetime],
+        updated_since: Optional[Union[str, datetime]]=None,
     ) -> List[QueryRequest]:
         """Filter queries to keep only those with data updated since a given date.
 
@@ -1321,12 +1321,18 @@ class OECDClient:
             queries: List of QueryRequest objects to filter.
             updated_since: Date/datetime threshold. Only queries for dataflows
                           updated after this date will be returned.
-                          Can be a string (ISO format) or datetime object.
+                          Can be a string (ISO format), datetime object, or None.
+                          If None, all queries are returned without filtering.
 
         Returns:
             Filtered list of QueryRequest objects for updated dataflows only.
+            If updated_since is None, returns all queries unchanged.
 
         Example:
+            >>> # Get all queries without filtering
+            >>> all_queries = client.filter_updated_queries(queries, updated_since=None)
+
+            >>> # Filter by specific date
             >>> queries = [
             ...     QueryRequest(agency="OECD.SDD.STES", dataflow="DSD_KEI@DF_KEI"),
             ...     QueryRequest(agency="OECD.ELS.SPD", dataflow="DSD_SOCX_AGG@DF_SOCX_AGG"),
@@ -1339,6 +1345,12 @@ class OECDClient:
             >>> for query in updated_queries:
             ...     df = client.execute_query(query)
         """
+        # Early return si aucun filtrage demandé
+        if updated_since is None:
+            # Logging
+            logger.info(f"No filtering requested (updated_since=None), returning all {len(queries)} queries")
+            return queries
+
         # Normalisation de la date
         if isinstance(updated_since, str):
             cutoff_date = datetime.fromisoformat(updated_since)
