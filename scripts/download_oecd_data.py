@@ -31,7 +31,7 @@ import yaml
 # Ajout du répertoire parent au path pour importer macroforecast
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from macroforecast.datasets.oecd import OECDClient, QueryRequest
+from macroforecast.datasets.sources.oecd import OECDClient, QueryRequest
 
 logging.basicConfig(
     level=logging.INFO,

@@ -20,20 +20,20 @@ from functools import reduce
 import itertools
 
 # Utilitaires internes au package pour la requête de données au format SDMX
-from .client import APIClient
-from .sdmx import (
+from ..core.client import APIClient
+from ..core.sdmx import (
     SDMXURLBuilder,
     SDMXDataQuery,
     SDMXVersion,
     ResponseFormat,
     DimensionAtObservation,
 )
-from .structures import (
+from ..core.structures import (
     DataflowStructureRegistry,
     DataflowStructure,
     DimensionInfo,
 )
-from .rate_limiter import RateLimiter
+from ..core.rate_limiter import RateLimiter
 
 # Initialisation du logger
 logger = logging.getLogger(__name__)
