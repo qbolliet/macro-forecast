@@ -45,7 +45,7 @@ DuplicateHandling = Literal["ignore", "warn", "raise"]
 
 # Classe représentant une requête de données
 @dataclass
-class QueryRequest:
+class OECDQueryRequest:
     """Represents an OECD data query request.
 
     This class encapsulates all parameters needed for a get_data() call,
@@ -68,7 +68,7 @@ class QueryRequest:
         max_split_combinations: Max allowed split combinations
 
     Example:
-        >>> query = QueryRequest(
+        >>> query = OECDQueryRequest(
         ...     agency="OECD.SDD.STES",
         ...     dataflow="DSD_KEI@DF_KEI",
         ...     dimensions={"REF_AREA": ["FRA", "DEU"], "FREQ": "M"},
@@ -412,17 +412,17 @@ class OECDClient:
             return df
 
     # Méthode d'exécution d'une requête QueryRequest
-    def execute_query(self, query: QueryRequest) -> pd.DataFrame:
-        """Execute a QueryRequest.
+    def execute_query(self, query: OECDQueryRequest) -> pd.DataFrame:
+        """Execute a OECDQueryRequest.
 
         Args:
-            query: QueryRequest object containing all parameters.
+            query: OECDQueryRequest object containing all parameters.
 
         Returns:
             DataFrame with the retrieved data.
 
         Example:
-            >>> query = QueryRequest(
+            >>> query = OECDQueryRequest(
             ...     agency="OECD.SDD.STES",
             ...     dataflow="DSD_KEI@DF_KEI",
             ...     dimensions={"REF_AREA": ["FRA"], "FREQ": "M"},
@@ -1309,23 +1309,23 @@ class OECDClient:
     # Méthode de filtrage des requêtes mises à jour
     def filter_updated_queries(
         self,
-        queries: List[QueryRequest],
+        queries: List[OECDQueryRequest],
         updated_since: Optional[Union[str, datetime]]=None,
-    ) -> List[QueryRequest]:
+    ) -> List[OECDQueryRequest]:
         """Filter queries to keep only those with data updated since a given date.
 
         This method queries the OECD ContentConstraint endpoint for each dataflow
         to determine if the data has been updated since the specified date.
 
         Args:
-            queries: List of QueryRequest objects to filter.
+            queries: List of OECDQueryRequest objects to filter.
             updated_since: Date/datetime threshold. Only queries for dataflows
                           updated after this date will be returned.
                           Can be a string (ISO format), datetime object, or None.
                           If None, all queries are returned without filtering.
 
         Returns:
-            Filtered list of QueryRequest objects for updated dataflows only.
+            Filtered list of OECDQueryRequest objects for updated dataflows only.
             If updated_since is None, returns all queries unchanged.
 
         Example:
@@ -1334,8 +1334,8 @@ class OECDClient:
 
             >>> # Filter by specific date
             >>> queries = [
-            ...     QueryRequest(agency="OECD.SDD.STES", dataflow="DSD_KEI@DF_KEI"),
-            ...     QueryRequest(agency="OECD.ELS.SPD", dataflow="DSD_SOCX_AGG@DF_SOCX_AGG"),
+            ...     OECDQueryRequest(agency="OECD.SDD.STES", dataflow="DSD_KEI@DF_KEI"),
+            ...     OECDQueryRequest(agency="OECD.ELS.SPD", dataflow="DSD_SOCX_AGG@DF_SOCX_AGG"),
             ... ]
             >>> updated_queries = client.filter_updated_queries(
             ...     queries,

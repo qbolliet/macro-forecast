@@ -4,7 +4,7 @@ from .client import APIClient
 # Rate limiter
 from .rate_limiter import RateLimiter
 # SDMX
-from .sdmx import SDMXDataQuery, SDMXURLBuilder
+from .sdmx import SDMXDataQuery, SDMXURLBuilder, SDMXVersion, ResponseFormat
 # Structures
 from .structures import DimensionInfo, DataflowStructure, DataflowStructureRegistry
 
@@ -14,6 +14,8 @@ __all__ = [
     'RateLimiter',
     'SDMXDataQuery',
     'SDMXURLBuilder',
+    'SDMXVersion',
+    'ResponseFormat',
     'DimensionInfo',
     'DataflowStructure',
     'DataflowStructureRegistry'
