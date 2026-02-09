@@ -2,7 +2,7 @@
 # Core
 from .core import APIClient, RateLimiter, SDMXDataQuery, SDMXURLBuilder, DimensionInfo, DataflowStructure, DataflowStructureRegistry
 # Sources
-from .sources import OECDQueryRequest, OECDClient
+from .sources import OECDQueryRequest, OECDClient, EurostatQueryRequest, EurostatClient, EurostatResponseFormat
 
 # Réexport des éléments d'intérêt du module
 __all__ = [
@@ -14,5 +14,8 @@ __all__ = [
     'DataflowStructure',
     'DataflowStructureRegistry',
     'OECDQueryRequest',
-    'OECDClient'
+    'OECDClient',
+    'EurostatQueryRequest',
+    'EurostatClient',
+    'EurostatResponseFormat'
 ]
