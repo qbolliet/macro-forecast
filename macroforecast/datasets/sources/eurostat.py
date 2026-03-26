@@ -36,6 +36,25 @@ logger = logging.getLogger(__name__)
 # Types pour la gestion des doublons
 DuplicateHandling = Literal["ignore", "warn", "raise"]
 
+# Types pour les paramètres de requêtes de structure SDMX 3.0
+StructureDetail = Literal[
+    "full",
+    "allstubs",
+    "referencestubs",
+    "allcompletestubs",
+    "referencecompletestubs",
+    "referencepartial",
+]
+StructureReferences = Literal[
+    "none",
+    "parents",
+    "parentsandsiblings",
+    "ancestors",
+    "children",
+    "descendants",
+    "all",
+]
+
 
 # Énumération des formats de réponse Eurostat
 class EurostatResponseFormat(str, Enum):
@@ -210,7 +229,7 @@ class EurostatClient:
         """
         try:
             # Construction du chemin vers le fichier de paramètres
-            params_path = Path(__file__).parent.parent.parent / "parameters" / "eurostat.json"
+            params_path = Path(__file__).parents[3] / "parameters" / "eurostat.json"
 
             # Vérification de l'existence du fichier
             if params_path.exists():
@@ -226,10 +245,13 @@ class EurostatClient:
                         unit=rate_config.get("unit", "minutes"),
                         count=rate_config.get("count", 1),
                     )
+            # Logging si pas de configuration trouvée
+            logger.debug("No RATE_LIMIT configuration found")
             # Retour de None si le fichier n'existe pas ou pas de configuration rate limit
             return None
         # Gestion des erreurs de chargement
         except Exception as e:
+            # Logging de l'erreur
             logger.warning(f"Failed to load rate limiter config: {e}")
             return None
 
@@ -276,19 +298,6 @@ class EurostatClient:
             return self._get_comext_client()
         return self.api_client
 
-    # Méthode de construction du path de l'endpoint de données
-    def _build_data_endpoint(self, dataflow: str, version: str) -> str:
-        """Build the data endpoint path.
-
-        Args:
-            dataflow: Dataflow identifier
-            version: Dataflow version
-
-        Returns:
-            Path component for the data endpoint
-        """
-        # Construction du path : /data/dataflow/ESTAT/{id}/{version}
-        return f"/data/dataflow/ESTAT/{dataflow.upper()}/{version}"
 
     # Méthode de construction des paramètres de dimensions
     def _build_dimension_params(self, dimensions: Optional[Dict[str, Union[str, List[str]]]]) -> Dict[str, str]:
@@ -869,21 +878,24 @@ class EurostatClient:
                 logger.warning(message)
 
     # Méthode publique de récupération de la structure d'un dataflow
-    def get_structure(self, dataflow: str, version: str = "*") -> DataflowStructure:
+    def get_structure(self, dataflow: str, version: str = "~") -> DataflowStructure:
         """Get structure metadata for a dataflow.
 
+        Queries the SDMX 3.0 ``/structure/datastructure/`` endpoint to retrieve
+        the Data Structure Definition (DSD) associated with the given dataflow.
+
         Args:
-            dataflow: Dataflow identifier
-            version: Dataflow version
+            dataflow: Dataflow identifier (e.g., ``"namq_10_gdp"``).
+            version: Dataflow version. Use ``"~"`` for the latest (default).
 
         Returns:
-            DataflowStructure with dimension information
+            DataflowStructure with dimension information.
 
         Raises:
-            ValueError: If structure cannot be retrieved
+            ValueError: If structure cannot be retrieved.
         """
-        # Construction de l'URL
-        endpoint = f"/structure/dataflow/ESTAT/{dataflow.upper()}/{version}"
+        # Construction de l'URL (endpoint datastructure, pas dataflow)
+        endpoint = f"/structure/datastructure/ESTAT/{dataflow.upper()}/{version}"
 
         # Sélection du client API
         client = self._get_api_client(dataflow)
@@ -897,6 +909,200 @@ class EurostatClient:
         except Exception as e:
             logger.error(f"Failed to get structure for {dataflow}: {e}")
             raise ValueError(f"Failed to get structure for {dataflow}: {e}")
+
+    # Méthode privée générique de requête d'artefacts structurels SDMX
+    def _fetch_structure_artefact(
+        self,
+        artefact_type: str,
+        resource_id: str,
+        agency: str = "ESTAT",
+        version: str = "~",
+        detail: StructureDetail = "full",
+        references: StructureReferences = "none",
+        dataflow: Optional[str] = None,
+    ) -> str:
+        """Fetch a raw SDMX structure artefact and return its XML content.
+
+        Builds and executes a request to:
+        ``/structure/{artefact_type}/{agency}/{resource_id}/{version}``
+
+        Args:
+            artefact_type: SDMX artefact type (e.g., ``"codelist"``,
+                ``"datastructure"``, ``"dataflow"``, ``"dataconstraint"``).
+            resource_id: Artefact identifier.
+            agency: Maintaining agency (default: ``"ESTAT"``).
+            version: Artefact version. Use ``"~"`` for the latest (default).
+            detail: Level of detail in the response (default: ``"full"``).
+                See ``StructureDetail`` for allowed values.
+            references: Whether to include referenced artefacts
+                (default: ``"none"``). See ``StructureReferences`` for
+                allowed values.
+            dataflow: Optional dataflow identifier used only to select the
+                correct API client (standard vs. Comext).
+
+        Returns:
+            Raw XML response text.
+
+        Raises:
+            ValueError: If the request fails.
+        """
+        # Construction de l'endpoint générique
+        endpoint = f"/structure/{artefact_type}/{agency}/{resource_id}/{version}"
+        params: Dict[str, str] = {"detail": detail, "references": references}
+
+        # Sélection du client API (Comext si nécessaire)
+        client = self._get_api_client(dataflow or resource_id)
+
+        try:
+            response = client.get(endpoint, params=params)
+            return response.text
+        except Exception as e:
+            logger.error(f"Failed to fetch {artefact_type}/{resource_id}: {e}")
+            raise ValueError(
+                f"Failed to fetch {artefact_type} '{resource_id}': {e}"
+            )
+
+    # Méthode publique de récupération d'une codelist
+    def get_codelist(
+        self,
+        codelist_id: str,
+        agency: str = "ESTAT",
+        version: str = "~",
+        detail: StructureDetail = "full",
+        references: StructureReferences = "none",
+    ) -> str:
+        """Retrieve a codelist from the SDMX 3.0 structure API.
+
+        Queries ``/structure/codelist/{agency}/{codelist_id}/{version}``.
+        Codelists define the controlled vocabulary (allowed codes) for a
+        given dimension (e.g., ``CL_GEO`` for geographic areas).
+
+        Args:
+            codelist_id: Codelist identifier (e.g., ``"CL_GEO"``).
+            agency: Maintaining agency (default: ``"ESTAT"``).
+            version: Codelist version. Use ``"~"`` for the latest (default).
+            detail: Level of detail in the response (default: ``"full"``).
+            references: Whether to include referenced artefacts
+                (default: ``"none"``).
+
+        Returns:
+            Raw SDMX-ML XML response text.
+
+        Raises:
+            ValueError: If the codelist cannot be retrieved.
+
+        Example:
+            >>> xml = client.get_codelist("CL_GEO")
+            >>> xml_with_parents = client.get_codelist(
+            ...     "CL_GEO", references="parents"
+            ... )
+        """
+        return self._fetch_structure_artefact(
+            artefact_type="codelist",
+            resource_id=codelist_id,
+            agency=agency,
+            version=version,
+            detail=detail,
+            references=references,
+        )
+
+    # Méthode publique de récupération d'un dataflow
+    def get_dataflow(
+        self,
+        dataflow_id: str,
+        agency: str = "ESTAT",
+        version: str = "~",
+        detail: StructureDetail = "full",
+        references: StructureReferences = "none",
+    ) -> str:
+        """Retrieve a dataflow definition from the SDMX 3.0 structure API.
+
+        Queries ``/structure/dataflow/{agency}/{dataflow_id}/{version}``.
+        A dataflow provides a reference to the Data Structure Definition (DSD)
+        that applies to a particular statistical domain.
+
+        Use ``references="children"`` to also retrieve the associated DSD, or
+        ``references="descendants"`` to additionally include the codelists.
+
+        Args:
+            dataflow_id: Dataflow identifier (e.g., ``"namq_10_gdp"``).
+            agency: Maintaining agency (default: ``"ESTAT"``).
+            version: Dataflow version. Use ``"~"`` for the latest (default).
+            detail: Level of detail in the response (default: ``"full"``).
+            references: Whether to include referenced artefacts
+                (default: ``"none"``). Supported values for dataflow:
+                ``"none"``, ``"children"`` (returns DF + DSD),
+                ``"descendants"`` (returns DF + DSD + CS + CL).
+
+        Returns:
+            Raw SDMX-ML XML response text.
+
+        Raises:
+            ValueError: If the dataflow cannot be retrieved.
+
+        Example:
+            >>> xml = client.get_dataflow("namq_10_gdp")
+            >>> xml_with_dsd = client.get_dataflow(
+            ...     "namq_10_gdp", references="descendants"
+            ... )
+        """
+        return self._fetch_structure_artefact(
+            artefact_type="dataflow",
+            resource_id=dataflow_id,
+            agency=agency,
+            version=version,
+            detail=detail,
+            references=references,
+            dataflow=dataflow_id,
+        )
+
+    # Méthode publique de récupération d'une dataconstraint
+    def get_dataconstraint(
+        self,
+        constraint_id: str,
+        agency: str = "ESTAT",
+        version: str = "~",
+        detail: StructureDetail = "full",
+        references: StructureReferences = "none",
+    ) -> str:
+        """Retrieve a data constraint from the SDMX 3.0 structure API.
+
+        Queries ``/structure/dataconstraint/{agency}/{constraint_id}/{version}``.
+        Data constraints define the valid combinations of dimension values for
+        a given dataset or dataflow (i.e., the actual content constraint).
+
+        Args:
+            constraint_id: Constraint identifier (typically the same as the
+                dataflow identifier).
+            agency: Maintaining agency (default: ``"ESTAT"``).
+            version: Constraint version. Use ``"~"`` for the latest (default).
+            detail: Level of detail in the response (default: ``"full"``).
+            references: Whether to include referenced artefacts
+                (default: ``"none"``). Supported values: ``"none"``,
+                ``"parents"``, ``"parentsandsiblings"``, ``"children"``,
+                ``"descendants"``, ``"all"``.
+
+        Returns:
+            Raw SDMX-ML XML response text.
+
+        Raises:
+            ValueError: If the constraint cannot be retrieved.
+
+        Example:
+            >>> xml = client.get_dataconstraint("namq_10_gdp")
+            >>> xml_full = client.get_dataconstraint(
+            ...     "namq_10_gdp", references="children"
+            ... )
+        """
+        return self._fetch_structure_artefact(
+            artefact_type="dataconstraint",
+            resource_id=constraint_id,
+            agency=agency,
+            version=version,
+            detail=detail,
+            references=references,
+            dataflow=constraint_id,
+        )
 
     # Méthode publique d'enregistrement d'une structure pré-chargée
     def register_structure(self, structure: DataflowStructure) -> None:
@@ -1051,32 +1257,59 @@ class EurostatClient:
         return self.get_data(**query.to_dict())
 
     # Méthode publique de listage de tous les dataflows
-    def list_all_dataflows(self) -> pd.DataFrame:
+    def list_all_dataflows(
+        self,
+        detail: StructureDetail = "allstubs",
+        lang: str = "en",
+    ) -> pd.DataFrame:
         """List all available Eurostat dataflows.
 
+        Queries the SDMX 3.0 structure endpoint using the wildcard syntax
+        ``/structure/dataflow/ESTAT/*/~``, which is the correct way to
+        enumerate all published dataflows.
+
+        Args:
+            detail: Level of detail in the response (default: ``"allstubs"``).
+                ``"allstubs"`` returns only the identifier and name for each
+                dataflow, which is significantly more efficient than ``"full"``
+                for a catalogue listing.
+            lang: Language code for name labels (default: ``"en"``).
+                Accepted values: ``"en"``, ``"fr"``, ``"de"``.
+
         Returns:
-            DataFrame with columns: dataflow, agency, version, name
+            DataFrame with columns: ``dataflow``, ``agency``, ``version``,
+            ``name``.
 
         Raises:
-            ValueError: If dataflows cannot be retrieved
+            ValueError: If dataflows cannot be retrieved.
+
+        Example:
+            >>> df = client.list_all_dataflows()
+            >>> df_fr = client.list_all_dataflows(lang="fr")
         """
-        # Requête de la liste des dataflows
-        endpoint = "/structure/dataflow/ESTAT"
+        # Endpoint wildcard SDMX 3.0 pour la liste complète des dataflows ESTAT
+        endpoint = "/structure/dataflow/ESTAT/*/~"
+        params: Dict[str, str] = {"detail": detail, "lang": lang}
 
         try:
-            response = self.api_client.get(endpoint)
+            response = self.api_client.get(endpoint, params=params)
 
-            # Parsing du XML pour extraire les dataflows
+            # Parsing du XML : tentative SDMX 3.0 puis fallback SDMX 2.1
             root = ET.fromstring(response.text)
             namespaces = self.SDMX3_NS
+            dataflow_elems = root.findall(".//str:Dataflow", namespaces)
+            if not dataflow_elems:
+                namespaces = self.SDMX21_NS
+                dataflow_elems = root.findall(".//str:Dataflow", namespaces)
 
+            # Extraction des métadonnées de chaque dataflow
             dataflows = []
-            for df_elem in root.findall(".//str:Dataflow", namespaces):
+            for df_elem in dataflow_elems:
                 df_id = df_elem.get("id")
-                df_version = df_elem.get("version", "*")
-                df_name = None
+                df_version = df_elem.get("version", "~")
 
-                # Extraction du nom si disponible
+                # Extraction du nom (première balise Name disponible)
+                df_name = None
                 name_elem = df_elem.find(".//com:Name", namespaces)
                 if name_elem is not None and name_elem.text:
                     df_name = name_elem.text
@@ -1085,7 +1318,7 @@ class EurostatClient:
                     "dataflow": df_id,
                     "agency": "ESTAT",
                     "version": df_version,
-                    "name": df_name
+                    "name": df_name,
                 })
 
             df = pd.DataFrame(dataflows)
