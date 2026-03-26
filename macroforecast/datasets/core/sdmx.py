@@ -14,6 +14,8 @@ class SDMXVersion(str, Enum):
     """SDMX API version."""
     V1 = "v1"
     V2 = "v2"
+    V2_1 = "v2_1"
+    V3 = "v3"
 
 
 # Classe spécifiant les types des formats pouvant être retournés
