@@ -187,7 +187,7 @@ class OECDClient:
         """
         try:
             # Construction du chemin vers le fichier de paramètres
-            params_path = Path(__file__).parent.parent.parent / "parameters" / "oecd.json"
+            params_path = Path(__file__).parents[3] / "parameters" / "oecd.json"
 
             # Vérification de l'existence du fichier
             if params_path.exists():
