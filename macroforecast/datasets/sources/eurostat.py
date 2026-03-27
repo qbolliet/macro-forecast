@@ -39,10 +39,11 @@ AGENCY_ID = "ESTAT"
 # Types et énumérations
 # ──────────────────────────────────────────────────────────────────────
 
-# Gestion des doublons
+# Type pour la gestion des doublons
 DuplicateHandling = Literal["ignore", "warn", "raise"]
 
-# Paramètres de requêtes de structure
+# Types pour les paramètres de requêtes de structure SDMX
+# Détails des structures
 StructureDetail = Literal[
     "full",
     "allstubs",
@@ -51,6 +52,7 @@ StructureDetail = Literal[
     "referencecompletestubs",
     "referencepartial",
 ]
+# Références des structures
 StructureReferences = Literal[
     "none",
     "parents",
@@ -62,6 +64,7 @@ StructureReferences = Literal[
 ]
 
 
+# Énumération des versions d'API SDMX Eurostat supportées
 class EurostatAPIVersion(str, Enum):
     """Supported Eurostat SDMX API versions.
 
@@ -74,6 +77,7 @@ class EurostatAPIVersion(str, Enum):
     V2_1 = "2.1"
 
 
+# Énumération des types d'artefacts structurels SDMX interrogeables
 class StructureResourceType(str, Enum):
     """SDMX structure resource types queryable via ``get_structure``.
 
@@ -92,6 +96,7 @@ class StructureResourceType(str, Enum):
     CODELIST = "codelist"
 
 
+# Énumération des formats de réponse pour les requêtes de données Eurostat
 class EurostatResponseFormat(str, Enum):
     """Response format for Eurostat SDMX data queries.
 
@@ -113,6 +118,7 @@ class EurostatResponseFormat(str, Enum):
 # ──────────────────────────────────────────────────────────────────────
 
 
+# Classe abstraite de construction d'endpoints et de paramètres par version d'API
 class EndpointBuilder(ABC):
     """Abstract base for version-specific URL and parameter construction.
 
@@ -121,7 +127,7 @@ class EndpointBuilder(ABC):
     """
 
     # ── Data endpoints ────────────────────────────────────────────────
-
+    # Méthode abstraite de construction du endpoint de téléchargement des données
     @abstractmethod
     def build_data_endpoint(
         self,
@@ -139,7 +145,8 @@ class EndpointBuilder(ABC):
         Returns:
             URL path segment (without base URL).
         """
-
+    
+    # Méthode abstraite de construction des paramètres de téléchargement des données
     @abstractmethod
     def build_data_params(
         self,
@@ -171,7 +178,7 @@ class EndpointBuilder(ABC):
         """
 
     # ── Structure endpoints ───────────────────────────────────────────
-
+    # Méthode abstraite de construction du endpoint de téléchargement de la structure des données
     @abstractmethod
     def build_structure_endpoint(
         self,
@@ -192,6 +199,7 @@ class EndpointBuilder(ABC):
             URL path segment (without base URL).
         """
 
+    # Méthode abstraite de construction des paramètres de téléchargement de la structure des données
     @abstractmethod
     def build_structure_params(
         self,
@@ -209,6 +217,7 @@ class EndpointBuilder(ABC):
         """
 
 
+# Constructeur d'endpoints pour l'API SDMX 3.0 (version principale)
 class EndpointBuilderV30(EndpointBuilder):
     """Endpoint builder for the SDMX 3.0 API.
 
@@ -225,11 +234,13 @@ class EndpointBuilderV30(EndpointBuilder):
         EurostatResponseFormat.XML: "structurespecificdata",
     }
 
+    # Construction de l'endpoint de données SDMX 3.0
     def build_data_endpoint(
         self, dataflow: str, agency: str, version: str
     ) -> str:
         return f"/sdmx/3.0/data/dataflow/{agency}/{dataflow}/{version}"
 
+    # Construction des paramètres de requête de données SDMX 3.0
     def build_data_params(
         self,
         dimensions: Optional[Dict[str, List[str]]],
@@ -242,6 +253,7 @@ class EndpointBuilderV30(EndpointBuilder):
         attributes: Optional[str],
         measures: Optional[str],
     ) -> Dict[str, str]:
+        # Initialisation du dictionnaire de paramètres
         params: Dict[str, str] = {}
 
         # Filtres de dimensions (c[DIM]=val1,val2)
@@ -276,6 +288,7 @@ class EndpointBuilderV30(EndpointBuilder):
 
         return params
 
+    # Construction de l'endpoint de structure SDMX 3.0
     def build_structure_endpoint(
         self,
         resource_type: StructureResourceType,
@@ -288,6 +301,7 @@ class EndpointBuilderV30(EndpointBuilder):
             f"/{agency}/{resource_id}/{version}"
         )
 
+    # Construction des paramètres de requête de structure SDMX 3.0
     def build_structure_params(
         self,
         detail: StructureDetail,
@@ -296,6 +310,7 @@ class EndpointBuilderV30(EndpointBuilder):
         return {"detail": detail, "references": references}
 
 
+# Constructeur d'endpoints pour l'API SDMX 2.1 (version legacy)
 class EndpointBuilderV21(EndpointBuilder):
     """Endpoint builder for the SDMX 2.1 API.
 
@@ -328,12 +343,14 @@ class EndpointBuilderV21(EndpointBuilder):
         StructureResourceType.CODELIST: "codelist",
     }
 
+    # Construction de l'endpoint de données SDMX 2.1
     def build_data_endpoint(
         self, dataflow: str, agency: str, version: str
     ) -> str:
         # Note : en 2.1, le path-key est ajouté ultérieurement par le client
         return f"/sdmx/2.1/data/{dataflow}"
 
+    # Construction des paramètres de requête de données SDMX 2.1
     def build_data_params(
         self,
         dimensions: Optional[Dict[str, List[str]]],
@@ -346,6 +363,7 @@ class EndpointBuilderV21(EndpointBuilder):
         attributes: Optional[str],
         measures: Optional[str],
     ) -> Dict[str, str]:
+        # Initialisation du dictionnaire de paramètres
         params: Dict[str, str] = {}
 
         # Période temporelle (startPeriod / endPeriod)
@@ -366,6 +384,7 @@ class EndpointBuilderV21(EndpointBuilder):
 
         return params
 
+    # Construction de l'endpoint de structure SDMX 2.1
     def build_structure_endpoint(
         self,
         resource_type: StructureResourceType,
@@ -384,6 +403,7 @@ class EndpointBuilderV21(EndpointBuilder):
             f"/{agency}/{resource_id}/{v21_version}"
         )
 
+    # Construction des paramètres de requête de structure SDMX 2.1
     def build_structure_params(
         self,
         detail: StructureDetail,
@@ -404,6 +424,7 @@ _ENDPOINT_BUILDERS: Dict[EurostatAPIVersion, EndpointBuilder] = {
 # ──────────────────────────────────────────────────────────────────────
 
 
+# Classe représentant une requête de données Eurostat
 @dataclass
 class EurostatQueryRequest:
     """Encapsulates all parameters needed for a ``get_data()`` call.
@@ -431,7 +452,7 @@ class EurostatQueryRequest:
         ... )
         >>> df = client.execute_query(query)
     """
-
+    # Attributs
     dataflow: str
     version: str = "*"
     dimensions: Optional[Dict[str, Union[str, List[str]]]] = None
@@ -447,6 +468,7 @@ class EurostatQueryRequest:
     split_dimensions: Optional[List[str]] = None
     max_split_combinations: int = 100
 
+    # Méthode de conversion des paramètres en dictionnaire de kwargs
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary suitable for ``get_data()`` kwargs.
 
@@ -470,6 +492,7 @@ class EurostatQueryRequest:
             "max_split_combinations": self.max_split_combinations,
         }
 
+    # Méthode d'extraction de la clé unique associée au dataflow
     def get_dataflow_key(self) -> str:
         """Get unique key for this dataflow.
 
@@ -484,6 +507,7 @@ class EurostatQueryRequest:
 # ──────────────────────────────────────────────────────────────────────
 
 
+# Initialisation du client haut niveau pour l'API SDMX Eurostat
 class EurostatClient:
     """High-level client for the Eurostat SDMX API.
 
@@ -511,13 +535,13 @@ class EurostatClient:
         ... )
     """
 
-    # URLs par défaut pour chaque version d'API
+    # URLs de base par défaut pour chaque version d'API
     _DEFAULT_BASE_URLS: Dict[EurostatAPIVersion, str] = {
         EurostatAPIVersion.V3_0: "https://ec.europa.eu/eurostat/api/dissemination",
         EurostatAPIVersion.V2_1: "https://ec.europa.eu/eurostat/api/dissemination",
     }
 
-    # URLs Comext par version d'API
+    # URLs Comext par version d'API (pour les datasets DS-*)
     _COMEXT_BASE_URLS: Dict[EurostatAPIVersion, str] = {
         EurostatAPIVersion.V3_0: "https://ec.europa.eu/eurostat/api/comext/dissemination",
         EurostatAPIVersion.V2_1: "https://ec.europa.eu/eurostat/api/comext/dissemination",
@@ -530,13 +554,14 @@ class EurostatClient:
         "com": "http://www.sdmx.org/resources/sdmxml/schemas/v3_0/common",
     }
 
-    # Namespaces XML SDMX 2.1
+    # Namespaces XML SDMX 2.1 (fallback)
     _SDMX21_NS = {
         "mes": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message",
         "str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
         "com": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common",
     }
 
+    # Initialisation
     def __init__(
         self,
         api_version: EurostatAPIVersion = EurostatAPIVersion.V3_0,
@@ -574,6 +599,7 @@ class EurostatClient:
     # Méthodes publiques — Données
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode publique principale de récupération de données
     def get_data(
         self,
         dataflow: str,
@@ -615,21 +641,21 @@ class EurostatClient:
         Raises:
             ValueError: If data retrieval fails.
         """
-        # Application du rate limiter
+        # Application du rate limiter avant la requête
         if self.rate_limiter:
             self.rate_limiter.wait()
 
-        # Normalisation des dimensions
+        # Normalisation des dimensions (conversion str → List[str])
         normalized_dims = self._normalize_dimensions(dimensions)
 
-        # Chargement de la structure si disponible
+        # Chargement de la structure si disponible (non fatal en cas d'échec)
         structure = None
         try:
             structure = self._ensure_structure(dataflow, version)
         except Exception as e:
             logger.warning(f"Could not load structure: {e}")
 
-        # Gestion du split_dimensions
+        # Gestion du split_dimensions : génération et exécution des sous-requêtes
         if split_dimensions and normalized_dims:
             request_combinations = self._generate_request_combinations(
                 normalized_dims, split_dimensions, max_split_combinations
@@ -667,11 +693,11 @@ class EurostatClient:
         # Sélection du client API (standard ou Comext)
         client = self._get_api_client(dataflow)
 
-        # Requête des données
+        # Requête des données et parsing selon le format
         try:
             response = client.get(endpoint, params=params)
 
-            # Parsing de la réponse selon le format
+            # Parsing de la réponse selon le format demandé
             if format == EurostatResponseFormat.CSV:
                 df = self._parse_csv_response(response.text)
             elif format == EurostatResponseFormat.TSV:
@@ -681,19 +707,21 @@ class EurostatClient:
             else:
                 raise ValueError(f"Unsupported format: {format}")
 
-            # Vérification des doublons
+            # Vérification des doublons dans le DataFrame résultant
             self._check_duplicates(df, normalized_dims, structure, on_duplicate)
 
-            # Post-filtrage si nécessaire
+            # Post-filtrage par dimensions si nécessaire
             if normalized_dims:
                 df = self._filter_dataframe_by_dimensions(df, normalized_dims)
 
             logger.info(f"Retrieved {len(df)} rows from {dataflow}")
             return df
+        # Gestion des erreurs de requête et de parsing
         except Exception as e:
             logger.error(f"Data retrieval failed: {e}")
             raise ValueError(f"Failed to retrieve data from {dataflow}: {e}")
 
+    # Méthode publique d'exécution d'un objet EurostatQueryRequest
     def execute_query(self, query: EurostatQueryRequest) -> pd.DataFrame:
         """Execute an ``EurostatQueryRequest``.
 
@@ -706,12 +734,14 @@ class EurostatClient:
         Raises:
             ValueError: If query execution fails.
         """
+        # Délégation à get_data avec les paramètres de la requête
         return self.get_data(**query.to_dict())
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes publiques — Structure
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode publique unifiée de requête d'artefacts structurels SDMX
     def get_structure(
         self,
         resource_type: StructureResourceType,
@@ -764,9 +794,11 @@ class EurostatClient:
         # Sélection du client API (Comext si nécessaire)
         client = self._get_api_client(dataflow or resource_id)
 
+        # Requête de l'artefact structurel
         try:
             response = client.get(endpoint, params=params)
             return response.text
+        # Gestion des erreurs de requête
         except Exception as e:
             logger.error(
                 f"Failed to fetch {resource_type.value}/{resource_id}: {e}"
@@ -775,10 +807,11 @@ class EurostatClient:
                 f"Failed to fetch {resource_type.value} '{resource_id}': {e}"
             )
 
+    # Méthode publique de récupération et parsing de la DSD d'un dataflow
     def get_dataflow_structure(
         self,
         dataflow: str,
-        version: str = "~",
+        version: str = "+",
     ) -> DataflowStructure:
         """Retrieve and parse the DSD for a dataflow.
 
@@ -787,7 +820,7 @@ class EurostatClient:
 
         Args:
             dataflow: Dataflow identifier.
-            version: Dataflow version (``"~"`` for latest).
+            version: Dataflow version (``"+"`` for latest).
 
         Returns:
             Parsed ``DataflowStructure`` with dimension information.
@@ -795,24 +828,28 @@ class EurostatClient:
         Raises:
             ValueError: If the structure cannot be retrieved or parsed.
         """
+        # Requête du XML brut via get_structure (endpoint datastructure)
         xml_text = self.get_structure(
             StructureResourceType.DATASTRUCTURE,
             resource_id=dataflow.upper(),
             version=version,
             dataflow=dataflow,
         )
+        # Parsing du XML et retour de la structure de dataflow
         return self._parse_structure_response(xml_text, dataflow)
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes publiques — Registre de structures
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode publique d'enregistrement d'une structure pré-chargée
     def register_structure(self, structure: DataflowStructure) -> None:
         """Register a pre-loaded structure in the internal registry.
 
         Args:
             structure: DataflowStructure to register.
         """
+        # Enregistrement de la structure dans le registre interne
         self.structure_registry.register(structure)
         logger.info(f"Registered structure for {structure.dataflow}")
 
@@ -820,14 +857,18 @@ class EurostatClient:
     # Context manager et fermeture des ressources
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode de fermeture des connexions HTTP
     def close(self) -> None:
         """Close API client connections."""
+        # Fermeture du client API standard
         if self.api_client:
             self.api_client.close()
+        # Fermeture du client Comext si initialisé
         if self._comext_client:
             self._comext_client.close()
         logger.info("Eurostat client closed")
 
+    # Entrée du context manager
     def __enter__(self) -> "EurostatClient":
         """Context manager entry.
 
@@ -836,6 +877,7 @@ class EurostatClient:
         """
         return self
 
+    # Sortie du context manager avec fermeture des ressources
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         """Context manager exit.
 
@@ -850,6 +892,7 @@ class EurostatClient:
     # Méthodes privées — Sélection du client API
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode statique de détection des datasets Comext (préfixe DS-)
     @staticmethod
     def _is_comext_dataset(dataflow: str) -> bool:
         """Detect if a dataflow belongs to the Comext database.
@@ -860,14 +903,17 @@ class EurostatClient:
         Returns:
             True if the dataflow starts with ``'DS-'``.
         """
+        # Détection du préfixe DS- caractéristique des datasets Comext
         return dataflow.upper().startswith("DS-")
 
+    # Méthode d'accès au client Comext avec initialisation paresseuse
     def _get_comext_client(self) -> APIClient:
         """Get or create the Comext API client (lazy initialisation).
 
         Returns:
             ``APIClient`` instance for the Comext endpoint.
         """
+        # Création du client Comext si non encore initialisé
         if self._comext_client is None:
             comext_url = self._COMEXT_BASE_URLS[self.api_version]
             self._comext_client = APIClient(
@@ -875,6 +921,7 @@ class EurostatClient:
             )
         return self._comext_client
 
+    # Méthode de sélection du client API approprié selon le dataflow
     def _get_api_client(self, dataflow: str) -> APIClient:
         """Return the appropriate API client for a given dataflow.
 
@@ -884,6 +931,7 @@ class EurostatClient:
         Returns:
             Standard or Comext ``APIClient``.
         """
+        # Redirection vers le client Comext pour les datasets DS-*
         if self._is_comext_dataset(dataflow):
             return self._get_comext_client()
         return self.api_client
@@ -892,6 +940,7 @@ class EurostatClient:
     # Méthodes privées — Configuration
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode auxiliaire de chargement du rate limiter depuis le fichier de configuration
     def _load_rate_limiter(self) -> Optional[RateLimiter]:
         """Load rate limiter from ``parameters/eurostat.json``.
 
@@ -899,12 +948,15 @@ class EurostatClient:
             ``RateLimiter`` instance or *None* if configuration not found.
         """
         try:
+            # Construction du chemin vers le fichier de paramètres
             params_path = (
                 Path(__file__).parents[3] / "parameters" / "eurostat.json"
             )
+            # Lecture et parsing du fichier de configuration si existant
             if params_path.exists():
                 with open(params_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
+                # Extraction de la configuration du rate limiter
                 if "RATE_LIMIT" in config:
                     rate_config = config["RATE_LIMIT"]
                     return RateLimiter(
@@ -912,8 +964,10 @@ class EurostatClient:
                         unit=rate_config.get("unit", "minutes"),
                         count=rate_config.get("count", 1),
                     )
+            # Logging si aucune configuration de rate limit trouvée
             logger.debug("No RATE_LIMIT configuration found")
             return None
+        # Gestion des erreurs de lecture ou de parsing
         except Exception as e:
             logger.warning(f"Failed to load rate limiter config: {e}")
             return None
@@ -922,6 +976,7 @@ class EurostatClient:
     # Méthodes privées — Parsing des réponses
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode statique de parsing de réponse SDMX-CSV
     @staticmethod
     def _parse_csv_response(text: str) -> pd.DataFrame:
         """Parse an SDMX-CSV response.
@@ -935,12 +990,15 @@ class EurostatClient:
         Raises:
             ValueError: If CSV parsing fails.
         """
+        # Parsing direct du CSV avec pandas
         try:
             return pd.read_csv(StringIO(text))
+        # Gestion des erreurs de parsing
         except Exception as e:
             logger.error(f"CSV parsing failed: {e}")
             raise ValueError(f"Failed to parse CSV response: {e}")
 
+    # Méthode statique de parsing du format TSV Eurostat (format large avec flags)
     @staticmethod
     def _parse_tsv_response(text: str) -> pd.DataFrame:
         """Parse Eurostat TSV format (wide format with flags).
@@ -958,22 +1016,23 @@ class EurostatClient:
             ValueError: If TSV parsing fails.
         """
         try:
+            # Lecture du TSV avec séparateur tabulation
             df = pd.read_csv(StringIO(text), sep="\t")
             index_col = df.columns[0]
 
-            # Colonnes de périodes (contiennent des chiffres)
+            # Sélection des colonnes de périodes (contiennent des chiffres)
             period_cols = [
                 col
                 for col in df.columns[1:]
                 if any(char.isdigit() for char in col)
             ]
 
-            # Extraction des dimensions depuis la première colonne
+            # Extraction des dimensions depuis la première colonne composite
             dimensions_split = df[index_col].str.split(",", expand=True)
             dim_names = [f"DIM_{i}" for i in range(len(dimensions_split.columns))]
             dimensions_split.columns = dim_names
 
-            # Construction du DataFrame long
+            # Reconstruction du DataFrame en format large puis conversion en format long
             df_wide = pd.concat(
                 [dimensions_split, df[period_cols].copy()], axis=1
             )
@@ -983,15 +1042,17 @@ class EurostatClient:
                 value_name="value",
             )
 
-            # Nettoyage des valeurs (suppression des flags)
+            # Nettoyage des valeurs (suppression des flags et conversion numérique)
             df_long["value"] = df_long["value"].astype(str).str.strip()
             df_long["value"] = pd.to_numeric(df_long["value"], errors="coerce")
 
             return df_long
+        # Gestion des erreurs de parsing
         except Exception as e:
             logger.error(f"TSV parsing failed: {e}")
             raise ValueError(f"Failed to parse TSV response: {e}")
 
+    # Méthode statique de parsing de réponse JSON-stat 2.0
     @staticmethod
     def _parse_json_response(data: Dict[str, Any]) -> pd.DataFrame:
         """Parse a JSON-stat 2.0 response.
@@ -1006,14 +1067,18 @@ class EurostatClient:
             ValueError: If JSON parsing fails.
         """
         try:
+            # Extraction des dimensions et des observations depuis la réponse
             dimensions = data.get("dimension", {})
             observations = data.get("observation", {})
 
+            # Construction des lignes du DataFrame à partir des observations
             rows = []
             for obs_key, value in observations.items():
+                # Parsing de la clé d'observation (format : "0:1:2:...")
                 indices = list(map(int, obs_key.split(":")))
                 row: Dict[str, Any] = {}
 
+                # Mapping des indices positionnels vers les codes de dimensions
                 for i, (dim_name, dim_info) in enumerate(dimensions.items()):
                     if i < len(indices):
                         dim_idx = indices[i]
@@ -1022,14 +1087,17 @@ class EurostatClient:
                             if dim_idx in categories:
                                 row[dim_name] = categories[dim_idx]
 
+                # Ajout de la valeur d'observation à la ligne courante
                 row["value"] = value
                 rows.append(row)
 
             return pd.DataFrame(rows)
+        # Gestion des erreurs de parsing
         except Exception as e:
             logger.error(f"JSON parsing failed: {e}")
             raise ValueError(f"Failed to parse JSON response: {e}")
 
+    # Méthode de parsing d'une réponse SDMX-ML et d'extraction des dimensions
     def _parse_structure_response(
         self, xml_content: str, dataflow: str
     ) -> DataflowStructure:
@@ -1048,21 +1116,23 @@ class EurostatClient:
             ValueError: If XML parsing fails.
         """
         try:
+            # Parsing du document XML
             root = ET.fromstring(xml_content)
 
-            # Tentative SDMX 3.0 puis fallback 2.1
+            # Tentative avec les namespaces SDMX 3.0 puis fallback vers 2.1
             namespaces = self._SDMX3_NS
             structure_elem = root.find(".//str:DataStructure", namespaces)
             if structure_elem is None:
                 namespaces = self._SDMX21_NS
                 structure_elem = root.find(".//str:DataStructure", namespaces)
 
+            # Vérification de la présence de l'élément DataStructure
             if structure_elem is None:
                 raise ValueError(
                     "DataStructure element not found in XML response"
                 )
 
-            # Extraction des dimensions
+            # Extraction de la liste des dimensions depuis le DSD
             dimensions: list[DimensionInfo] = []
             dimension_list = structure_elem.find(
                 ".//str:DimensionList", namespaces
@@ -1075,6 +1145,7 @@ class EurostatClient:
                     position = dim.get("position", str(i))
                     description = None
 
+                    # Extraction de la description si disponible
                     desc_elem = dim.find(".//com:Description", namespaces)
                     if desc_elem is not None and desc_elem.text:
                         description = desc_elem.text
@@ -1087,6 +1158,7 @@ class EurostatClient:
                         )
                     )
 
+            # Construction et retour de la structure de dataflow
             return DataflowStructure(
                 agency=AGENCY_ID,
                 dataflow=dataflow,
@@ -1094,6 +1166,7 @@ class EurostatClient:
                 dimensions=dimensions,
                 description=None,
             )
+        # Gestion des erreurs de parsing XML
         except Exception as e:
             logger.error(f"Structure XML parsing failed: {e}")
             raise ValueError(f"Failed to parse structure response: {e}")
@@ -1102,6 +1175,7 @@ class EurostatClient:
     # Méthodes privées — Normalisation, filtrage, doublons
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode statique de normalisation des dimensions (str → List[str])
     @staticmethod
     def _normalize_dimensions(
         dimensions: Optional[Dict[str, Union[str, List[str]]]],
@@ -1114,13 +1188,16 @@ class EurostatClient:
         Returns:
             Normalised dimensions or *None*.
         """
+        # Retour immédiat si pas de dimensions à normaliser
         if not dimensions:
             return None
+        # Conversion des valeurs scalaires en listes unitaires
         return {
             k: [v] if isinstance(v, str) else v
             for k, v in dimensions.items()
         }
 
+    # Méthode statique de post-filtrage du DataFrame par valeurs de dimensions
     @staticmethod
     def _filter_dataframe_by_dimensions(
         df: pd.DataFrame,
@@ -1135,16 +1212,21 @@ class EurostatClient:
         Returns:
             Filtered DataFrame.
         """
+        # Retour immédiat si pas de filtres ou DataFrame vide
         if not filters or df.empty:
             return df
+        # Application successive des filtres par dimension
         result = df.copy()
         for col, values in filters.items():
             if col in result.columns:
+                # Normalisation des valeurs scalaires en liste
                 if isinstance(values, str):
                     values = [values]
+                # Filtrage par appartenance à la liste de valeurs autorisées
                 result = result[result[col].isin(values)]
         return result
 
+    # Méthode statique de détection et de gestion des doublons
     @staticmethod
     def _check_duplicates(
         df: pd.DataFrame,
@@ -1163,9 +1245,11 @@ class EurostatClient:
         Raises:
             ValueError: If ``on_duplicate='raise'`` and duplicates found.
         """
+        # Retour immédiat si le DataFrame est vide ou sans dimensions
         if df.empty or not dimensions:
             return
 
+        # Identification des colonnes de dimensions disponibles dans le DataFrame
         dim_cols = (
             [d.name for d in structure.dimensions]
             if structure
@@ -1175,11 +1259,13 @@ class EurostatClient:
         if not available_cols:
             return
 
+        # Construction de la liste de colonnes pour la détection des doublons
         check_cols = available_cols + (
             ["TIME_PERIOD"] if "TIME_PERIOD" in df.columns else []
         )
         duplicates = df[check_cols].duplicated().sum()
 
+        # Application de la stratégie de gestion des doublons
         if duplicates > 0:
             message = f"Found {duplicates} duplicate rows"
             if on_duplicate == "raise":
@@ -1191,6 +1277,7 @@ class EurostatClient:
     # Méthodes privées — Chargement de structure à la demande
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode d'assurance de la disponibilité de la structure d'un dataflow
     def _ensure_structure(
         self, dataflow: str, version: str = "*"
     ) -> DataflowStructure:
@@ -1206,24 +1293,26 @@ class EurostatClient:
         Raises:
             ValueError: If the structure cannot be retrieved.
         """
-        # Vérification dans le cache
+        # Vérification dans le cache avant tout appel API
         key = f"{dataflow}::{version}"
         cached = self.structure_registry.get(key)
         if cached:
             return cached
 
-        # Chargement via API si non cachée
+        # Chargement via API et mise en cache si auto_fetch_structure est activé
         if self.auto_fetch_structure:
             structure = self.get_dataflow_structure(dataflow, version)
             self.register_structure(structure)
             return structure
 
+        # Levée d'une erreur si la structure est introuvable et le fetch désactivé
         raise ValueError(f"Structure not found for {dataflow}::{version}")
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes privées — Requêtes splitées
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode statique de génération des combinaisons de dimensions pour le split
     @staticmethod
     def _generate_request_combinations(
         dimensions: Dict[str, List[str]],
@@ -1243,20 +1332,24 @@ class EurostatClient:
         Raises:
             ValueError: If combinations exceed *max_combinations*.
         """
+        # Séparation des dimensions à splitter de celles à conserver intactes
         split_dims_set = set(split_dims)
         split_dict = {k: v for k, v in dimensions.items() if k in split_dims_set}
         keep_dict = {k: v for k, v in dimensions.items() if k not in split_dims_set}
 
+        # Génération du produit cartésien des valeurs des dimensions à splitter
         split_keys = list(split_dict.keys())
         split_values = [split_dict[k] for k in split_keys]
         combinations = list(itertools.product(*split_values))
 
+        # Vérification du nombre de combinaisons avant traitement
         if len(combinations) > max_combinations:
             raise ValueError(
                 f"Split combinations ({len(combinations)}) exceed "
                 f"max allowed ({max_combinations})"
             )
 
+        # Construction des dictionnaires de dimensions pour chaque combinaison
         result = []
         for combo in combinations:
             dims = keep_dict.copy()
@@ -1265,6 +1358,7 @@ class EurostatClient:
             result.append(dims)
         return result
 
+    # Méthode d'exécution des requêtes splitées et de concaténation des résultats
     def _execute_split_requests(
         self,
         dataflow: str,
@@ -1297,7 +1391,10 @@ class EurostatClient:
         Returns:
             Concatenated DataFrame from all requests.
         """
+        # Initialisation de la liste des DataFrames résultants
         dfs: list[pd.DataFrame] = []
+
+        # Exécution de chaque sous-requête correspondant à une combinaison de dimensions
         for dims in request_combinations:
             try:
                 df = self.get_data(
@@ -1312,14 +1409,16 @@ class EurostatClient:
                     compress=compress,
                     attributes=attributes,
                     measures=measures,
-                    on_duplicate="ignore",
-                    split_dimensions=None,
+                    on_duplicate="ignore",  # Désactivation des logs de doublons répétés
+                    split_dimensions=None,  # Désactivation du split récursif
                 )
                 dfs.append(df)
+            # Gestion des erreurs par sous-requête (non fatale)
             except Exception as e:
                 logger.error(f"Split request failed for {dims}: {e}")
                 continue
 
+        # Concaténation des résultats ou retour d'un DataFrame vide si tout a échoué
         if dfs:
             return pd.concat(dfs, ignore_index=True)
         return pd.DataFrame()
