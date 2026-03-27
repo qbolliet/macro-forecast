@@ -366,7 +366,7 @@ class OECDClient:
             else:
                 raise NotImplementedError(f"Format {format} not yet implemented")
 
-            # IMPORTANT: Filtrer AVANT check_duplicates
+            # IMPORTANT: Filtre AVANT check_duplicates
             if dims_for_postfilter:
                 df = self._filter_dataframe_by_dimensions(df, dims_for_postfilter)
 
