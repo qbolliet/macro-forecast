@@ -62,7 +62,15 @@ StructureReferences = Literal[
     "descendants",
     "all",
 ]
-
+# Compression des structures
+StructureCompress = Literal["true", "false"]
+# Type de détail des données
+DataDetail = Literal[
+    "full",
+    "dataonly",
+    "serieskeysonly",
+    "nodata"
+]
 
 # Énumération des versions d'API SDMX Eurostat supportées
 class EurostatAPIVersion(str, Enum):
@@ -203,8 +211,8 @@ class EndpointBuilder(ABC):
     @abstractmethod
     def build_structure_params(
         self,
+        references: str,
         detail: StructureDetail,
-        references: StructureReferences,
     ) -> Dict[str, str]:
         """Build query parameters for a structure request.
 
@@ -225,6 +233,8 @@ class EndpointBuilderV30(EndpointBuilder):
         data: ``/sdmx/3.0/data/dataflow/{agency}/{resource}/{version}``
         structure: ``/sdmx/3.0/structure/{type}/{agency}/{resource}/{version}``
     """
+    # Adresse de base du header
+    ACCEPT_HEADER = "application/vnd.sdmx.structure+xml;version=3.0.0"
 
     # Mapping des formats de réponse vers les valeurs de paramètre API
     _FORMAT_PARAM: Dict[EurostatResponseFormat, str] = {
@@ -234,11 +244,36 @@ class EndpointBuilderV30(EndpointBuilder):
         EurostatResponseFormat.XML: "structurespecificdata",
     }
 
+    # Construction des headers pour SDMX 3.0
+    def build_headers(
+        accept_encoding: Optional[str]=None,
+        accept_language: Optional[str]=None
+    ) -> Dict[str, str]:
+        # Initialisation du dictionnaire des headers
+        headers = { 'Accept' : self.ACCEPT_HEADER }
+        # Ajout des clés si spécifiées
+        if accept_encoding is not None:
+            headers['Accept-Encoding'] = accept_encoding
+        if accept_language is not None:
+            headers['Accept-Language'] = accept_language
+        # Retourne les headers
+        return headers
+
     # Construction de l'endpoint de données SDMX 3.0
     def build_data_endpoint(
-        self, dataflow: str, agency: str, version: str
+        self, dataflow: str, agency: str, version: str, key: Optional[str]
     ) -> str:
-        return f"/sdmx/3.0/data/dataflow/{agency}/{dataflow}/{version}"
+        """
+            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/data-query#APIDetailedguidelinesSDMX3.0APIdataquery-Overview
+            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Data%20queries/get_sdmx_3_0_data_dataflow__agencyID___resourceID___version___key_
+        """
+        # Construction du path de base
+        path = f"/sdmx/3.0/data/dataflow/{agency}/{dataflow}/{version}"
+        # Ajout de la clé si spécifiée
+        if key is not None:
+            path += f"/{key}"
+
+        return path
 
     # Construction des paramètres de requête de données SDMX 3.0
     def build_data_params(
@@ -248,11 +283,19 @@ class EndpointBuilderV30(EndpointBuilder):
         end_period: Optional[str],
         last_n_observations: Optional[int],
         first_n_observations: Optional[int],
-        response_format: EurostatResponseFormat,
-        compress: bool,
         attributes: Optional[str],
         measures: Optional[str],
+        response_format: Optional[EurostatResponseFormat],
+        response_format_version: Optional[str],
+        lang: Optional[str],
+        labels: Optional[str],
+        compress: bool,
+        return_data: Optional[str]
     ) -> Dict[str, str]:
+        """
+            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/data-query#APIDetailedguidelinesSDMX3.0APIdataquery-Overview
+            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Data%20queries/get_sdmx_3_0_data_dataflow__agencyID___resourceID___version___key_
+        """
         # Initialisation du dictionnaire de paramètres
         params: Dict[str, str] = {}
 
@@ -276,15 +319,32 @@ class EndpointBuilderV30(EndpointBuilder):
         if first_n_observations is not None:
             params["firstNObservations"] = str(first_n_observations)
 
-        # Format et compression
-        params["format"] = self._FORMAT_PARAM[response_format]
-        params["compress"] = "true" if compress else "false"
-
         # Attributs et mesures optionnels
         if attributes:
             params["attributes"] = attributes
         if measures:
             params["measures"] = measures
+
+        # Format
+        if response_format:
+            params["format"] = self._FORMAT_PARAM[response_format]
+        if response_format_version:
+            params["formatVersion"] = response_format_version
+        
+        # Langue 
+        if lang:
+            params["lang"] = lang
+
+        # Labels
+        if labels is not None :
+            params["labels"] = labels
+        
+        # Compression
+        params["compress"] = "true" if compress else "false"
+
+        # Données
+        if return_data:
+            params["returnData"]= return_data
 
         return params
 
@@ -292,10 +352,14 @@ class EndpointBuilderV30(EndpointBuilder):
     def build_structure_endpoint(
         self,
         resource_type: StructureResourceType,
-        resource_id: str,
         agency: str,
+        resource_id: str,
         version: str,
     ) -> str:
+        """
+            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/structure-queries
+            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Structure%20queries/get_sdmx_3_0_structure_dataflow__agencyID___resourceID_
+        """
         return (
             f"/sdmx/3.0/structure/{resource_type.value}"
             f"/{agency}/{resource_id}/{version}"
@@ -304,10 +368,33 @@ class EndpointBuilderV30(EndpointBuilder):
     # Construction des paramètres de requête de structure SDMX 3.0
     def build_structure_params(
         self,
-        detail: StructureDetail,
-        references: StructureReferences,
+        references: Optional[StructureReferences]="none",
+        detail: Optional[StructureDetail]="full",
+        format: Optional[str]="structure",
+        format_version: Optional[str]="3.0",
+        compress: Optional[StructureCompress]="true"
     ) -> Dict[str, str]:
-        return {"detail": detail, "references": references}
+        """
+            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/structure-queries
+            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Structure%20queries/get_sdmx_3_0_structure_dataflow__agencyID___resourceID_
+        """
+        # Initialisation du dictionnaire des paramètres
+        params = {}
+
+        # Ajout des clés quand elles sont non nulles
+        if references is not None:
+            params["references"] = references
+        if detail is not None:
+            params["detail"] = detail
+        if format is not None:
+            params["format"] = format
+        if format_version is not None:
+            params["formatVersion"] = format_version
+        if compress is not None:
+            params["compress"] = compress
+        
+        # Retourne le dictionnaire des paramètres
+        return params
 
 
 # Constructeur d'endpoints pour l'API SDMX 2.1 (version legacy)
@@ -325,6 +412,8 @@ class EndpointBuilderV21(EndpointBuilder):
         * ``dataconstraint`` is mapped to ``contentconstraint``.
         * The latest-version token is ``latest`` (not ``~``).
     """
+    # Adresse de base du header
+    ACCEPT_HEADER = "application/vnd.sdmx.structure+xml;version=2.1"
 
     # Mapping des formats de réponse vers les valeurs de paramètre API 2.1
     _FORMAT_PARAM: Dict[EurostatResponseFormat, str] = {
@@ -343,26 +432,68 @@ class EndpointBuilderV21(EndpointBuilder):
         StructureResourceType.CODELIST: "codelist",
     }
 
+    # Construction des headers pour SDMX 2.1
+    def build_headers(
+        accept_encoding: Optional[str]=None,
+        accept_language: Optional[str]=None
+    ) -> Dict[str, str]:
+        # Initialisation du dictionnaire des headers
+        headers = { 'Accept' : self.ACCEPT_HEADER }
+        # Ajout des clés si spécifiées
+        if accept_encoding is not None:
+            headers['Accept-Encoding'] = accept_encoding
+        if accept_language is not None:
+            headers['Accept-Language'] = accept_language
+        # Retourne les headers
+        return headers
+
     # Construction de l'endpoint de données SDMX 2.1
     def build_data_endpoint(
-        self, dataflow: str, agency: str, version: str
+        self, agency: Optional[str], dataflow: str, version: Optional[str], key: str = "all"
     ) -> str:
+        """
+            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/data-query
+            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Data%20queries/get_sdmx_2_1_data__flow___key_
+            flow *
+            string
+            (path)
+                
+
+            The statistical domain (aka dataflow) of the data to be returned.
+
+            Examples:
+
+                EXR: The ID of the domain
+                ECB,EXR: The EXR domain, maintained by the ECB
+                ECB,EXR,1.0: Version 1.0 of the EXR domain, maintained by the ECB
+        """
+        # Construction du flow
+        flow = dataflow
+        # Ajout de l'agency si précisé
+        if agency is not None:
+            flow = f"{agency},"+flow
+        # Ajout de la version si spécifiée
+        if version is not None:
+            flow = flow + f",{version}"
         # Note : en 2.1, le path-key est ajouté ultérieurement par le client
-        return f"/sdmx/2.1/data/{dataflow}"
+        return f"/sdmx/2.1/data/{flow}/{key}"
 
     # Construction des paramètres de requête de données SDMX 2.1
     def build_data_params(
         self,
-        dimensions: Optional[Dict[str, List[str]]],
         start_period: Optional[str],
         end_period: Optional[str],
         last_n_observations: Optional[int],
         first_n_observations: Optional[int],
-        response_format: EurostatResponseFormat,
-        compress: bool,
-        attributes: Optional[str],
-        measures: Optional[str],
+        dimension_at_observation: Optional[str],
+        detail: Optional[DataDetail],
+        compressed: Optional[bool],
+        return_data: Optional[str]
     ) -> Dict[str, str]:
+        """
+            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/data-query
+            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Data%20queries/get_sdmx_2_1_data__flow___key_
+        """
         # Initialisation du dictionnaire de paramètres
         params: Dict[str, str] = {}
 
@@ -373,14 +504,19 @@ class EndpointBuilderV21(EndpointBuilder):
             params["endPeriod"] = end_period
 
         # Paramètres d'observations
+        if first_n_observations is not None:
+            params["firstNObservations"] = str(first_n_observations)
         if last_n_observations is not None:
             params["lastNObservations"] = str(last_n_observations)
-        # Note : firstNObservations n'est pas supporté en 2.1
 
         # Format et compression
-        params["format"] = self._FORMAT_PARAM[response_format]
-        if compress:
-            params["compress"] = "true"
+        if dimension_at_observation:
+            params["dimensionAtObservation"] = dimension_at_observation
+        if detail:
+            params["detail"] = detail
+        params["compressed"] = "true" if compressed else "false"
+        if return_data:
+            params["returnData"] = return_data
 
         return params
 
@@ -388,15 +524,19 @@ class EndpointBuilderV21(EndpointBuilder):
     def build_structure_endpoint(
         self,
         resource_type: StructureResourceType,
-        resource_id: str,
         agency: str,
+        resource_id: str,
         version: str,
     ) -> str:
+        """
+            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/structure-queries#APIDetailedguidelinesSDMX2.1APIstructurequeries-Multiplevaluesandwildcardvaluesupport
+            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Structure%20queries/get_sdmx_2_1_dataflow__agencyID___resourceID___version_
+        """
         # Conversion du type de ressource vers la terminologie 2.1
         mapped_type = self._RESOURCE_MAP[resource_type]
 
-        # Conversion du token de version (~ → latest)
-        v21_version = "latest" if version in ("~", "*") else version
+        # Conversion du token de version (+ → latest, * → all)
+        v21_version = "latest" if version == "+" else ("all" if version == "*" else version)
 
         return (
             f"/sdmx/2.1/{mapped_type}"
@@ -406,10 +546,22 @@ class EndpointBuilderV21(EndpointBuilder):
     # Construction des paramètres de requête de structure SDMX 2.1
     def build_structure_params(
         self,
-        detail: StructureDetail,
-        references: StructureReferences,
+        references: Optional[StructureReferences]="none",
+        detail: Optional[StructureDetail]="full"
     ) -> Dict[str, str]:
-        return {"detail": detail, "references": references}
+        """
+            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/structure-queries#APIDetailedguidelinesSDMX2.1APIstructurequeries-Multiplevaluesandwildcardvaluesupport
+            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Structure%20queries/get_sdmx_2_1_dataflow__agencyID___resourceID___version_
+        """
+        # Initialisation du dictionnaire de paramètres
+        params = {}
+        # Ajout des clés
+        if detail is not None:
+            params["detail"]=detail
+        if references is not None:
+            params["references"]=references
+        # Retourne le dictionnaire de paramètres
+        return params
 
 
 # Registre des builders par version d'API
@@ -747,10 +899,14 @@ class EurostatClient:
         resource_type: StructureResourceType,
         resource_id: str,
         agency: str = AGENCY_ID,
-        version: str = "~",
-        detail: StructureDetail = "full",
+        version: str = "+",
         references: StructureReferences = "none",
-        dataflow: Optional[str] = None,
+        detail: StructureDetail = "full",
+        format:,
+        format_version:,
+        compress:,
+        accept_encoding:,
+        accept_language:,
     ) -> str:
         """Query an SDMX structure artefact and return raw XML.
 
@@ -762,12 +918,10 @@ class EurostatClient:
             resource_type: Type of structure artefact to retrieve.
             resource_id: Artefact identifier (e.g., ``"namq_10_gdp"``).
             agency: Maintaining agency (default: ``AGENCY_ID``).
-            version: Artefact version. Use ``"~"`` for latest (``"latest"``
+            version: Artefact version. Use ``"+"`` for latest (``"latest"``
                 is used automatically when the 2.1 builder is active).
             detail: Level of detail (default: ``"full"``).
             references: Related artefacts to include (default: ``"none"``).
-            dataflow: Optional dataflow hint used only to select the correct
-                API client (standard vs. Comext).
 
         Returns:
             Raw XML response text.
@@ -792,7 +946,7 @@ class EurostatClient:
         params = self.endpoint_builder.build_structure_params(detail, references)
 
         # Sélection du client API (Comext si nécessaire)
-        client = self._get_api_client(dataflow or resource_id)
+        client = self._get_api_client(resource_id)
 
         # Requête de l'artefact structurel
         try:
@@ -836,7 +990,7 @@ class EurostatClient:
             dataflow=dataflow,
         )
         # Parsing du XML et retour de la structure de dataflow
-        return self._parse_structure_response(xml_text, dataflow)
+        return xml_text #self._parse_structure_response(xml_text, dataflow)
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes publiques — Registre de structures
