@@ -1450,9 +1450,15 @@ class EurostatClient:
         Convenience wrapper around ``get_structure`` that returns a parsed
         ``DataflowStructure`` instead of raw XML.
 
+        The version wildcards ``"*"`` and ``"~"`` are valid for data
+        endpoints but cause HTTP 500 errors on Eurostat's structure endpoint.
+        They are therefore remapped to ``"+"`` (latest version) before the
+        structure request is issued.
+
         Args:
             dataflow: Dataflow identifier.
-            version: Dataflow version (``"+"`` for latest).
+            version: Dataflow version (``"+"`` for latest). The wildcards
+                ``"*"`` and ``"~"`` are automatically remapped to ``"+"``.
 
         Returns:
             Parsed ``DataflowStructure`` with dimension information.
@@ -1460,12 +1466,17 @@ class EurostatClient:
         Raises:
             ValueError: If the structure cannot be retrieved or parsed.
         """
+        # Remapping des wildcards "data" vers "+" (dernière version) pour la structure :
+        # l'API Eurostat renvoie HTTP 500 pour "*" et "~" sur l'endpoint /structure/datastructure
+        _UNSUPPORTED_STRUCTURE_VERSIONS = {"*", "~"}
+        structure_version = "+" if version in _UNSUPPORTED_STRUCTURE_VERSIONS else version
+
         # Requête du XML brut via get_structure (endpoint datastructure, avec descendants)
         xml_text = self.get_structure(
             resource_type=StructureResourceType.DATASTRUCTURE,
             resource_id=dataflow,
             agency=AGENCY_ID,
-            version=version,
+            version=structure_version,
             references="descendants",
             compress="false"
         )
@@ -2281,4 +2292,3 @@ class EurostatClient:
         if dfs:
             return pd.concat(dfs, ignore_index=True)
         return pd.DataFrame()
-    
