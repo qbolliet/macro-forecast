@@ -7,14 +7,15 @@ their SDMX API and converting responses to pandas DataFrames. Both SDMX 3.0
 # Importation des modules
 # Modules de base
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
+import gzip
 from io import StringIO
 import itertools
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -132,7 +133,32 @@ class EndpointBuilder(ABC):
 
     Subclasses implement the endpoint layout and query-parameter conventions
     for a given SDMX API version.
+
+    All method signatures span the **union** of parameters supported by
+    SDMX 3.0 and SDMX 2.1.  Version-specific parameters that are not
+    applicable to a given subclass are silently ignored by that subclass.
+    Callers should always use keyword arguments so that optional
+    version-specific parameters can be forwarded transparently.
     """
+
+    # ── Headers ───────────────────────────────────────────────────────
+    # Méthode abstraite de construction des headers HTTP
+    @abstractmethod
+    def build_headers(
+        self,
+        accept_encoding: Optional[str] = None,
+        accept_language: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Build HTTP request headers.
+
+        Args:
+            accept_encoding: Value for the ``Accept-Encoding`` header.
+            accept_language: Value for the ``Accept-Language`` header.
+
+        Returns:
+            HTTP headers dictionary including at minimum the ``Accept``
+            header for the SDMX version handled by this builder.
+        """
 
     # ── Data endpoints ────────────────────────────────────────────────
     # Méthode abstraite de construction du endpoint de téléchargement des données
@@ -142,6 +168,7 @@ class EndpointBuilder(ABC):
         dataflow: str,
         agency: str,
         version: str,
+        key: Optional[str] = None,
     ) -> str:
         """Build the URL path for a data query.
 
@@ -149,37 +176,71 @@ class EndpointBuilder(ABC):
             dataflow: Dataflow identifier.
             agency: Maintaining agency.
             version: Dataflow version.
+            key: Optional positional key for dimension filtering.
+                Used by SDMX 2.1 (path-based filtering); ignored by 3.0
+                when dimension filters are passed as query parameters.
 
         Returns:
             URL path segment (without base URL).
         """
-    
+
     # Méthode abstraite de construction des paramètres de téléchargement des données
     @abstractmethod
     def build_data_params(
         self,
-        dimensions: Optional[Dict[str, List[str]]],
-        start_period: Optional[str],
-        end_period: Optional[str],
-        last_n_observations: Optional[int],
-        first_n_observations: Optional[int],
-        response_format: "EurostatResponseFormat",
-        compress: bool,
-        attributes: Optional[str],
-        measures: Optional[str],
+        *,
+        # Commun aux deux versions
+        start_period: Optional[str] = None,
+        end_period: Optional[str] = None,
+        last_n_observations: Optional[int] = None,
+        first_n_observations: Optional[int] = None,
+        compress: bool = False,
+        # Spécifique SDMX 3.0
+        dimensions: Optional[Dict[str, List[str]]] = None,
+        response_format: Optional["EurostatResponseFormat"] = None,
+        response_format_version: Optional[str] = None,
+        lang: Optional[str] = None,
+        labels: Optional[str] = None,
+        attributes: Optional[str] = None,
+        measures: Optional[str] = None,
+        return_data: Optional[str] = None,
+        # Spécifique SDMX 2.1
+        dimension_at_observation: Optional[str] = None,
+        detail: Optional["DataDetail"] = None,
     ) -> Dict[str, str]:
         """Build query parameters for a data request.
 
+        All parameters are keyword-only to support transparent forwarding
+        across versions without relying on positional ordering.
+
         Args:
-            dimensions: Normalised dimension filters.
-            start_period: Start period filter.
+            start_period: Start period filter (ISO / SDMX format).
             end_period: End period filter.
-            last_n_observations: Number of most-recent observations.
-            first_n_observations: Number of first observations.
-            response_format: Desired response format.
+            last_n_observations: Number of most-recent observations to return.
+            first_n_observations: Number of first observations to return.
             compress: Whether to request gzip compression.
-            attributes: Attributes selection.
-            measures: Measures selection.
+            dimensions: Normalised dimension filters as
+                ``{dim_name: [value, ...]}``.
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
+            response_format: Desired response format enum value.
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
+            response_format_version: Format version string (e.g. ``"1.0"``).
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
+            lang: Language code for label localisation (e.g. ``"en"``).
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
+            labels: Label display mode (e.g. ``"name"``).
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
+            attributes: Attribute selection string (e.g. ``"dsd"``, ``"none"``).
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
+            measures: Measure selection string.
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
+            return_data: Return-data flag.
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
+            dimension_at_observation: Dimension serialised at observation
+                level (e.g. ``"AllDimensions"``).
+                **SDMX 2.1 only** — ignored by the 3.0 builder.
+            detail: Data detail level (e.g. ``"full"``, ``"dataonly"``).
+                **SDMX 2.1 only** — ignored by the 3.0 builder.
 
         Returns:
             Query-parameter dictionary.
@@ -197,11 +258,17 @@ class EndpointBuilder(ABC):
     ) -> str:
         """Build the URL path for a structure query.
 
+        The wildcard token ``"*"`` is accepted for both *resource_id* and
+        *agency* on all versions; subclasses map it to the
+        version-appropriate token (e.g. ``"all"`` for SDMX 2.1).
+
         Args:
             resource_type: Type of structure artefact.
-            resource_id: Artefact identifier.
-            agency: Maintaining agency.
-            version: Artefact version.
+            resource_id: Artefact identifier, or ``"*"`` for all artefacts.
+            agency: Maintaining agency, or ``"*"`` for all agencies.
+            version: Artefact version.  Use ``"+"`` for the latest version,
+                ``"*"`` for all versions, or ``"~"`` for the SDMX 3.0
+                latest-per-resource wildcard.
 
         Returns:
             URL path segment (without base URL).
@@ -211,14 +278,25 @@ class EndpointBuilder(ABC):
     @abstractmethod
     def build_structure_params(
         self,
-        references: str,
-        detail: StructureDetail,
+        references: Optional[StructureReferences] = "none",
+        detail: Optional[StructureDetail] = "full",
+        # Spécifique SDMX 3.0
+        format: Optional[str] = None,
+        format_version: Optional[str] = None,
+        compress: Optional[StructureCompress] = None,
     ) -> Dict[str, str]:
         """Build query parameters for a structure request.
 
         Args:
-            detail: Level of detail.
-            references: Related artefacts to include.
+            references: Related artefacts to include (default: ``"none"``).
+            detail: Level of detail (default: ``"full"``).
+            format: Response format string (e.g. ``"structure"``).
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
+            format_version: Format version string (e.g. ``"3.0"``).
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
+            compress: Whether to request gzip compression (``"true"`` /
+                ``"false"``).
+                **SDMX 3.0 only** — ignored by the 2.1 builder.
 
         Returns:
             Query-parameter dictionary.
@@ -227,12 +305,26 @@ class EndpointBuilder(ABC):
 
 # Constructeur d'endpoints pour l'API SDMX 3.0 (version principale)
 class EndpointBuilderV30(EndpointBuilder):
-    """Endpoint builder for the SDMX 3.0 API.
+    """Endpoint builder for the Eurostat SDMX 3.0 API.
+
+    Implements URL construction and query-parameter encoding following the
+    SDMX 3.0 conventions used by the Eurostat dissemination endpoint.
 
     URL patterns:
-        data: ``/sdmx/3.0/data/dataflow/{agency}/{resource}/{version}``
-        structure: ``/sdmx/3.0/structure/{type}/{agency}/{resource}/{version}``
+        data:
+            ``/sdmx/3.0/data/dataflow/{agency}/{resource}/{version}[/{key}]``
+        structure:
+            ``/sdmx/3.0/structure/{type}/{agency}/{resource}/{version}``
+
+    Attributes:
+        ACCEPT_HEADER: MIME type sent in the ``Accept`` request header.
+
+    Note:
+        Dimension filtering is performed via query parameters
+        (``c[DIM]=val1,val2``) rather than the URL path key, which is the
+        primary difference from the SDMX 2.1 approach.
     """
+
     # Adresse de base du header
     ACCEPT_HEADER = "application/vnd.sdmx.structure+xml;version=3.0.0"
 
@@ -246,55 +338,126 @@ class EndpointBuilderV30(EndpointBuilder):
 
     # Construction des headers pour SDMX 3.0
     def build_headers(
-        accept_encoding: Optional[str]=None,
-        accept_language: Optional[str]=None
+        self,
+        accept_encoding: Optional[str] = None,
+        accept_language: Optional[str] = None,
     ) -> Dict[str, str]:
+        """Build HTTP request headers for SDMX 3.0.
+
+        Args:
+            accept_encoding: Value for the ``Accept-Encoding`` header
+                (e.g. ``"gzip"``).
+            accept_language: Value for the ``Accept-Language`` header
+                (e.g. ``"en"``).
+
+        Returns:
+            HTTP headers dictionary with at minimum the ``Accept`` header
+            set to the SDMX 3.0 structure MIME type.
+        """
         # Initialisation du dictionnaire des headers
-        headers = { 'Accept' : self.ACCEPT_HEADER }
+        headers = {"Accept": self.ACCEPT_HEADER}
         # Ajout des clés si spécifiées
         if accept_encoding is not None:
-            headers['Accept-Encoding'] = accept_encoding
+            headers["Accept-Encoding"] = accept_encoding
         if accept_language is not None:
-            headers['Accept-Language'] = accept_language
-        # Retourne les headers
+            headers["Accept-Language"] = accept_language
         return headers
 
     # Construction de l'endpoint de données SDMX 3.0
     def build_data_endpoint(
-        self, dataflow: str, agency: str, version: str, key: Optional[str]
+        self,
+        dataflow: str,
+        agency: str,
+        version: str,
+        key: Optional[str] = None,
     ) -> str:
-        """
-            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/data-query#APIDetailedguidelinesSDMX3.0APIdataquery-Overview
-            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Data%20queries/get_sdmx_3_0_data_dataflow__agencyID___resourceID___version___key_
+        """Build the URL path for an SDMX 3.0 data query.
+
+        Full documentation:
+            https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/data-query#APIDetailedguidelinesSDMX3.0APIdataquery-Overview
+
+        Swagger UI:
+            https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Data%20queries/get_sdmx_3_0_data_dataflow__agencyID___resourceID___version___key_
+
+        Args:
+            dataflow: Dataflow identifier (e.g. ``"namq_10_gdp"``).
+            agency: Maintaining agency (e.g. ``"ESTAT"``).
+            version: Dataflow version.  Use ``"*"`` for the latest version.
+            key: Optional positional key for dimension filtering.
+                When provided, appended as a trailing path segment.
+                Not commonly used in SDMX 3.0 (prefer query-parameter
+                filtering via :meth:`build_data_params`).
+
+        Returns:
+            URL path segment (without base URL).
         """
         # Construction du path de base
         path = f"/sdmx/3.0/data/dataflow/{agency}/{dataflow}/{version}"
         # Ajout de la clé si spécifiée
         if key is not None:
             path += f"/{key}"
-
         return path
 
     # Construction des paramètres de requête de données SDMX 3.0
     def build_data_params(
         self,
-        dimensions: Optional[Dict[str, List[str]]],
-        start_period: Optional[str],
-        end_period: Optional[str],
-        last_n_observations: Optional[int],
-        first_n_observations: Optional[int],
-        attributes: Optional[str],
-        measures: Optional[str],
-        response_format: Optional[EurostatResponseFormat],
-        response_format_version: Optional[str],
-        lang: Optional[str],
-        labels: Optional[str],
-        compress: bool,
-        return_data: Optional[str]
+        *,
+        # Commun aux deux versions
+        start_period: Optional[str] = None,
+        end_period: Optional[str] = None,
+        last_n_observations: Optional[int] = None,
+        first_n_observations: Optional[int] = None,
+        compress: bool = False,
+        # Spécifique SDMX 3.0
+        dimensions: Optional[Dict[str, List[str]]] = None,
+        response_format: Optional[EurostatResponseFormat] = None,
+        response_format_version: Optional[str] = None,
+        lang: Optional[str] = None,
+        labels: Optional[str] = None,
+        attributes: Optional[str] = None,
+        measures: Optional[str] = None,
+        return_data: Optional[str] = None,
+        # Spécifique SDMX 2.1 (ignoré par ce builder)
+        dimension_at_observation: Optional[str] = None,
+        detail: Optional[DataDetail] = None,
     ) -> Dict[str, str]:
-        """
-            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/data-query#APIDetailedguidelinesSDMX3.0APIdataquery-Overview
-            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Data%20queries/get_sdmx_3_0_data_dataflow__agencyID___resourceID___version___key_
+        """Build query parameters for an SDMX 3.0 data request.
+
+        Full documentation:
+            https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/data-query#APIDetailedguidelinesSDMX3.0APIdataquery-Overview
+
+        Swagger UI:
+            https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Data%20queries/get_sdmx_3_0_data_dataflow__agencyID___resourceID___version___key_
+
+        Args:
+            start_period: Start period filter encoded as
+                ``ge:<value>`` in ``c[TIME_PERIOD]``.
+            end_period: End period filter encoded as
+                ``le:<value>`` in ``c[TIME_PERIOD]``.
+            last_n_observations: Number of most-recent observations.
+            first_n_observations: Number of first observations.
+            compress: Whether to request gzip compression via the
+                ``compress`` query parameter.
+            dimensions: Dimension filters as ``{name: [values]}``.
+                Encoded as ``c[DIM]=val1,val2`` query parameters.
+            response_format: Desired response format.  Mapped to the
+                ``format`` query parameter via :attr:`_FORMAT_PARAM`.
+            response_format_version: Format version string (``formatVersion``
+                parameter, e.g. ``"1.0"`` for SDMX-CSV 1.0).
+            lang: Language code for label localisation (``lang`` parameter,
+                e.g. ``"en"``).
+            labels: Label display mode (``labels`` parameter,
+                e.g. ``"name"``).
+            attributes: Attribute selection string (``attributes``
+                parameter, e.g. ``"dsd"``, ``"none"``).
+            measures: Measure selection string (``measures`` parameter).
+            return_data: Return-data flag (``returnData`` parameter).
+            dimension_at_observation: Ignored — SDMX 2.1 only.
+            detail: Ignored — SDMX 2.1 only.
+
+        Returns:
+            Query-parameter dictionary suitable for use as ``params`` in
+            an HTTP GET request.
         """
         # Initialisation du dictionnaire de paramètres
         params: Dict[str, str] = {}
@@ -325,26 +488,26 @@ class EndpointBuilderV30(EndpointBuilder):
         if measures:
             params["measures"] = measures
 
-        # Format
+        # Format et version de format
         if response_format:
             params["format"] = self._FORMAT_PARAM[response_format]
         if response_format_version:
             params["formatVersion"] = response_format_version
-        
-        # Langue 
+
+        # Langue
         if lang:
             params["lang"] = lang
 
         # Labels
-        if labels is not None :
+        if labels is not None:
             params["labels"] = labels
-        
+
         # Compression
         params["compress"] = "true" if compress else "false"
 
         # Données
         if return_data:
-            params["returnData"]= return_data
+            params["returnData"] = return_data
 
         return params
 
@@ -352,13 +515,29 @@ class EndpointBuilderV30(EndpointBuilder):
     def build_structure_endpoint(
         self,
         resource_type: StructureResourceType,
-        agency: str,
         resource_id: str,
+        agency: str,
         version: str,
     ) -> str:
-        """
-            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/structure-queries
-            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Structure%20queries/get_sdmx_3_0_structure_dataflow__agencyID___resourceID_
+        """Build the URL path for an SDMX 3.0 structure query.
+
+        Full documentation:
+            https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/structure-queries
+
+        Swagger UI:
+            https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Structure%20queries/get_sdmx_3_0_structure_dataflow__agencyID___resourceID_
+
+        Args:
+            resource_type: Type of structure artefact (e.g.
+                :attr:`StructureResourceType.DATAFLOW`).
+            resource_id: Artefact identifier, or ``"*"`` for all artefacts
+                of the given type.
+            agency: Maintaining agency, or ``"*"`` for all agencies.
+            version: Artefact version.  Use ``"+"`` or ``"~"`` for the
+                latest version, ``"*"`` for all versions.
+
+        Returns:
+            URL path segment (without base URL).
         """
         return (
             f"/sdmx/3.0/structure/{resource_type.value}"
@@ -368,18 +547,37 @@ class EndpointBuilderV30(EndpointBuilder):
     # Construction des paramètres de requête de structure SDMX 3.0
     def build_structure_params(
         self,
-        references: Optional[StructureReferences]="none",
-        detail: Optional[StructureDetail]="full",
-        format: Optional[str]="structure",
-        format_version: Optional[str]="3.0",
-        compress: Optional[StructureCompress]="true"
+        references: Optional[StructureReferences] = "none",
+        detail: Optional[StructureDetail] = "full",
+        format: Optional[str] = "structure",
+        format_version: Optional[str] = "3.0",
+        compress: Optional[StructureCompress] = "true",
     ) -> Dict[str, str]:
-        """
-            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/structure-queries
-            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Structure%20queries/get_sdmx_3_0_structure_dataflow__agencyID___resourceID_
+        """Build query parameters for an SDMX 3.0 structure request.
+
+        Full documentation:
+            https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx3-0/structure-queries
+
+        Swagger UI:
+            https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%203.0%20Structure%20queries/get_sdmx_3_0_structure_dataflow__agencyID___resourceID_
+
+        Args:
+            references: Related artefacts to embed in the response
+                (default: ``"none"``).
+            detail: Level of detail for each returned artefact
+                (default: ``"full"``).
+            format: Response format identifier (default: ``"structure"``).
+            format_version: Version of the response format
+                (default: ``"3.0"``).
+            compress: Whether to request gzip compression of the response.
+                Defaults to ``"true"`` because structure responses can be
+                large; the client transparently decompresses the result.
+
+        Returns:
+            Query-parameter dictionary.
         """
         # Initialisation du dictionnaire des paramètres
-        params = {}
+        params: Dict[str, str] = {}
 
         # Ajout des clés quand elles sont non nulles
         if references is not None:
@@ -392,26 +590,41 @@ class EndpointBuilderV30(EndpointBuilder):
             params["formatVersion"] = format_version
         if compress is not None:
             params["compress"] = compress
-        
-        # Retourne le dictionnaire des paramètres
+
         return params
 
 
 # Constructeur d'endpoints pour l'API SDMX 2.1 (version legacy)
 class EndpointBuilderV21(EndpointBuilder):
-    """Endpoint builder for the SDMX 2.1 API.
+    """Endpoint builder for the Eurostat SDMX 2.1 API.
+
+    Implements URL construction and query-parameter encoding following the
+    SDMX 2.1 conventions.  This builder is kept for compatibility testing
+    and for accessing Comext datasets that are not yet available on the
+    SDMX 3.0 endpoint.
 
     URL patterns:
-        data: ``/sdmx/2.1/data/{resource}/{key}``
-        structure: ``/sdmx/2.1/{type}/{agency}/{resource}/{version}``
+        data:
+            ``/sdmx/2.1/data/{flow}[,{agency}[,{version}]]/{key}``
+        structure:
+            ``/sdmx/2.1/{type}/{agency}/{resource}/{version}``
 
-    Notes:
-        * Dimension filtering uses a positional key in the URL path.
-          The ``dimensions`` dict is ignored here and must be handled
-          at a higher level (the client builds the key externally for 2.1).
-        * ``dataconstraint`` is mapped to ``contentconstraint``.
-        * The latest-version token is ``latest`` (not ``~``).
+    Attributes:
+        ACCEPT_HEADER: MIME type sent in the ``Accept`` request header.
+
+    Note:
+        Dimension filtering uses a **positional key** embedded in the URL
+        path (``/key`` segment), not query parameters.  The ``dimensions``
+        and ``response_format`` parameters of :meth:`build_data_params`
+        are accepted for interface compatibility but silently ignored.
+
+        The wildcard tokens differ from SDMX 3.0:
+
+        - ``"*"`` (all versions / all resources) → ``"all"`` in paths
+        - ``"+"`` (latest version) → ``"latest"`` in paths
+        - ``"dataconstraint"`` resource type → ``"contentconstraint"``
     """
+
     # Adresse de base du header
     ACCEPT_HEADER = "application/vnd.sdmx.structure+xml;version=2.1"
 
@@ -434,65 +647,137 @@ class EndpointBuilderV21(EndpointBuilder):
 
     # Construction des headers pour SDMX 2.1
     def build_headers(
-        accept_encoding: Optional[str]=None,
-        accept_language: Optional[str]=None
+        self,
+        accept_encoding: Optional[str] = None,
+        accept_language: Optional[str] = None,
     ) -> Dict[str, str]:
+        """Build HTTP request headers for SDMX 2.1.
+
+        Args:
+            accept_encoding: Value for the ``Accept-Encoding`` header
+                (e.g. ``"gzip"``).
+            accept_language: Value for the ``Accept-Language`` header
+                (e.g. ``"en"``).
+
+        Returns:
+            HTTP headers dictionary with at minimum the ``Accept`` header
+            set to the SDMX 2.1 structure MIME type.
+        """
         # Initialisation du dictionnaire des headers
-        headers = { 'Accept' : self.ACCEPT_HEADER }
+        headers = {"Accept": self.ACCEPT_HEADER}
         # Ajout des clés si spécifiées
         if accept_encoding is not None:
-            headers['Accept-Encoding'] = accept_encoding
+            headers["Accept-Encoding"] = accept_encoding
         if accept_language is not None:
-            headers['Accept-Language'] = accept_language
-        # Retourne les headers
+            headers["Accept-Language"] = accept_language
         return headers
 
     # Construction de l'endpoint de données SDMX 2.1
     def build_data_endpoint(
-        self, agency: Optional[str], dataflow: str, version: Optional[str], key: str = "all"
+        self,
+        dataflow: str,
+        agency: Optional[str],
+        version: Optional[str],
+        key: Optional[str] = "all",
     ) -> str:
+        """Build the URL path for an SDMX 2.1 data query.
+
+        Full documentation:
+            https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/data-query
+
+        Swagger UI:
+            https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Data%20queries/get_sdmx_2_1_data__flow___key_
+
+        In SDMX 2.1 the *flow* path parameter combines agency, dataflow ID
+        and version in a single compound token:
+
+        Examples::
+
+            EXR               → dataflow ID only
+            ECB,EXR           → agency + dataflow ID
+            ECB,EXR,1.0       → agency + dataflow ID + version
+
+        Args:
+            dataflow: Dataflow identifier (e.g. ``"namq_10_gdp"``).
+            agency: Maintaining agency.  When provided, prepended to the
+                flow token (e.g. ``"ESTAT"``).
+            version: Dataflow version.  When provided, appended to the
+                flow token.
+            key: Positional key for dimension filtering (default:
+                ``"all"`` — no filtering).  Individual dimension values
+                are separated by ``"."`` and multiple values within a
+                dimension by ``"+"``.
+
+        Returns:
+            URL path segment (without base URL).
         """
-            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/data-query
-            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Data%20queries/get_sdmx_2_1_data__flow___key_
-            flow *
-            string
-            (path)
-                
-
-            The statistical domain (aka dataflow) of the data to be returned.
-
-            Examples:
-
-                EXR: The ID of the domain
-                ECB,EXR: The EXR domain, maintained by the ECB
-                ECB,EXR,1.0: Version 1.0 of the EXR domain, maintained by the ECB
-        """
-        # Construction du flow
+        # Construction du flow composé
         flow = dataflow
         # Ajout de l'agency si précisé
         if agency is not None:
-            flow = f"{agency},"+flow
+            flow = f"{agency}," + flow
         # Ajout de la version si spécifiée
         if version is not None:
             flow = flow + f",{version}"
-        # Note : en 2.1, le path-key est ajouté ultérieurement par le client
         return f"/sdmx/2.1/data/{flow}/{key}"
 
     # Construction des paramètres de requête de données SDMX 2.1
     def build_data_params(
         self,
-        start_period: Optional[str],
-        end_period: Optional[str],
-        last_n_observations: Optional[int],
-        first_n_observations: Optional[int],
-        dimension_at_observation: Optional[str],
-        detail: Optional[DataDetail],
-        compressed: Optional[bool],
-        return_data: Optional[str]
+        *,
+        # Commun aux deux versions
+        start_period: Optional[str] = None,
+        end_period: Optional[str] = None,
+        last_n_observations: Optional[int] = None,
+        first_n_observations: Optional[int] = None,
+        compress: bool = False,
+        # Spécifique SDMX 3.0 (ignoré par ce builder)
+        dimensions: Optional[Dict[str, List[str]]] = None,
+        response_format: Optional[EurostatResponseFormat] = None,
+        response_format_version: Optional[str] = None,
+        lang: Optional[str] = None,
+        labels: Optional[str] = None,
+        attributes: Optional[str] = None,
+        measures: Optional[str] = None,
+        return_data: Optional[str] = None,
+        # Spécifique SDMX 2.1
+        dimension_at_observation: Optional[str] = None,
+        detail: Optional[DataDetail] = None,
     ) -> Dict[str, str]:
-        """
-            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/data-query
-            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Data%20queries/get_sdmx_2_1_data__flow___key_
+        """Build query parameters for an SDMX 2.1 data request.
+
+        Full documentation:
+            https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/data-query
+
+        Swagger UI:
+            https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Data%20queries/get_sdmx_2_1_data__flow___key_
+
+        Args:
+            start_period: Start period filter (``startPeriod`` parameter).
+            end_period: End period filter (``endPeriod`` parameter).
+            last_n_observations: Number of most-recent observations
+                (``lastNObservations`` parameter).
+            first_n_observations: Number of first observations
+                (``firstNObservations`` parameter).
+            compress: Whether to request gzip compression
+                (``compressed`` parameter).
+            dimensions: Ignored — SDMX 3.0 only (use ``key`` in
+                :meth:`build_data_endpoint` for 2.1 filtering).
+            response_format: Ignored — SDMX 3.0 only.
+            response_format_version: Ignored — SDMX 3.0 only.
+            lang: Ignored — SDMX 3.0 only.
+            labels: Ignored — SDMX 3.0 only.
+            attributes: Ignored — SDMX 3.0 only.
+            measures: Ignored — SDMX 3.0 only.
+            return_data: Ignored — SDMX 3.0 only.
+            dimension_at_observation: Dimension serialised at observation
+                level (``dimensionAtObservation`` parameter,
+                e.g. ``"AllDimensions"``).
+            detail: Data detail level (``detail`` parameter,
+                e.g. ``"full"``, ``"dataonly"``).
+
+        Returns:
+            Query-parameter dictionary.
         """
         # Initialisation du dictionnaire de paramètres
         params: Dict[str, str] = {}
@@ -509,14 +794,14 @@ class EndpointBuilderV21(EndpointBuilder):
         if last_n_observations is not None:
             params["lastNObservations"] = str(last_n_observations)
 
-        # Format et compression
+        # Paramètres spécifiques 2.1
         if dimension_at_observation:
             params["dimensionAtObservation"] = dimension_at_observation
         if detail:
             params["detail"] = detail
-        params["compressed"] = "true" if compressed else "false"
-        if return_data:
-            params["returnData"] = return_data
+
+        # Compression (paramètre 2.1 : "compressed")
+        params["compressed"] = "true" if compress else "false"
 
         return params
 
@@ -524,43 +809,93 @@ class EndpointBuilderV21(EndpointBuilder):
     def build_structure_endpoint(
         self,
         resource_type: StructureResourceType,
-        agency: str,
         resource_id: str,
+        agency: str,
         version: str,
     ) -> str:
-        """
-            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/structure-queries#APIDetailedguidelinesSDMX2.1APIstructurequeries-Multiplevaluesandwildcardvaluesupport
-            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Structure%20queries/get_sdmx_2_1_dataflow__agencyID___resourceID___version_
+        """Build the URL path for an SDMX 2.1 structure query.
+
+        Full documentation:
+            https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/structure-queries#APIDetailedguidelinesSDMX2.1APIstructurequeries-Multiplevaluesandwildcardvaluesupport
+
+        Swagger UI:
+            https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Structure%20queries/get_sdmx_2_1_dataflow__agencyID___resourceID___version_
+
+        Wildcard token mapping (SDMX 3.0 → SDMX 2.1):
+
+        - resource_id ``"*"`` → ``"all"``
+        - agency ``"*"`` → ``"all"``
+        - version ``"+"`` or ``"~"`` → ``"latest"``
+        - version ``"*"`` → ``"all"``
+
+        Args:
+            resource_type: Type of structure artefact.  ``DATACONSTRAINT``
+                is mapped to ``contentconstraint``.
+            resource_id: Artefact identifier, or ``"*"`` for all artefacts
+                (mapped to ``"all"``).
+            agency: Maintaining agency, or ``"*"`` for all agencies
+                (mapped to ``"all"``).
+            version: Artefact version.  Use ``"+"`` or ``"~"`` for the
+                latest version; ``"*"`` for all versions.
+
+        Returns:
+            URL path segment (without base URL).
         """
         # Conversion du type de ressource vers la terminologie 2.1
         mapped_type = self._RESOURCE_MAP[resource_type]
 
-        # Conversion du token de version (+ → latest, * → all)
-        v21_version = "latest" if version == "+" else ("all" if version == "*" else version)
+        # Conversion des tokens de version vers les équivalents 2.1
+        v21_version = (
+            "latest" if version in ("+", "~")
+            else ("all" if version == "*" else version)
+        )
+
+        # Conversion des wildcards d'agence et de ressource vers 2.1
+        v21_agency = "all" if agency == "*" else agency
+        v21_resource_id = "all" if resource_id == "*" else resource_id
 
         return (
             f"/sdmx/2.1/{mapped_type}"
-            f"/{agency}/{resource_id}/{v21_version}"
+            f"/{v21_agency}/{v21_resource_id}/{v21_version}"
         )
 
     # Construction des paramètres de requête de structure SDMX 2.1
     def build_structure_params(
         self,
-        references: Optional[StructureReferences]="none",
-        detail: Optional[StructureDetail]="full"
+        references: Optional[StructureReferences] = "none",
+        detail: Optional[StructureDetail] = "full",
+        # Spécifique SDMX 3.0 (ignoré par ce builder)
+        format: Optional[str] = None,
+        format_version: Optional[str] = None,
+        compress: Optional[StructureCompress] = None,
     ) -> Dict[str, str]:
-        """
-            The full documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/structure-queries#APIDetailedguidelinesSDMX2.1APIstructurequeries-Multiplevaluesandwildcardvaluesupport
-            The open API Swagger ui can be found here : https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Structure%20queries/get_sdmx_2_1_dataflow__agencyID___resourceID___version_
+        """Build query parameters for an SDMX 2.1 structure request.
+
+        Full documentation:
+            https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-detailed-guidelines/sdmx2-1/structure-queries#APIDetailedguidelinesSDMX2.1APIstructurequeries-Multiplevaluesandwildcardvaluesupport
+
+        Swagger UI:
+            https://ec.europa.eu/eurostat/api/dissemination/swagger-ui#/SDMX%202.1%20Structure%20queries/get_sdmx_2_1_dataflow__agencyID___resourceID___version_
+
+        Args:
+            references: Related artefacts to embed in the response
+                (default: ``"none"``).
+            detail: Level of detail for each returned artefact
+                (default: ``"full"``).
+            format: Ignored — SDMX 3.0 only.
+            format_version: Ignored — SDMX 3.0 only.
+            compress: Ignored — SDMX 2.1 does not support this parameter.
+
+        Returns:
+            Query-parameter dictionary.
         """
         # Initialisation du dictionnaire de paramètres
-        params = {}
-        # Ajout des clés
+        params: Dict[str, str] = {}
+        # Ajout des clés supportées par l'API 2.1
         if detail is not None:
-            params["detail"]=detail
+            params["detail"] = detail
         if references is not None:
-            params["references"]=references
-        # Retourne le dictionnaire de paramètres
+            params["references"] = references
         return params
 
 
@@ -581,21 +916,36 @@ _ENDPOINT_BUILDERS: Dict[EurostatAPIVersion, EndpointBuilder] = {
 class EurostatQueryRequest:
     """Encapsulates all parameters needed for a ``get_data()`` call.
 
+    This dataclass follows a **union-of-parameters** design: it holds all
+    parameters supported by either SDMX 3.0 or 2.1.  Version-specific
+    parameters are silently ignored by the builder of the other version,
+    so the same request object can be reused regardless of which API
+    version the client is configured with.
+
     Attributes:
-        dataflow: Dataflow identifier (e.g., ``"namq_10_gdp"``, ``"DS-045409"``).
+        dataflow: Dataflow identifier (e.g., ``"namq_10_gdp"``,
+            ``"DS-045409"``).
         version: Dataflow version (default: ``"*"`` for latest).
         dimensions: Dimension filters as ``{name: value_or_list}``.
-        start_period: Start period filter.
+        start_period: Start period filter (ISO / SDMX format).
         end_period: End period filter.
-        last_n_observations: Number of recent observations.
-        first_n_observations: Number of first observations.
-        format: Response format.
-        compress: Whether to compress the response.
-        attributes: Attributes to include.
-        measures: Measures to include.
+        last_n_observations: Number of most-recent observations to return.
+        first_n_observations: Number of first observations to return.
+        format: Response format (default: CSV).
+        compress: Whether to request gzip compression of the response.
+        attributes: Attribute selection string (SDMX 3.0 only).
+        measures: Measure selection string (SDMX 3.0 only).
+        lang: Language code for label localisation, e.g. ``"en"``
+            (SDMX 3.0 only).
+        labels: Label display mode, e.g. ``"name"`` (SDMX 3.0 only).
+        response_format_version: Format version string, e.g. ``"1.0"``
+            (SDMX 3.0 only).
+        dimension_at_observation: Dimension serialised at observation
+            level, e.g. ``"AllDimensions"`` (SDMX 2.1 only).
+        detail: Data detail level, e.g. ``"dataonly"`` (SDMX 2.1 only).
         on_duplicate: Duplicate handling strategy.
-        split_dimensions: Dimensions to split into separate requests.
-        max_split_combinations: Max allowed split combinations.
+        split_dimensions: Dimensions to split into separate sub-requests.
+        max_split_combinations: Maximum allowed split combinations.
 
     Example:
         >>> query = EurostatQueryRequest(
@@ -604,7 +954,7 @@ class EurostatQueryRequest:
         ... )
         >>> df = client.execute_query(query)
     """
-    # Attributs
+    # Attributs communs aux deux versions
     dataflow: str
     version: str = "*"
     dimensions: Optional[Dict[str, Union[str, List[str]]]] = None
@@ -614,18 +964,25 @@ class EurostatQueryRequest:
     first_n_observations: Optional[int] = None
     format: EurostatResponseFormat = EurostatResponseFormat.CSV
     compress: bool = False
-    attributes: Optional[str] = None
-    measures: Optional[str] = None
     on_duplicate: DuplicateHandling = "warn"
     split_dimensions: Optional[List[str]] = None
     max_split_combinations: int = 100
+    # Attributs spécifiques SDMX 3.0
+    attributes: Optional[str] = None
+    measures: Optional[str] = None
+    lang: Optional[str] = None
+    labels: Optional[str] = None
+    response_format_version: Optional[str] = None
+    # Attributs spécifiques SDMX 2.1
+    dimension_at_observation: Optional[str] = None
+    detail: Optional[DataDetail] = None
 
     # Méthode de conversion des paramètres en dictionnaire de kwargs
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary suitable for ``get_data()`` kwargs.
 
         Returns:
-            Dictionary of parameters.
+            Dictionary of all parameters, including version-specific ones.
         """
         return {
             "dataflow": self.dataflow,
@@ -639,6 +996,11 @@ class EurostatQueryRequest:
             "compress": self.compress,
             "attributes": self.attributes,
             "measures": self.measures,
+            "lang": self.lang,
+            "labels": self.labels,
+            "response_format_version": self.response_format_version,
+            "dimension_at_observation": self.dimension_at_observation,
+            "detail": self.detail,
             "on_duplicate": self.on_duplicate,
             "split_dimensions": self.split_dimensions,
             "max_split_combinations": self.max_split_combinations,
@@ -765,6 +1127,11 @@ class EurostatClient:
         compress: bool = False,
         attributes: Optional[str] = None,
         measures: Optional[str] = None,
+        lang: Optional[str] = None,
+        labels: Optional[str] = None,
+        response_format_version: Optional[str] = None,
+        dimension_at_observation: Optional[str] = None,
+        detail: Optional[DataDetail] = None,
         on_duplicate: DuplicateHandling = "warn",
         split_dimensions: Optional[List[str]] = None,
         max_split_combinations: int = 100,
@@ -781,8 +1148,14 @@ class EurostatClient:
             first_n_observations: Number of first observations.
             format: Response format (default: CSV).
             compress: Whether to request gzip compression.
-            attributes: Attributes to include (e.g., ``"dsd"``, ``"none"``).
-            measures: Measures to include (e.g., ``"all"``, ``"none"``).
+            attributes: Attributes to include (SDMX 3.0 only).
+            measures: Measures to include (SDMX 3.0 only).
+            lang: Language code for label localisation (SDMX 3.0 only).
+            labels: Label display mode (SDMX 3.0 only).
+            response_format_version: Format version string (SDMX 3.0 only).
+            dimension_at_observation: Dimension at observation level
+                (SDMX 2.1 only).
+            detail: Data detail level (SDMX 2.1 only).
             on_duplicate: Duplicate handling strategy.
             split_dimensions: Dimensions to split into separate requests.
             max_split_combinations: Maximum split combinations allowed.
@@ -813,33 +1186,45 @@ class EurostatClient:
                 normalized_dims, split_dimensions, max_split_combinations
             )
             return self._execute_split_requests(
-                dataflow,
-                version,
-                request_combinations,
-                start_period,
-                end_period,
-                last_n_observations,
-                first_n_observations,
-                format,
-                compress,
-                attributes,
-                measures,
+                dataflow=dataflow,
+                version=version,
+                request_combinations=request_combinations,
+                start_period=start_period,
+                end_period=end_period,
+                last_n_observations=last_n_observations,
+                first_n_observations=first_n_observations,
+                response_format=format,
+                compress=compress,
+                attributes=attributes,
+                measures=measures,
+                lang=lang,
+                labels=labels,
+                response_format_version=response_format_version,
+                dimension_at_observation=dimension_at_observation,
+                detail=detail,
             )
 
-        # Construction de l'endpoint et des paramètres via le builder
+        # Construction de l'endpoint et des paramètres via le builder (keyword args)
         endpoint = self.endpoint_builder.build_data_endpoint(
-            dataflow, AGENCY_ID, version
+            dataflow=dataflow,
+            agency=AGENCY_ID,
+            version=version,
         )
         params = self.endpoint_builder.build_data_params(
-            normalized_dims,
-            start_period,
-            end_period,
-            last_n_observations,
-            first_n_observations,
-            format,
-            compress,
-            attributes,
-            measures,
+            dimensions=normalized_dims,
+            start_period=start_period,
+            end_period=end_period,
+            last_n_observations=last_n_observations,
+            first_n_observations=first_n_observations,
+            compress=compress,
+            response_format=format,
+            response_format_version=response_format_version,
+            lang=lang,
+            labels=labels,
+            attributes=attributes,
+            measures=measures,
+            dimension_at_observation=dimension_at_observation,
+            detail=detail,
         )
 
         # Sélection du client API (standard ou Comext)
@@ -849,13 +1234,18 @@ class EurostatClient:
         try:
             response = client.get(endpoint, params=params)
 
+            # Décompression si nécessaire (gzip transparent)
+            raw_bytes = self._decompress_response_bytes(response.content)
+
             # Parsing de la réponse selon le format demandé
             if format == EurostatResponseFormat.CSV:
-                df = self._parse_csv_response(response.text)
+                df = self._parse_csv_response(raw_bytes.decode("utf-8"))
             elif format == EurostatResponseFormat.TSV:
-                df = self._parse_tsv_response(response.text)
+                df = self._parse_tsv_response(raw_bytes.decode("utf-8"))
             elif format == EurostatResponseFormat.JSON:
-                df = self._parse_json_response(response.json())
+                df = self._parse_json_response(
+                    json.loads(raw_bytes.decode("utf-8"))
+                )
             else:
                 raise ValueError(f"Unsupported format: {format}")
 
@@ -902,11 +1292,11 @@ class EurostatClient:
         version: str = "+",
         references: StructureReferences = "none",
         detail: StructureDetail = "full",
-        format:,
-        format_version:,
-        compress:,
-        accept_encoding:,
-        accept_language:,
+        format: Optional[str] = "structure",
+        format_version: Optional[str] = None,
+        compress: Optional[StructureCompress] = "true",
+        accept_encoding: Optional[str] = None,
+        accept_language: Optional[str] = None,
     ) -> str:
         """Query an SDMX structure artefact and return raw XML.
 
@@ -914,14 +1304,29 @@ class EurostatClient:
         ``resource_type`` parameter selects which endpoint is targeted
         (dataflow, datastructure, dataconstraint, conceptscheme, codelist).
 
+        When the ``compress`` parameter is ``"true"`` (default for SDMX 3.0)
+        or when the API returns gzip-compressed content, the response is
+        transparently decompressed before being returned.
+
         Args:
             resource_type: Type of structure artefact to retrieve.
-            resource_id: Artefact identifier (e.g., ``"namq_10_gdp"``).
-            agency: Maintaining agency (default: ``AGENCY_ID``).
+            resource_id: Artefact identifier (e.g., ``"namq_10_gdp"``), or
+                ``"*"`` to retrieve all artefacts of the given type.
+            agency: Maintaining agency (default: ``AGENCY_ID``), or ``"*"``
+                for all agencies.
             version: Artefact version. Use ``"+"`` for latest (``"latest"``
-                is used automatically when the 2.1 builder is active).
+                is used automatically when the 2.1 builder is active), ``"~"``
+                for SDMX 3.0 latest-per-resource, ``"*"`` for all versions.
             detail: Level of detail (default: ``"full"``).
             references: Related artefacts to include (default: ``"none"``).
+            format: Response format identifier (SDMX 3.0 only,
+                default: ``"structure"``).
+            format_version: Format version string (SDMX 3.0 only).
+            compress: Whether to request gzip compression (SDMX 3.0 only,
+                default: ``"true"``; the response is decompressed
+                transparently).
+            accept_encoding: Value for the ``Accept-Encoding`` request header.
+            accept_language: Value for the ``Accept-Language`` request header.
 
         Returns:
             Raw XML response text.
@@ -941,17 +1346,32 @@ class EurostatClient:
         """
         # Construction de l'endpoint et des paramètres via le builder
         endpoint = self.endpoint_builder.build_structure_endpoint(
-            resource_type, resource_id, agency, version
+            resource_type=resource_type,
+            resource_id=resource_id,
+            agency=agency,
+            version=version,
         )
-        params = self.endpoint_builder.build_structure_params(detail, references)
+        params = self.endpoint_builder.build_structure_params(
+            references=references,
+            detail=detail,
+            format=format,
+            format_version=format_version,
+            compress=compress,
+        )
+        headers = self.endpoint_builder.build_headers(
+            accept_encoding=accept_encoding,
+            accept_language=accept_language,
+        )
 
         # Sélection du client API (Comext si nécessaire)
         client = self._get_api_client(resource_id)
 
         # Requête de l'artefact structurel
         try:
-            response = client.get(endpoint, params=params)
-            return response.text
+            response = client.get(endpoint, params=params, headers=headers)
+            # Décompression si nécessaire (réponses gzip de l'API SDMX 3.0)
+            content = self._decompress_response_bytes(response.content)
+            return content.decode("utf-8")
         # Gestion des erreurs de requête
         except Exception as e:
             logger.error(
@@ -982,15 +1402,73 @@ class EurostatClient:
         Raises:
             ValueError: If the structure cannot be retrieved or parsed.
         """
-        # Requête du XML brut via get_structure (endpoint datastructure)
+        # Requête du XML brut via get_structure (endpoint datastructure, avec descendants)
         xml_text = self.get_structure(
-            StructureResourceType.DATASTRUCTURE,
+            resource_type=StructureResourceType.DATASTRUCTURE,
             resource_id=dataflow.upper(),
+            agency=AGENCY_ID,
             version=version,
-            dataflow=dataflow,
+            references="descendants",
         )
         # Parsing du XML et retour de la structure de dataflow
-        return xml_text #self._parse_structure_response(xml_text, dataflow)
+        return self._parse_structure_response(xml_text, dataflow)
+
+    # Méthode publique d'extraction du catalogue de dataflows Eurostat
+    def list_all_dataflows(
+        self,
+        agency: str = "*",
+    ) -> pd.DataFrame:
+        """Retrieve the full Eurostat dataflow catalogue.
+
+        Fetches all dataflow definitions available on the configured API
+        endpoint (standard or Comext) and returns them as a tidy DataFrame.
+
+        The request is constructed by calling :meth:`get_structure` with a
+        wildcard ``resource_id`` and ``agency``, using the version wildcard
+        appropriate for the active API version:
+
+        - SDMX 3.0 request:
+          ``/sdmx/3.0/structure/dataflow/{agency}/*/~``
+        - SDMX 2.1 request:
+          ``/sdmx/2.1/dataflow/{agency}/all/latest``
+
+        Args:
+            agency: Maintaining agency filter. Use ``"*"`` (default) for
+                all agencies. Use ``"ESTAT"`` to restrict to official
+                Eurostat datasets.  When using the SDMX 2.1 builder,
+                ``"*"`` is automatically mapped to ``"all"``.
+
+        Returns:
+            DataFrame with columns: ``id``, ``name``, ``version``,
+            ``agency``.
+
+        Raises:
+            ValueError: If the catalogue cannot be retrieved or parsed.
+
+        Example:
+            >>> catalogue = client.list_all_dataflows()
+            >>> estat_only = client.list_all_dataflows(agency="ESTAT")
+        """
+        # Sélection du token de version adapté à la version d'API
+        if self.api_version == EurostatAPIVersion.V3_0:
+            # Token "~" : dernière version de chaque dataflow en SDMX 3.0
+            version = "~"
+        else:
+            # Token "+" : converti en "latest" par le builder V2.1
+            version = "+"
+
+        # Requête du catalogue via get_structure avec wildcards
+        xml_text = self.get_structure(
+            resource_type=StructureResourceType.DATAFLOW,
+            resource_id="*",
+            agency=agency,
+            version=version,
+            references="none",
+            detail="allstubs",
+        )
+
+        # Parsing du XML et retour sous forme de DataFrame
+        return self._parse_dataflow_list_response(xml_text)
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes publiques — Registre de structures
@@ -1129,6 +1607,29 @@ class EurostatClient:
     # ──────────────────────────────────────────────────────────────────
     # Méthodes privées — Parsing des réponses
     # ──────────────────────────────────────────────────────────────────
+
+    # Méthode statique de décompression transparente des réponses gzip
+    @staticmethod
+    def _decompress_response_bytes(content: bytes) -> bytes:
+        """Transparently decompress response bytes if gzip-encoded.
+
+        Some Eurostat API endpoints return gzip-compressed content when the
+        ``compress=true`` query parameter is set, or by default for large
+        structure responses.  This method inspects the magic bytes and
+        decompresses only when necessary, so it is safe to call on any
+        response regardless of whether compression was requested.
+
+        Args:
+            content: Raw response bytes, possibly gzip-compressed.
+
+        Returns:
+            Decompressed bytes, or the original bytes unchanged if the
+            content is not gzip-compressed.
+        """
+        # Détection de la compression gzip par les octets magiques (0x1F 0x8B)
+        if content[:2] == b"\x1f\x8b":
+            return gzip.decompress(content)
+        return content
 
     # Méthode statique de parsing de réponse SDMX-CSV
     @staticmethod
@@ -1324,6 +1825,69 @@ class EurostatClient:
         except Exception as e:
             logger.error(f"Structure XML parsing failed: {e}")
             raise ValueError(f"Failed to parse structure response: {e}")
+
+    # Méthode de parsing d'une réponse SDMX-ML contenant une liste de dataflows
+    def _parse_dataflow_list_response(
+        self, xml_content: str
+    ) -> pd.DataFrame:
+        """Parse an SDMX-ML structure response containing multiple dataflows.
+
+        Tries SDMX 3.0 namespaces first, then falls back to 2.1.
+        Extracts the English name for each dataflow when available.
+
+        Args:
+            xml_content: XML response content (already decompressed).
+
+        Returns:
+            DataFrame with columns: ``id``, ``name``, ``version``,
+            ``agency``.
+
+        Raises:
+            ValueError: If XML parsing or element extraction fails.
+        """
+        try:
+            # Parsing du document XML
+            root = ET.fromstring(xml_content)
+
+            # Tentative avec les namespaces SDMX 3.0 puis fallback 2.1
+            namespaces = self._SDMX3_NS
+            dataflows = root.findall(".//str:Dataflow", namespaces)
+            if not dataflows:
+                namespaces = self._SDMX21_NS
+                dataflows = root.findall(".//str:Dataflow", namespaces)
+
+            # Extraction des métadonnées de chaque dataflow
+            rows = []
+            for df_elem in dataflows:
+                df_id = df_elem.get("id")
+                df_agency = df_elem.get("agencyID")
+                df_version = df_elem.get("version")
+
+                # Extraction du nom anglais, ou première langue disponible
+                name: Optional[str] = None
+                for name_elem in df_elem.findall("com:Name", namespaces):
+                    lang = name_elem.get(
+                        "{http://www.w3.org/XML/1998/namespace}lang", ""
+                    )
+                    if name is None or lang == "en":
+                        name = name_elem.text
+
+                rows.append(
+                    {
+                        "id": df_id,
+                        "name": name,
+                        "version": df_version,
+                        "agency": df_agency,
+                    }
+                )
+
+            # Logging
+            logger.info(f"Parsed {len(rows)} dataflows from catalogue response")
+            return pd.DataFrame(rows)
+        # Gestion des erreurs de parsing XML
+        except Exception as e:
+            logger.error(f"Dataflow catalogue parsing failed: {e}")
+            raise ValueError(f"Failed to parse dataflow catalogue: {e}")
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes privées — Normalisation, filtrage, doublons
@@ -1526,6 +2090,11 @@ class EurostatClient:
         compress: bool,
         attributes: Optional[str],
         measures: Optional[str],
+        lang: Optional[str],
+        labels: Optional[str],
+        response_format_version: Optional[str],
+        dimension_at_observation: Optional[str],
+        detail: Optional[DataDetail],
     ) -> pd.DataFrame:
         """Execute multiple split requests and concatenate results.
 
@@ -1539,8 +2108,14 @@ class EurostatClient:
             first_n_observations: Number of first observations.
             response_format: Response format.
             compress: Whether to compress.
-            attributes: Attributes to include.
-            measures: Measures to include.
+            attributes: Attributes to include (SDMX 3.0 only).
+            measures: Measures to include (SDMX 3.0 only).
+            lang: Language code (SDMX 3.0 only).
+            labels: Label display mode (SDMX 3.0 only).
+            response_format_version: Format version string (SDMX 3.0 only).
+            dimension_at_observation: Dimension at observation level
+                (SDMX 2.1 only).
+            detail: Data detail level (SDMX 2.1 only).
 
         Returns:
             Concatenated DataFrame from all requests.
@@ -1563,6 +2138,11 @@ class EurostatClient:
                     compress=compress,
                     attributes=attributes,
                     measures=measures,
+                    lang=lang,
+                    labels=labels,
+                    response_format_version=response_format_version,
+                    dimension_at_observation=dimension_at_observation,
+                    detail=detail,
                     on_duplicate="ignore",  # Désactivation des logs de doublons répétés
                     split_dimensions=None,  # Désactivation du split récursif
                 )
