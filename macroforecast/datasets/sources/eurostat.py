@@ -1350,9 +1350,9 @@ class EurostatClient:
         version: str = "+",
         references: StructureReferences = "none",
         detail: StructureDetail = "full",
-        format: Optional[str] = "structure",
+        format: Optional[str] = None,
         format_version: Optional[str] = None,
-        compress: Optional[StructureCompress] = "true",
+        compress: Optional[StructureCompress] = None,
         accept_encoding: Optional[str] = None,
         accept_language: Optional[str] = None,
     ) -> str:
@@ -1463,10 +1463,11 @@ class EurostatClient:
         # Requête du XML brut via get_structure (endpoint datastructure, avec descendants)
         xml_text = self.get_structure(
             resource_type=StructureResourceType.DATASTRUCTURE,
-            resource_id=dataflow.upper(),
+            resource_id=dataflow,
             agency=AGENCY_ID,
             version=version,
             references="descendants",
+            compress="false"
         )
         # Parsing du XML et retour de la structure de dataflow
         return self._parse_structure_response(xml_text, dataflow)
@@ -1845,6 +1846,20 @@ class EurostatClient:
                     "DataStructure element not found in XML response"
                 )
 
+            # Construction d'un index id -> nom depuis les ConceptSchemes
+            # (les dimensions ne portent pas de description directement :
+            #  elles référencent un Concept via ConceptIdentity)
+            concept_names: dict[str, str] = {}
+            for concept in root.findall(".//str:Concept", namespaces):
+                concept_id = concept.get("id")
+                if not concept_id:
+                    continue
+                # Extraction du nom
+                name: str | None = None
+                for name_elem in concept.findall("com:Name", namespaces):
+                    name = name_elem.text
+                concept_names[concept_id] = name
+
             # Extraction de la liste des dimensions depuis le DSD
             dimensions: list[DimensionInfo] = []
             dimension_list = structure_elem.find(
@@ -1856,12 +1871,9 @@ class EurostatClient:
                 ):
                     dim_id = dim.get("id")
                     position = dim.get("position", str(i))
-                    description = None
 
-                    # Extraction de la description si disponible
-                    desc_elem = dim.find(".//com:Description", namespaces)
-                    if desc_elem is not None and desc_elem.text:
-                        description = desc_elem.text
+                    # Résolution de la description via le ConceptScheme
+                    description = concept_names.get(dim_id)
 
                     dimensions.append(
                         DimensionInfo(
@@ -2269,3 +2281,4 @@ class EurostatClient:
         if dfs:
             return pd.concat(dfs, ignore_index=True)
         return pd.DataFrame()
+    
