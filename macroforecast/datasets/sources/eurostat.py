@@ -1138,6 +1138,20 @@ class EurostatClient:
     ) -> pd.DataFrame:
         """Retrieve data from Eurostat.
 
+        The URL key and query parameters are built automatically from the
+        dataflow structure (loaded from the registry or fetched on demand):
+
+        - **SDMX 3.0**: dimensions with a single value are embedded in the
+          positional URL key; dimensions with multiple values are passed as
+          ``c[DIM]=val1,val2`` query parameters (server-side filtering,
+          no client-side post-filter required).
+        - **SDMX 2.1**: all dimensions are embedded in the positional URL
+          key using ``val1+val2`` for multi-value positions.
+
+        When no structure is available the method falls back to passing all
+        dimensions as query parameters for SDMX 3.0 (existing behaviour) or
+        using the ``"all"`` wildcard key for SDMX 2.1.
+
         Args:
             dataflow: Dataflow identifier (e.g., ``"namq_10_gdp"``).
             version: Dataflow version (``"*"`` for latest).
@@ -1157,7 +1171,9 @@ class EurostatClient:
                 (SDMX 2.1 only).
             detail: Data detail level (SDMX 2.1 only).
             on_duplicate: Duplicate handling strategy.
-            split_dimensions: Dimensions to split into separate requests.
+            split_dimensions: Dimension names for which each value triggers
+                a separate API request.  Use this to control the trade-off
+                between response size and number of requests.
             max_split_combinations: Maximum split combinations allowed.
 
         Returns:
@@ -1165,20 +1181,34 @@ class EurostatClient:
 
         Raises:
             ValueError: If data retrieval fails.
+
+        Examples:
+            >>> # SDMX 3.0 — GEO (single value) goes in URL key,
+            >>> # unit (multi-value) goes in c[UNIT]=... query param
+            >>> df = client.get_data(
+            ...     dataflow="namq_10_gdp",
+            ...     dimensions={"GEO": "FR", "unit": ["CLV10_MEUR", "CP_MEUR"]},
+            ... )
+            >>> # SDMX 3.0 — split GEO into separate requests
+            >>> df = client.get_data(
+            ...     dataflow="namq_10_gdp",
+            ...     dimensions={"GEO": ["FR", "DE"]},
+            ...     split_dimensions=["GEO"],
+            ... )
         """
         # Application du rate limiter avant la requête
         if self.rate_limiter:
             self.rate_limiter.wait()
 
-        # Normalisation des dimensions (conversion str → List[str])
-        normalized_dims = self._normalize_dimensions(dimensions)
-
-        # Chargement de la structure si disponible (non fatal en cas d'échec)
+        # Chargement de la structure (non fatal en cas d'échec)
         structure = None
         try:
             structure = self._ensure_structure(dataflow, version)
         except Exception as e:
             logger.warning(f"Could not load structure: {e}")
+
+        # Normalisation des dimensions (conversion str → List[str], validation des noms)
+        normalized_dims = self._normalize_dimensions(dimensions, structure)
 
         # Gestion du split_dimensions : génération et exécution des sous-requêtes
         if split_dimensions and normalized_dims:
@@ -1204,14 +1234,41 @@ class EurostatClient:
                 detail=detail,
             )
 
-        # Construction de l'endpoint et des paramètres via le builder (keyword args)
+        # Détermination automatique de la séparation URL key / query params
+        # /!\ Vérifier aussi que la clé est présente dans la structure du dataflow
+        is_v21 = self.api_version == EurostatAPIVersion.V2_1
+        url_dims: Optional[Dict[str, List[str]]] = None
+        param_dims: Optional[Dict[str, List[str]]] = normalized_dims
+
+        if normalized_dims and structure:
+            if is_v21:
+                # SDMX 2.1 : les query params sont ignorés → toutes les dims dans le key
+                # (multi-valeurs encodées comme val1+val2 dans la clé positionnelle)
+                url_dims = normalized_dims
+                param_dims = None
+            else:
+                # SDMX 3.0 : dims à valeur unique → key positionnel
+                #             dims à valeurs multiples → c[DIM]=val1,val2 query params
+                url_dims = {k: v for k, v in normalized_dims.items() if len(v) == 1}
+                param_dims = {k: v for k, v in normalized_dims.items() if len(v) > 1} or None
+
+        # Construction de la clé positionnelle si des dimensions sont destinées au key
+        key_str: Optional[str] = None
+        if url_dims and structure:
+            key_str = self._build_key_string(url_dims, structure)
+        elif is_v21:
+            # V21 : clé obligatoire dans le path — fallback à "all" sans structure
+            key_str = "all"
+
+        # Construction de l'endpoint et des paramètres via le builder
         endpoint = self.endpoint_builder.build_data_endpoint(
             dataflow=dataflow,
             agency=AGENCY_ID,
             version=version,
+            key=key_str,
         )
         params = self.endpoint_builder.build_data_params(
-            dimensions=normalized_dims,
+            dimensions=param_dims,
             start_period=start_period,
             end_period=end_period,
             last_n_observations=last_n_observations,
@@ -1252,7 +1309,8 @@ class EurostatClient:
             # Vérification des doublons dans le DataFrame résultant
             self._check_duplicates(df, normalized_dims, structure, on_duplicate)
 
-            # Post-filtrage par dimensions si nécessaire
+            # Post-filtrage si nécessaire (V30 sans structure : query params server-side
+            # mais les valeurs renvoyées peuvent être plus larges que demandé)
             if normalized_dims:
                 df = self._filter_dataframe_by_dimensions(df, normalized_dims)
 
@@ -1893,15 +1951,63 @@ class EurostatClient:
     # Méthodes privées — Normalisation, filtrage, doublons
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode de construction de la clé positionnelle pour l'URL
+    def _build_key_string(
+        self,
+        dims: Dict[str, List[str]],
+        structure: "DataflowStructure",
+    ) -> str:
+        """Build a positional key string for the data endpoint URL.
+
+        The key encodes dimension filters as a dot-separated sequence of
+        values, one slot per dimension.  Each slot is either a single value,
+        multiple values joined with ``+``, or a wildcard token.
+
+        Wildcard tokens differ by API version:
+
+        - SDMX 3.0: ``*``
+        - SDMX 2.1: ``all``
+
+        Args:
+            dims: Dimension name → list of values to include in the URL key.
+                Dimensions absent from this mapping receive the wildcard.
+            structure: Dataflow structure used to resolve dimension names to
+                their positional order.
+
+        Returns:
+            Positional key string (e.g. ``"FRA+DEU.*.Q"``).
+
+        Examples:
+            >>> key = client._build_key_string(
+            ...     {"GEO": ["FR", "DE"], "FREQ": ["Q"]},
+            ...     structure,
+            ... )
+            >>> # Returns e.g. "*.FR+DE.Q.*.*" depending on positions
+        """
+        # Jeton wildcard selon la version d'API
+        wildcard = "*" if self.api_version == EurostatAPIVersion.V3_0 else "all"
+        # Construction position par position
+        parts = []
+        for i in range(structure.num_dimensions):
+            name = structure.get_name(i)
+            if name and name in dims:
+                parts.append("+".join(dims[name]))
+            else:
+                parts.append(wildcard)
+        return ".".join(parts)
+
     # Méthode statique de normalisation des dimensions (str → List[str])
     @staticmethod
     def _normalize_dimensions(
         dimensions: Optional[Dict[str, Union[str, List[str]]]],
+        structure: Optional["DataflowStructure"] = None,
     ) -> Optional[Dict[str, List[str]]]:
         """Normalize dimension values to ``Dict[str, List[str]]``.
 
         Args:
             dimensions: Input dimensions (may contain strings or lists).
+            structure: Optional dataflow structure used to validate dimension
+                names. Unknown names trigger a warning but are kept.
 
         Returns:
             Normalised dimensions or *None*.
@@ -1910,10 +2016,18 @@ class EurostatClient:
         if not dimensions:
             return None
         # Conversion des valeurs scalaires en listes unitaires
-        return {
-            k: [v] if isinstance(v, str) else v
+        normalized = {
+            k: [v] if isinstance(v, str) else list(v)
             for k, v in dimensions.items()
         }
+        # Validation des noms contre la structure si disponible
+        if structure:
+            for name in normalized:
+                if structure.get_position(name) is None:
+                    logger.warning(
+                        f"Dimension '{name}' not found in structure for this dataflow"
+                    )
+        return normalized
 
     # Méthode statique de post-filtrage du DataFrame par valeurs de dimensions
     @staticmethod
@@ -2012,8 +2126,7 @@ class EurostatClient:
             ValueError: If the structure cannot be retrieved.
         """
         # Vérification dans le cache avant tout appel API
-        key = f"{dataflow}::{version}"
-        cached = self.structure_registry.get(key)
+        cached = self.structure_registry.get(AGENCY_ID, dataflow)
         if cached:
             return cached
 
