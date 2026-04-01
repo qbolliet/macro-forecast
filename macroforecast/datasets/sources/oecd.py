@@ -1153,77 +1153,88 @@ class OECDClient:
         api_response: Dict[str, Any],
     ) -> DataflowStructure:
         """Create a DataflowStructure from OECD API structure response.
-        
-        This function parses the structure metadata returned by the OECD API
-        and creates a DataflowStructure object.
-        
+
+        Parses the structure metadata returned by the OECD API and creates
+        a DataflowStructure object. Supports both SDMX v1 (dimensions with
+        inline names) and SDMX v2 (dimensions referencing concept schemes).
+
         Args:
             agency: Agency identifier.
             dataflow: Dataflow identifier.
             api_response: JSON response from structure API endpoint.
-            
+
         Returns:
             DataflowStructure instance.
-            
+
         Raises:
             ValueError: If the response cannot be parsed.
         """
         try:
-            # Extraction des dimensions depuis la réponse
-            # La structure varie selon la version de l'API
             data = api_response.get("data", api_response)
+
+            # Construction de l'index concept_id → nom lisible
+            concept_names: Dict[str, str] = {}
+            for scheme in data.get("conceptSchemes", []):
+                for concept in scheme.get("concepts", []):
+                    concept_id = concept.get("id")
+                    name = (
+                        concept.get("names", {}).get("en")
+                        or concept.get("name")
+                    )
+                    if concept_id and name:
+                        concept_names[concept_id] = name
+
             structures = data.get("structures", data.get("structure", {}))
-            
-            # Recherche des dimensions
             dimensions_data = []
-            
-            # Format v1: structure.dimensions.observation
+
+            # Format v1 : structure.dimensions.observation
             if "dimensions" in structures:
                 dims = structures["dimensions"]
                 if "observation" in dims:
                     dimensions_data = dims["observation"]
                 elif isinstance(dims, list):
                     dimensions_data = dims
-            
-            # Format v2: peut varier
+
+            # Format v2 : data.dataStructures
             elif "dataStructures" in data:
                 ds_list = data["dataStructures"]
                 if ds_list:
-                    # Extraction des données de dimensions
                     ds = ds_list[0]
                     components = ds.get("dataStructureComponents", {})
                     dim_list = components.get("dimensionList", {})
                     dimensions_data = dim_list.get("dimensions", [])
-            
-            # Construction des DimensionInfo
+
             dimensions = []
-            # Parcours des dimensions
             for i, dim_data in enumerate(dimensions_data):
-                # Extraction de l'identifiant de la dimension
                 dim_id = dim_data.get("id", dim_data.get("name", f"DIM_{i}"))
-                # Extraction du nom d ela dimension
-                dim_name = dim_data.get("name", dim_id)
-                # Extraction de la position de la dimension
                 position = dim_data.get("position", dim_data.get("keyPosition", i))
-                # Ajout des informations de la dimension
+
+                # Résolution du nom : inline (v1) puis concept scheme (v2)
+                dim_name = dim_data.get("name") or dim_data.get("names", {}).get("en")
+                if not dim_name:
+                    # Extraction de l'identifiant de concept depuis l'URN
+                    # Ex. "...CS_STES(4.0).REF_AREA" → "REF_AREA"
+                    concept_identity = dim_data.get("conceptIdentity", "")
+                    concept_id = concept_identity.rsplit(".", 1)[-1] if concept_identity else dim_id
+                    dim_name = concept_names.get(concept_id)
+
                 dimensions.append(DimensionInfo(
                     name=dim_id,
                     position=position,
                     description=dim_name if dim_name != dim_id else None,
                 ))
-            
+
             # Tri par position
             dimensions.sort(key=lambda d: d.position)
-            # Création de la structure
+
             return DataflowStructure(
                 agency=agency,
                 dataflow=dataflow,
                 num_dimensions=len(dimensions),
                 dimensions=dimensions,
             )
-            
+
         except Exception as e:
-            # Logging
             logger.error(f"Error parsing structure: {e}")
             raise ValueError(f"Unable to parse structure: {e}")
     
