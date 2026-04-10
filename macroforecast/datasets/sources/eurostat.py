@@ -15,7 +15,7 @@ import itertools
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -1210,15 +1210,25 @@ class EurostatClient:
         # Normalisation des dimensions (conversion str → List[str], validation des noms)
         normalized_dims = self._normalize_dimensions(dimensions, structure)
 
-        # Gestion du split_dimensions : génération et exécution des sous-requêtes
-        if split_dimensions and normalized_dims:
-            request_combinations = self._generate_request_combinations(
-                normalized_dims, split_dimensions, max_split_combinations
-            )
+        is_v21 = self.api_version == EurostatAPIVersion.V2_1
+
+        # Génération des combinaisons (dims_for_url, dims_for_params) — appel
+        # systématique, même sans split_dimensions (retourne une seule combinaison)
+        request_combinations = self._generate_request_combinations(
+            dimensions=normalized_dims,
+            split_dims=split_dimensions,
+            max_combinations=max_split_combinations,
+            is_v21=is_v21,
+            structure=structure,
+        )
+
+        # Requêtes multiples (split_dimensions) : délégation directe sans récursion
+        if len(request_combinations) > 1:
             return self._execute_split_requests(
+                request_combinations=request_combinations,
+                structure=structure,
                 dataflow=dataflow,
                 version=version,
-                request_combinations=request_combinations,
                 start_period=start_period,
                 end_period=end_period,
                 last_n_observations=last_n_observations,
@@ -1234,28 +1244,13 @@ class EurostatClient:
                 detail=detail,
             )
 
-        # Détermination automatique de la séparation URL key / query params
-        # /!\ Vérifier aussi que la clé est présente dans la structure du dataflow
-        is_v21 = self.api_version == EurostatAPIVersion.V2_1
-        url_dims: Optional[Dict[str, List[str]]] = None
-        param_dims: Optional[Dict[str, List[str]]] = normalized_dims
-
-        if normalized_dims and structure:
-            if is_v21:
-                # SDMX 2.1 : les query params sont ignorés → toutes les dims dans le key
-                # (multi-valeurs encodées comme val1+val2 dans la clé positionnelle)
-                url_dims = normalized_dims
-                param_dims = None
-            else:
-                # SDMX 3.0 : dims à valeur unique → key positionnel
-                #             dims à valeurs multiples → c[DIM]=val1,val2 query params
-                url_dims = {k: v for k, v in normalized_dims.items() if len(v) == 1}
-                param_dims = {k: v for k, v in normalized_dims.items() if len(v) > 1} or None
+        # Requête unique : extraction du tuple (dims_for_url, dims_for_params)
+        dims_for_url, dims_for_params = request_combinations[0]
 
         # Construction de la clé positionnelle si des dimensions sont destinées au key
         key_str: Optional[str] = None
-        if url_dims and structure:
-            key_str = self._build_key_string(url_dims, structure)
+        if dims_for_url and structure:
+            key_str = self._build_key_string(dims_for_url, structure)
         elif is_v21:
             # V21 : clé obligatoire dans le path — fallback à "all" sans structure
             key_str = "all"
@@ -1268,7 +1263,7 @@ class EurostatClient:
             key=key_str,
         )
         params = self.endpoint_builder.build_data_params(
-            dimensions=param_dims,
+            dimensions=dims_for_params or None,
             start_period=start_period,
             end_period=end_period,
             last_n_observations=last_n_observations,
@@ -1309,9 +1304,10 @@ class EurostatClient:
             # Vérification des doublons dans le DataFrame résultant
             self._check_duplicates(df, normalized_dims, structure, on_duplicate)
 
-            # Post-filtrage si nécessaire (V30 sans structure : query params server-side
-            # mais les valeurs renvoyées peuvent être plus larges que demandé)
-            if normalized_dims:
+            # Post-filtrage en fallback uniquement : sans structure toutes les dims
+            # partent en query params server-side mais le serveur peut renvoyer
+            # des valeurs plus larges que demandé
+            if normalized_dims and not structure:
                 df = self._filter_dataframe_by_dimensions(df, normalized_dims)
 
             logger.info(f"Retrieved {len(df)} rows from {dataflow}")
@@ -2169,32 +2165,68 @@ class EurostatClient:
     # Méthode statique de génération des combinaisons de dimensions pour le split
     @staticmethod
     def _generate_request_combinations(
-        dimensions: Dict[str, List[str]],
-        split_dims: List[str],
+        dimensions: Optional[Dict[str, List[str]]],
+        split_dims: Optional[List[str]],
         max_combinations: int,
-    ) -> List[Dict[str, List[str]]]:
-        """Generate dimension combinations for split requests.
+        is_v21: bool,
+        structure: Optional["DataflowStructure"],
+    ) -> List[Tuple[Dict[str, List[str]], Dict[str, List[str]]]]:
+        """Generate request combinations as ``(dims_for_url, dims_for_params)`` tuples.
+
+        Each combination encodes which dimensions go into the positional URL
+        key and which go into ``c[DIM]=...`` query parameters:
+
+        - ``dims_for_url``: embedded in the URL key via
+          :meth:`_build_key_string`.  For SDMX 3.0 these are the
+          single-value dimensions; for SDMX 2.1 all dimensions are placed
+          in the key.
+        - ``dims_for_params``: passed to
+          :meth:`EndpointBuilder.build_data_params` as ``c[DIM]=...``
+          server-side filters (SDMX 3.0 only; empty dict for SDMX 2.1).
+
+        When ``split_dims`` is given, one combination is produced per
+        element of the cartesian product of the split-dimension values;
+        each combination always contains a single value per split
+        dimension, so that value always lands in ``dims_for_url``.
 
         Args:
-            dimensions: Normalised dimensions.
-            split_dims: Dimensions to split.
+            dimensions: Normalised dimensions, or *None*.
+            split_dims: Dimension names to split into separate requests.
             max_combinations: Maximum allowed combinations.
+            is_v21: Whether the target API version is SDMX 2.1.
+            structure: Dataflow structure (reserved for future use,
+                currently unused).
 
         Returns:
-            List of dimension dictionaries, one per combination.
+            List of ``(dims_for_url, dims_for_params)`` tuples.  Always
+            contains at least one element.
 
         Raises:
             ValueError: If combinations exceed *max_combinations*.
+
+        Examples:
+            >>> # V3.0, no split — single-value dim to URL, multi-value to params
+            >>> combos = EurostatClient._generate_request_combinations(
+            ...     {"GEO": ["FR"], "UNIT": ["CLV10_MEUR", "CP_MEUR"]},
+            ...     split_dims=None, max_combinations=100,
+            ...     is_v21=False, structure=None,
+            ... )
+            >>> combos[0]  # ({"GEO": ["FR"]}, {"UNIT": ["CLV10_MEUR", "CP_MEUR"]})
         """
+        # Cas trivial : pas de dimensions → une seule combinaison vide
+        if not dimensions:
+            return [({}, {})]
+
         # Séparation des dimensions à splitter de celles à conserver intactes
-        split_dims_set = set(split_dims)
+        split_dims_set = set(split_dims) if split_dims else set()
         split_dict = {k: v for k, v in dimensions.items() if k in split_dims_set}
         keep_dict = {k: v for k, v in dimensions.items() if k not in split_dims_set}
 
         # Génération du produit cartésien des valeurs des dimensions à splitter
+        # (tuple vide si aucune dim à splitter → une seule combinaison)
         split_keys = list(split_dict.keys())
         split_values = [split_dict[k] for k in split_keys]
-        combinations = list(itertools.product(*split_values))
+        combinations = list(itertools.product(*split_values)) if split_keys else [()]
 
         # Vérification du nombre de combinaisons avant traitement
         if len(combinations) > max_combinations:
@@ -2203,21 +2235,35 @@ class EurostatClient:
                 f"max allowed ({max_combinations})"
             )
 
-        # Construction des dictionnaires de dimensions pour chaque combinaison
-        result = []
+        # Construction des tuples (dims_for_url, dims_for_params) pour chaque combinaison
+        result: List[Tuple[Dict[str, List[str]], Dict[str, List[str]]]] = []
         for combo in combinations:
-            dims = keep_dict.copy()
-            for key, val in zip(split_keys, combo):
-                dims[key] = [val]
-            result.append(dims)
+            # Fusion des dims non-splittées avec la valeur unique de chaque dim splittée
+            combo_dims: Dict[str, List[str]] = keep_dict.copy()
+            for k, val in zip(split_keys, combo):
+                combo_dims[k] = [val]
+
+            # Répartition entre URL key et query params selon la version SDMX
+            if is_v21:
+                # SDMX 2.1 : toutes les dims vont dans le key positionnel
+                dims_for_url = combo_dims
+                dims_for_params: Dict[str, List[str]] = {}
+            else:
+                # SDMX 3.0 : valeur unique → key, valeurs multiples → c[DIM]=...
+                dims_for_url = {k: v for k, v in combo_dims.items() if len(v) == 1}
+                dims_for_params = {k: v for k, v in combo_dims.items() if len(v) > 1}
+
+            result.append((dims_for_url, dims_for_params))
+
         return result
 
     # Méthode d'exécution des requêtes splitées et de concaténation des résultats
     def _execute_split_requests(
         self,
+        request_combinations: List[Tuple[Dict[str, List[str]], Dict[str, List[str]]]],
+        structure: Optional[DataflowStructure],
         dataflow: str,
         version: str,
-        request_combinations: List[Dict[str, List[str]]],
         start_period: Optional[str],
         end_period: Optional[str],
         last_n_observations: Optional[int],
@@ -2234,10 +2280,18 @@ class EurostatClient:
     ) -> pd.DataFrame:
         """Execute multiple split requests and concatenate results.
 
+        Builds each sub-request directly from its
+        ``(dims_for_url, dims_for_params)`` tuple without recursing into
+        :meth:`get_data`, so the structure is reused rather than
+        re-fetched for every combination.
+
         Args:
+            request_combinations: List of ``(dims_for_url, dims_for_params)``
+                tuples produced by :meth:`_generate_request_combinations`.
+            structure: Dataflow structure, used to build the positional URL
+                key via :meth:`_build_key_string`.
             dataflow: Dataflow identifier.
             version: Dataflow version.
-            request_combinations: List of dimension combinations.
             start_period: Start period.
             end_period: End period.
             last_n_observations: Number of last observations.
@@ -2256,36 +2310,65 @@ class EurostatClient:
         Returns:
             Concatenated DataFrame from all requests.
         """
+        is_v21 = self.api_version == EurostatAPIVersion.V2_1
+        client = self._get_api_client(dataflow)
         # Initialisation de la liste des DataFrames résultants
         dfs: list[pd.DataFrame] = []
 
         # Exécution de chaque sous-requête correspondant à une combinaison de dimensions
-        for dims in request_combinations:
+        for dims_for_url, dims_for_params in request_combinations:
             try:
-                df = self.get_data(
+                # Construction de la clé positionnelle
+                key_str: Optional[str] = None
+                if dims_for_url and structure:
+                    key_str = self._build_key_string(dims_for_url, structure)
+                elif is_v21:
+                    key_str = "all"
+
+                # Construction de l'endpoint et des paramètres via le builder
+                endpoint = self.endpoint_builder.build_data_endpoint(
                     dataflow=dataflow,
+                    agency=AGENCY_ID,
                     version=version,
-                    dimensions=dims,
+                    key=key_str,
+                )
+                params = self.endpoint_builder.build_data_params(
+                    dimensions=dims_for_params or None,
                     start_period=start_period,
                     end_period=end_period,
                     last_n_observations=last_n_observations,
                     first_n_observations=first_n_observations,
-                    format=response_format,
                     compress=compress,
-                    attributes=attributes,
-                    measures=measures,
+                    response_format=response_format,
+                    response_format_version=response_format_version,
                     lang=lang,
                     labels=labels,
-                    response_format_version=response_format_version,
+                    attributes=attributes,
+                    measures=measures,
                     dimension_at_observation=dimension_at_observation,
                     detail=detail,
-                    on_duplicate="ignore",  # Désactivation des logs de doublons répétés
-                    split_dimensions=None,  # Désactivation du split récursif
                 )
+
+                # Exécution de la requête
+                response = client.get(endpoint, params=params)
+                raw_bytes = self._decompress_response_bytes(response.content)
+
+                # Parsing de la réponse selon le format demandé
+                if response_format == EurostatResponseFormat.CSV:
+                    df = self._parse_csv_response(raw_bytes.decode("utf-8"))
+                elif response_format == EurostatResponseFormat.TSV:
+                    df = self._parse_tsv_response(raw_bytes.decode("utf-8"))
+                elif response_format == EurostatResponseFormat.JSON:
+                    df = self._parse_json_response(
+                        json.loads(raw_bytes.decode("utf-8"))
+                    )
+                else:
+                    raise ValueError(f"Unsupported format: {response_format}")
+
                 dfs.append(df)
             # Gestion des erreurs par sous-requête (non fatale)
             except Exception as e:
-                logger.error(f"Split request failed for {dims}: {e}")
+                logger.error(f"Split request failed for {dims_for_url}: {e}")
                 continue
 
         # Concaténation des résultats ou retour d'un DataFrame vide si tout a échoué
