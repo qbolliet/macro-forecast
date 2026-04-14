@@ -1204,8 +1204,13 @@ class EurostatClient:
         structure = None
         try:
             structure = self._ensure_structure(dataflow, version)
-        except Exception as e:
-            logger.warning(f"Could not load structure: {e}")
+        except Exception:
+            # Fetch de secours : population du registry même si auto_fetch_structure=False
+            try:
+                structure = self.get_dataflow_structure(dataflow, version)
+                self.register_structure(structure)
+            except Exception as e2:
+                logger.warning(f"Could not load structure for {dataflow}: {e2}")
 
         # Normalisation des dimensions (conversion str → List[str], validation des noms)
         normalized_dims = self._normalize_dimensions(dimensions, structure)
@@ -2005,12 +2010,15 @@ class EurostatClient:
         """
         # Jeton wildcard selon la version d'API
         wildcard = "*" if self.api_version == EurostatAPIVersion.V3_0 else "all"
-        # Construction position par position
+        # Index lowercase pour la comparaison insensible à la casse
+        dims_lower = {k.lower(): v for k, v in dims.items()}
+        # Itération sur les dimensions triées par position (positions XML 1-based)
+        sorted_dims = sorted(structure.dimensions, key=lambda d: d.position)
         parts = []
-        for i in range(structure.num_dimensions):
-            name = structure.get_name(i)
-            if name and name in dims:
-                parts.append("+".join(dims[name]))
+        for dim_info in sorted_dims:
+            values = dims_lower.get(dim_info.name.lower())
+            if values:
+                parts.append("+".join(values))
             else:
                 parts.append(wildcard)
         return ".".join(parts)
@@ -2039,6 +2047,7 @@ class EurostatClient:
             k: [v] if isinstance(v, str) else list(v)
             for k, v in dimensions.items()
         }
+
         # Validation des noms contre la structure si disponible
         if structure:
             for name in normalized:
@@ -2249,7 +2258,7 @@ class EurostatClient:
                 dims_for_url = combo_dims
                 dims_for_params: Dict[str, List[str]] = {}
             else:
-                # SDMX 3.0 : valeur unique → key, valeurs multiples → c[DIM]=...
+                # SDMX 3.0 : valeur unique → key positionnel, multi-valeurs → c[DIM]=...
                 dims_for_url = {k: v for k, v in combo_dims.items() if len(v) == 1}
                 dims_for_params = {k: v for k, v in combo_dims.items() if len(v) > 1}
 

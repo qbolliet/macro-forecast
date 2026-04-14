@@ -137,7 +137,7 @@ class DataflowStructure:
         Returns:
             Position index or None if not found.
         """
-        return self._name_to_position.get(name)
+        return self._name_to_position.get(name) or self._name_to_position.get(name.lower())
     
     # Méthode d'extraction d'un nom à partir d'une position
     def get_name(self, position: int) -> Optional[str]:
