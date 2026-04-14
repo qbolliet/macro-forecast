@@ -911,16 +911,14 @@ _ENDPOINT_BUILDERS: Dict[EurostatAPIVersion, EndpointBuilder] = {
 # ──────────────────────────────────────────────────────────────────────
 
 
-# Classe représentant une requête de données Eurostat
+# Classe de base contenant les paramètres communs aux deux versions d'API
 @dataclass
-class EurostatQueryRequest:
-    """Encapsulates all parameters needed for a ``get_data()`` call.
+class BaseEurostatQueryRequest:
+    """Base class for Eurostat query requests.
 
-    This dataclass follows a **union-of-parameters** design: it holds all
-    parameters supported by either SDMX 3.0 or 2.1.  Version-specific
-    parameters are silently ignored by the builder of the other version,
-    so the same request object can be reused regardless of which API
-    version the client is configured with.
+    Contains all parameters shared by both SDMX 3.0 and 2.1 API versions.
+    Use :class:`EurostatQueryRequestV30` or :class:`EurostatQueryRequestV21`
+    directly to benefit from version-specific parameter typing.
 
     Attributes:
         dataflow: Dataflow identifier (e.g., ``"namq_10_gdp"``,
@@ -933,26 +931,9 @@ class EurostatQueryRequest:
         first_n_observations: Number of first observations to return.
         format: Response format (default: CSV).
         compress: Whether to request gzip compression of the response.
-        attributes: Attribute selection string (SDMX 3.0 only).
-        measures: Measure selection string (SDMX 3.0 only).
-        lang: Language code for label localisation, e.g. ``"en"``
-            (SDMX 3.0 only).
-        labels: Label display mode, e.g. ``"name"`` (SDMX 3.0 only).
-        response_format_version: Format version string, e.g. ``"1.0"``
-            (SDMX 3.0 only).
-        dimension_at_observation: Dimension serialised at observation
-            level, e.g. ``"AllDimensions"`` (SDMX 2.1 only).
-        detail: Data detail level, e.g. ``"dataonly"`` (SDMX 2.1 only).
         on_duplicate: Duplicate handling strategy.
         split_dimensions: Dimensions to split into separate sub-requests.
         max_split_combinations: Maximum allowed split combinations.
-
-    Example:
-        >>> query = EurostatQueryRequest(
-        ...     dataflow="namq_10_gdp",
-        ...     dimensions={"GEO": ["FR", "DE"], "FREQ": "Q"},
-        ... )
-        >>> df = client.execute_query(query)
     """
     # Attributs communs aux deux versions
     dataflow: str
@@ -967,22 +948,13 @@ class EurostatQueryRequest:
     on_duplicate: DuplicateHandling = "warn"
     split_dimensions: Optional[List[str]] = None
     max_split_combinations: int = 100
-    # Attributs spécifiques SDMX 3.0
-    attributes: Optional[str] = None
-    measures: Optional[str] = None
-    lang: Optional[str] = None
-    labels: Optional[str] = None
-    response_format_version: Optional[str] = None
-    # Attributs spécifiques SDMX 2.1
-    dimension_at_observation: Optional[str] = None
-    detail: Optional[DataDetail] = None
 
-    # Méthode de conversion des paramètres en dictionnaire de kwargs
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary suitable for ``get_data()`` kwargs.
+    # Méthode de conversion des paramètres communs en dictionnaire de kwargs
+    def _base_dict(self) -> Dict[str, Any]:
+        """Return the common parameters as a dictionary.
 
         Returns:
-            Dictionary of all parameters, including version-specific ones.
+            Dictionary of parameters shared by both API versions.
         """
         return {
             "dataflow": self.dataflow,
@@ -994,13 +966,6 @@ class EurostatQueryRequest:
             "first_n_observations": self.first_n_observations,
             "format": self.format,
             "compress": self.compress,
-            "attributes": self.attributes,
-            "measures": self.measures,
-            "lang": self.lang,
-            "labels": self.labels,
-            "response_format_version": self.response_format_version,
-            "dimension_at_observation": self.dimension_at_observation,
-            "detail": self.detail,
             "on_duplicate": self.on_duplicate,
             "split_dimensions": self.split_dimensions,
             "max_split_combinations": self.max_split_combinations,
@@ -1014,6 +979,99 @@ class EurostatQueryRequest:
             Key in format ``'dataflow::version'``.
         """
         return f"{self.dataflow}::{self.version}"
+
+
+# Classe représentant une requête de données Eurostat via l'API SDMX 3.0
+@dataclass
+class EurostatQueryRequestV30(BaseEurostatQueryRequest):
+    """Query request for the Eurostat SDMX 3.0 API.
+
+    Extends :class:`BaseEurostatQueryRequest` with parameters specific to
+    the SDMX 3.0 endpoint. Use this class when the client is configured with
+    ``api_version=EurostatAPIVersion.V3_0`` (the default).
+
+    Attributes:
+        attributes: Attribute selection string (e.g., ``"dataStructure"``).
+        measures: Measure selection string (e.g., ``"OBS_VALUE"``).
+        lang: Language code for label localisation (e.g., ``"en"``,
+            ``"fr"``).
+        labels: Label display mode (e.g., ``"name"``, ``"id"``).
+        response_format_version: Format version string (e.g., ``"1.0"``).
+
+    Example:
+        >>> query = EurostatQueryRequestV30(
+        ...     dataflow="namq_10_gdp",
+        ...     dimensions={"GEO": ["FR", "DE"], "FREQ": "Q"},
+        ...     lang="fr",
+        ... )
+        >>> df = client.execute_query(query)
+    """
+    # Attributs spécifiques SDMX 3.0
+    attributes: Optional[str] = None
+    measures: Optional[str] = None
+    lang: Optional[str] = None
+    labels: Optional[str] = None
+    response_format_version: Optional[str] = None
+
+    # Méthode de conversion des paramètres en dictionnaire de kwargs
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary suitable for ``get_data()`` kwargs.
+
+        Returns:
+            Dictionary of all parameters. SDMX 2.1-specific fields are
+            included as ``None`` for compatibility with ``get_data()``.
+        """
+        return {
+            **self._base_dict(),
+            "attributes": self.attributes,
+            "measures": self.measures,
+            "lang": self.lang,
+            "labels": self.labels,
+            "response_format_version": self.response_format_version,
+        }
+
+
+# Classe représentant une requête de données Eurostat via l'API SDMX 2.1
+@dataclass
+class EurostatQueryRequestV21(BaseEurostatQueryRequest):
+    """Query request for the Eurostat SDMX 2.1 API (legacy).
+
+    Extends :class:`BaseEurostatQueryRequest` with parameters specific to
+    the SDMX 2.1 endpoint. Use this class when the client is configured with
+    ``api_version=EurostatAPIVersion.V2_1``.
+
+    Attributes:
+        dimension_at_observation: Dimension serialised at observation
+            level (e.g., ``"AllDimensions"`` for flat output,
+            ``"TIME_PERIOD"`` for time series).
+        detail: Data detail level (e.g., ``"dataonly"``,
+            ``"serieskeysonly"``).
+
+    Example:
+        >>> query = EurostatQueryRequestV21(
+        ...     dataflow="namq_10_gdp",
+        ...     dimensions={"GEO": ["FR", "DE"], "FREQ": "Q"},
+        ...     detail="dataonly",
+        ... )
+        >>> df = client_v21.execute_query(query)
+    """
+    # Attributs spécifiques SDMX 2.1
+    dimension_at_observation: Optional[str] = None
+    detail: Optional[DataDetail] = None
+
+    # Méthode de conversion des paramètres en dictionnaire de kwargs
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary suitable for ``get_data()`` kwargs.
+
+        Returns:
+            Dictionary of all parameters. SDMX 3.0-specific fields are
+            included as ``None`` for compatibility with ``get_data()``.
+        """
+        return {
+            **self._base_dict(),
+            "dimension_at_observation": self.dimension_at_observation,
+            "detail": self.detail,
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1323,11 +1381,18 @@ class EurostatClient:
             raise ValueError(f"Failed to retrieve data from {dataflow}: {e}")
 
     # Méthode publique d'exécution d'un objet EurostatQueryRequest
-    def execute_query(self, query: EurostatQueryRequest) -> pd.DataFrame:
-        """Execute an ``EurostatQueryRequest``.
+    def execute_query(
+        self,
+        query: Union[EurostatQueryRequestV30, EurostatQueryRequestV21],
+    ) -> pd.DataFrame:
+        """Execute a query request.
+
+        Accepts either :class:`EurostatQueryRequestV30` or
+        :class:`EurostatQueryRequestV21` depending on the API version the
+        client was configured with.
 
         Args:
-            query: Query request instance.
+            query: Version-specific query request instance.
 
         Returns:
             DataFrame with retrieved data.
