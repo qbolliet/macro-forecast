@@ -1393,14 +1393,52 @@ class EurostatClient:
         Raises:
             ValueError: If the request fails.
 
-        Example:
+        Notes:
+            Passing ``resource_id="*"`` triggers the Eurostat "special case"
+            bulk endpoint that returns **all** artefacts of the given type in a
+            single request.  This covers both documented special cases of the
+            SDMX 3.0 API:
+
+            - *Dataset listing*: ``resource_type=DATAFLOW``, ``resource_id="*"``
+              → full catalogue of all dataflows.
+              The documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-getting-started/sdmx3.0#APIGettingstartedwithSDMX3.0API-SpecialcaseofDatasetlisting
+
+            - *Metadata harvesting*: any other ``resource_type`` with
+              ``resource_id="*"`` → all codelists, DSDs, concept schemes, etc.
+              The documentation can be found here : https://ec.europa.eu/eurostat/web/user-guides/data-browser/api-data-access/api-getting-started/sdmx3.0#APIGettingstartedwithSDMX3.0API-SpecialcaseofMetadataharvesting
+              
+            Compression (``compress="true"``) is strongly recommended for these
+            bulk queries because responses can be very large.
+
+            Version token summary:
+
+            - ``"*"``: any resource / any agency (wildcard).
+            - ``"+"``: latest published version (SDMX 2.1 convention; mapped
+              to ``"latest"`` by the 2.1 builder).
+            - ``"~"``: latest version *per resource* (SDMX 3.0 only).
+
+            For the dataflow catalogue specifically, prefer
+            :meth:`list_all_dataflows`, which automatically selects the correct
+            version token, sets optimal parameters (``detail="allstubs"``,
+            ``references="none"``), and returns a parsed DataFrame.
+
+        Examples:
+            >>> # Requête d'un codelist spécifique
             >>> xml = client.get_structure(
             ...     StructureResourceType.CODELIST, "CL_GEO"
             ... )
+            >>> # Requête d'un dataflow avec ses artefacts descendants
             >>> xml = client.get_structure(
             ...     StructureResourceType.DATAFLOW,
             ...     "namq_10_gdp",
             ...     references="descendants",
+            ... )
+            >>> # Metadata harvesting : tous les codelists Eurostat
+            >>> xml = client.get_structure(
+            ...     StructureResourceType.CODELIST,
+            ...     resource_id="*",
+            ...     agency="ESTAT",
+            ...     compress="true",
             ... )
         """
         # Construction de l'endpoint et des paramètres via le builder
@@ -1491,17 +1529,21 @@ class EurostatClient:
     ) -> pd.DataFrame:
         """Retrieve the full Eurostat dataflow catalogue.
 
-        Fetches all dataflow definitions available on the configured API
-        endpoint (standard or Comext) and returns them as a tidy DataFrame.
+        Convenience wrapper for the *Dataset listing* special case of the
+        Eurostat SDMX API.  Fetches all dataflow definitions available on the
+        configured API endpoint and returns them as a tidy DataFrame.
 
-        The request is constructed by calling :meth:`get_structure` with a
-        wildcard ``resource_id`` and ``agency``, using the version wildcard
-        appropriate for the active API version:
+        Internally calls :meth:`get_structure` with ``resource_id="*"``,
+        ``detail="allstubs"``, and ``references="none"``, which maps to the
+        following bulk endpoints:
 
-        - SDMX 3.0 request:
-          ``/sdmx/3.0/structure/dataflow/{agency}/*/~``
-        - SDMX 2.1 request:
-          ``/sdmx/2.1/dataflow/{agency}/all/latest``
+        - SDMX 3.0: ``/sdmx/3.0/structure/dataflow/{agency}/*/~``
+        - SDMX 2.1: ``/sdmx/2.1/dataflow/{agency}/all/latest``
+
+        For other structure types (codelists, DSDs, concept schemes), use
+        :meth:`get_structure` directly with ``resource_id="*"``.  See the
+        *Notes* section of :meth:`get_structure` for details on bulk /
+        metadata-harvesting queries.
 
         Args:
             agency: Maintaining agency filter. Use ``"*"`` (default) for
@@ -1516,8 +1558,10 @@ class EurostatClient:
         Raises:
             ValueError: If the catalogue cannot be retrieved or parsed.
 
-        Example:
+        Examples:
+            >>> # Catalogue complet (toutes agences)
             >>> catalogue = client.list_all_dataflows()
+            >>> # Restreint aux datasets officiels Eurostat
             >>> estat_only = client.list_all_dataflows(agency="ESTAT")
         """
         # Sélection du token de version adapté à la version d'API
