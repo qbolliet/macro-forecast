@@ -1137,7 +1137,7 @@ class OECDClient:
         
         # Construction des headers de requête
         headers = {
-            "Accept": "application/vnd.sdmx.structure+json; charset=utf-8; version=1.0",
+            "Accept": "application/vnd.sdmx.structure+json; charset=utf-8; version=3.0",
         }
         
         # Exécution de la requête
