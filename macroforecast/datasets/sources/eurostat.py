@@ -254,7 +254,7 @@ class EndpointBuilder(ABC):
         resource_type: "StructureResourceType",
         resource_id: str,
         agency: str,
-        version: str,
+        version: Optional[str],
     ) -> str:
         """Build the URL path for a structure query.
 
@@ -267,8 +267,9 @@ class EndpointBuilder(ABC):
             resource_id: Artefact identifier, or ``"*"`` for all artefacts.
             agency: Maintaining agency, or ``"*"`` for all agencies.
             version: Artefact version.  Use ``"+"`` for the latest version,
-                ``"*"`` for all versions, or ``"~"`` for the SDMX 3.0
-                latest-per-resource wildcard.
+                ``"*"`` for all versions, ``"~"`` for the SDMX 3.0
+                latest-per-resource wildcard, or ``None`` to omit the version
+                segment entirely (required for the Dataset listing special case).
 
         Returns:
             URL path segment (without base URL).
@@ -517,7 +518,7 @@ class EndpointBuilderV30(EndpointBuilder):
         resource_type: StructureResourceType,
         resource_id: str,
         agency: str,
-        version: str,
+        version: Optional[str],
     ) -> str:
         """Build the URL path for an SDMX 3.0 structure query.
 
@@ -534,15 +535,18 @@ class EndpointBuilderV30(EndpointBuilder):
                 of the given type.
             agency: Maintaining agency, or ``"*"`` for all agencies.
             version: Artefact version.  Use ``"+"`` or ``"~"`` for the
-                latest version, ``"*"`` for all versions.
+                latest version, ``"*"`` for all versions, or ``None`` to omit
+                the version segment (Dataset listing special case).
 
         Returns:
             URL path segment (without base URL).
         """
-        return (
-            f"/sdmx/3.0/structure/{resource_type.value}"
-            f"/{agency}/{resource_id}/{version}"
-        )
+        # Base path sans version
+        path = f"/sdmx/3.0/structure/{resource_type.value}/{agency}/{resource_id}"
+        # Ajout du segment de version uniquement si spécifié
+        if version is not None:
+            path += f"/{version}"
+        return path
 
     # Construction des paramètres de requête de structure SDMX 3.0
     def build_structure_params(
@@ -811,7 +815,7 @@ class EndpointBuilderV21(EndpointBuilder):
         resource_type: StructureResourceType,
         resource_id: str,
         agency: str,
-        version: str,
+        version: Optional[str],
     ) -> str:
         """Build the URL path for an SDMX 2.1 structure query.
 
@@ -825,7 +829,7 @@ class EndpointBuilderV21(EndpointBuilder):
 
         - resource_id ``"*"`` → ``"all"``
         - agency ``"*"`` → ``"all"``
-        - version ``"+"`` or ``"~"`` → ``"latest"``
+        - version ``"+"`` or ``"~"`` or ``None`` → ``"latest"``
         - version ``"*"`` → ``"all"``
 
         Args:
@@ -836,7 +840,8 @@ class EndpointBuilderV21(EndpointBuilder):
             agency: Maintaining agency, or ``"*"`` for all agencies
                 (mapped to ``"all"``).
             version: Artefact version.  Use ``"+"`` or ``"~"`` for the
-                latest version; ``"*"`` for all versions.
+                latest version; ``"*"`` for all versions; ``None`` defaults
+                to ``"latest"``.
 
         Returns:
             URL path segment (without base URL).
@@ -844,9 +849,9 @@ class EndpointBuilderV21(EndpointBuilder):
         # Conversion du type de ressource vers la terminologie 2.1
         mapped_type = self._RESOURCE_MAP[resource_type]
 
-        # Conversion des tokens de version vers les équivalents 2.1
+        # Conversion des tokens de version vers les équivalents 2.1 (None → "latest")
         v21_version = (
-            "latest" if version in ("+", "~")
+            "latest" if version in ("+", "~", None)
             else ("all" if version == "*" else version)
         )
 
@@ -1413,7 +1418,7 @@ class EurostatClient:
         resource_type: StructureResourceType,
         resource_id: str,
         agency: str = AGENCY_ID,
-        version: str = "+",
+        version: Optional[str] = "+",
         references: StructureReferences = "none",
         detail: StructureDetail = "full",
         format: Optional[str] = None,
@@ -1590,7 +1595,7 @@ class EurostatClient:
     # Méthode publique d'extraction du catalogue de dataflows Eurostat
     def list_all_dataflows(
         self,
-        agency: str = "*",
+        agency: str = "ESTAT",
     ) -> pd.DataFrame:
         """Retrieve the full Eurostat dataflow catalogue.
 
@@ -1602,7 +1607,7 @@ class EurostatClient:
         ``detail="allstubs"``, and ``references="none"``, which maps to the
         following bulk endpoints:
 
-        - SDMX 3.0: ``/sdmx/3.0/structure/dataflow/{agency}/*/~``
+        - SDMX 3.0: ``/sdmx/3.0/structure/dataflow/{agency}/*``
         - SDMX 2.1: ``/sdmx/2.1/dataflow/{agency}/all/latest``
 
         For other structure types (codelists, DSDs, concept schemes), use
@@ -1611,10 +1616,9 @@ class EurostatClient:
         metadata-harvesting queries.
 
         Args:
-            agency: Maintaining agency filter. Use ``"*"`` (default) for
-                all agencies. Use ``"ESTAT"`` to restrict to official
-                Eurostat datasets.  When using the SDMX 2.1 builder,
-                ``"*"`` is automatically mapped to ``"all"``.
+            agency: Maintaining agency filter. Defaults to ``"ESTAT"`` (official
+                Eurostat datasets). Use ``"*"`` for all agencies (mapped to
+                ``"all"`` by the SDMX 2.1 builder).
 
         Returns:
             DataFrame with columns: ``id``, ``name``, ``version``,
@@ -1624,18 +1628,15 @@ class EurostatClient:
             ValueError: If the catalogue cannot be retrieved or parsed.
 
         Examples:
-            >>> # Catalogue complet (toutes agences)
+            >>> # Catalogue des datasets officiels Eurostat (défaut)
             >>> catalogue = client.list_all_dataflows()
-            >>> # Restreint aux datasets officiels Eurostat
-            >>> estat_only = client.list_all_dataflows(agency="ESTAT")
+            >>> # Catalogue de toutes les agences
+            >>> all_agencies = client.list_all_dataflows(agency="*")
         """
-        # Sélection du token de version adapté à la version d'API
-        if self.api_version == EurostatAPIVersion.V3_0:
-            # Token "~" : dernière version de chaque dataflow en SDMX 3.0
-            version = "~"
-        else:
-            # Token "+" : converti en "latest" par le builder V2.1
-            version = "+"
+        # Sélection du token de version adapté à la version d'API :
+        # SDMX 3.0 → None pour omettre le segment de version (cas spécial Dataset listing)
+        # SDMX 2.1 → "+" converti en "latest" par le builder V2.1
+        version: Optional[str] = None if self.api_version == EurostatAPIVersion.V3_0 else "+"
 
         # Requête du catalogue via get_structure avec wildcards
         xml_text = self.get_structure(
@@ -1645,6 +1646,9 @@ class EurostatClient:
             version=version,
             references="none",
             detail="allstubs",
+            format="structure",
+            format_version="3.0",
+            compress="true",
         )
 
         # Parsing du XML et retour sous forme de DataFrame
