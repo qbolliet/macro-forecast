@@ -9,6 +9,7 @@ from .sdmx import (
     DimensionAtObservation,
     StructureResourceType,
     DuplicateHandling,
+    SDMXResponseFormat,
     SDMXEndpointBuilder,
 )
 # Structures
@@ -23,6 +24,7 @@ __all__ = [
     'DimensionAtObservation',
     'StructureResourceType',
     'DuplicateHandling',
+    'SDMXResponseFormat',
     'SDMXEndpointBuilder',
     'DimensionInfo',
     'DataflowStructure',

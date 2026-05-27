@@ -7,10 +7,12 @@ SDMX provider clients:
 - ``DimensionAtObservation``: observation-level dimension options.
 - ``StructureResourceType``: queryable SDMX artefact types.
 - ``DuplicateHandling``: duplicate-row handling strategy literal type.
+- ``SDMXResponseFormat``: marker base class for provider response-format enums.
 - ``SDMXEndpointBuilder``: abstract base class for URL builders.
 
-OECD-specific elements (``OECDResponseFormat``, ``OECDDataQuery``,
-``OECDEndpointBuilder``) are defined in ``sources/oecd.py``.
+Provider-specific response format enums (``EurostatResponseFormat``,
+``OECDResponseFormat``) inherit from :class:`SDMXResponseFormat` so that
+generic abstractions can refer to them by a common type.
 """
 # Importation des modules
 from abc import ABC, abstractmethod
@@ -54,6 +56,24 @@ class DimensionAtObservation(str, Enum):
 
     ALL_DIMENSIONS = "AllDimensions"
     TIME_PERIOD = "TIME_PERIOD"
+
+
+# Classe marker (sans membres) pour les enums de format de réponse SDMX
+class SDMXResponseFormat(str, Enum):
+    """Marker base class for provider-specific SDMX response-format enums.
+
+    Subclassed (with no extra members on this base) by
+    :class:`EurostatResponseFormat` and :class:`OECDResponseFormat`, so
+    that provider-agnostic abstractions such as :class:`SDMXEndpointBuilder`
+    can refer to response formats by a common static type.
+
+    Note:
+        A Python :class:`enum.Enum` can only be subclassed when it declares
+        no members; this class is therefore intentionally empty. The actual
+        format values (CSV, JSON, …) are defined in the provider-specific
+        subclasses, where their string values map to the parameter values
+        accepted by the corresponding API.
+    """
 
 
 # Énumération des types d'artefacts structurels SDMX interrogeables
@@ -106,7 +126,7 @@ class SDMXEndpointBuilder(ABC):
         self,
         accept_encoding: Optional[str] = None,
         accept_language: Optional[str] = None,
-        response_format: Optional[Any] = None,
+        response_format: Optional["SDMXResponseFormat"] = None,
     ) -> Dict[str, str]:
         """Build HTTP request headers.
 
@@ -160,7 +180,7 @@ class SDMXEndpointBuilder(ABC):
         compress: bool = False,
         # SDMX 3.0
         dimensions: Optional[Dict[str, List[str]]] = None,
-        response_format: Optional[Any] = None,
+        response_format: Optional["SDMXResponseFormat"] = None,
         response_format_version: Optional[str] = None,
         lang: Optional[str] = None,
         labels: Optional[str] = None,
