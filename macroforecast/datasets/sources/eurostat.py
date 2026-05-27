@@ -6,9 +6,7 @@ their SDMX API and converting responses to pandas DataFrames. Both SDMX 3.0
 """
 # Importation des modules
 # Modules de base
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
 import gzip
 from io import StringIO
 import itertools
@@ -21,7 +19,14 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 
 # Utilitaires internes au package pour la requête de données au format SDMX
-from ..core.client import APIClient
+from ..core.client import AbstractSDMXClient, APIClient
+from ..core.sdmx import (
+    DuplicateHandling,
+    SDMXEndpointBuilder,
+    SDMXResponseFormat,
+    SDMXVersion,
+    StructureResourceType,
+)
 from ..core.structures import (
     DataflowStructure,
     DataflowStructureRegistry,
@@ -39,9 +44,6 @@ AGENCY_ID = "ESTAT"
 # ──────────────────────────────────────────────────────────────────────
 # Types et énumérations
 # ──────────────────────────────────────────────────────────────────────
-
-# Type pour la gestion des doublons
-DuplicateHandling = Literal["ignore", "warn", "raise"]
 
 # Types pour les paramètres de requêtes de structure SDMX
 # Détails des structures
@@ -73,40 +75,14 @@ DataDetail = Literal[
     "nodata"
 ]
 
-# Énumération des versions d'API SDMX Eurostat supportées
-class EurostatAPIVersion(str, Enum):
-    """Supported Eurostat SDMX API versions.
-
-    Attributes:
-        V3_0: SDMX 3.0 API (primary, recommended).
-        V2_1: SDMX 2.1 API (legacy, kept for compatibility testing).
-    """
-
-    V3_0 = "3.0"
-    V2_1 = "2.1"
-
-
-# Énumération des types d'artefacts structurels SDMX interrogeables
-class StructureResourceType(str, Enum):
-    """SDMX structure resource types queryable via ``get_structure``.
-
-    Attributes:
-        DATAFLOW: Dataflow definition.
-        DATASTRUCTURE: Data Structure Definition (DSD).
-        DATACONSTRAINT: Data constraint (valid dimension combinations).
-        CONCEPTSCHEME: Concept scheme.
-        CODELIST: Codelist (controlled vocabulary for a dimension).
-    """
-
-    DATAFLOW = "dataflow"
-    DATASTRUCTURE = "datastructure"
-    DATACONSTRAINT = "dataconstraint"
-    CONCEPTSCHEME = "conceptscheme"
-    CODELIST = "codelist"
+# Sous-ensemble des versions SDMX supportées par Eurostat (utilisé pour la validation)
+SUPPORTED_API_VERSIONS: frozenset[SDMXVersion] = frozenset(
+    {SDMXVersion.V2_1, SDMXVersion.V3}
+)
 
 
 # Énumération des formats de réponse pour les requêtes de données Eurostat
-class EurostatResponseFormat(str, Enum):
+class EurostatResponseFormat(SDMXResponseFormat):
     """Response format for Eurostat SDMX data queries.
 
     Attributes:
@@ -126,186 +102,8 @@ class EurostatResponseFormat(str, Enum):
 # Endpoint builders (stratégie par version d'API)
 # ──────────────────────────────────────────────────────────────────────
 
-
-# Classe abstraite de construction d'endpoints et de paramètres par version d'API
-class EndpointBuilder(ABC):
-    """Abstract base for version-specific URL and parameter construction.
-
-    Subclasses implement the endpoint layout and query-parameter conventions
-    for a given SDMX API version.
-
-    All method signatures span the **union** of parameters supported by
-    SDMX 3.0 and SDMX 2.1.  Version-specific parameters that are not
-    applicable to a given subclass are silently ignored by that subclass.
-    Callers should always use keyword arguments so that optional
-    version-specific parameters can be forwarded transparently.
-    """
-
-    # ── Headers ───────────────────────────────────────────────────────
-    # Méthode abstraite de construction des headers HTTP
-    @abstractmethod
-    def build_headers(
-        self,
-        accept_encoding: Optional[str] = None,
-        accept_language: Optional[str] = None,
-    ) -> Dict[str, str]:
-        """Build HTTP request headers.
-
-        Args:
-            accept_encoding: Value for the ``Accept-Encoding`` header.
-            accept_language: Value for the ``Accept-Language`` header.
-
-        Returns:
-            HTTP headers dictionary including at minimum the ``Accept``
-            header for the SDMX version handled by this builder.
-        """
-
-    # ── Data endpoints ────────────────────────────────────────────────
-    # Méthode abstraite de construction du endpoint de téléchargement des données
-    @abstractmethod
-    def build_data_endpoint(
-        self,
-        dataflow: str,
-        agency: str,
-        version: str,
-        key: Optional[str] = None,
-    ) -> str:
-        """Build the URL path for a data query.
-
-        Args:
-            dataflow: Dataflow identifier.
-            agency: Maintaining agency.
-            version: Dataflow version.
-            key: Optional positional key for dimension filtering.
-                Used by SDMX 2.1 (path-based filtering); ignored by 3.0
-                when dimension filters are passed as query parameters.
-
-        Returns:
-            URL path segment (without base URL).
-        """
-
-    # Méthode abstraite de construction des paramètres de téléchargement des données
-    @abstractmethod
-    def build_data_params(
-        self,
-        *,
-        # Commun aux deux versions
-        start_period: Optional[str] = None,
-        end_period: Optional[str] = None,
-        last_n_observations: Optional[int] = None,
-        first_n_observations: Optional[int] = None,
-        compress: bool = False,
-        # Spécifique SDMX 3.0
-        dimensions: Optional[Dict[str, List[str]]] = None,
-        response_format: Optional["EurostatResponseFormat"] = None,
-        response_format_version: Optional[str] = None,
-        lang: Optional[str] = None,
-        labels: Optional[str] = None,
-        attributes: Optional[str] = None,
-        measures: Optional[str] = None,
-        return_data: Optional[str] = None,
-        # Spécifique SDMX 2.1
-        dimension_at_observation: Optional[str] = None,
-        detail: Optional["DataDetail"] = None,
-    ) -> Dict[str, str]:
-        """Build query parameters for a data request.
-
-        All parameters are keyword-only to support transparent forwarding
-        across versions without relying on positional ordering.
-
-        Args:
-            start_period: Start period filter (ISO / SDMX format).
-            end_period: End period filter.
-            last_n_observations: Number of most-recent observations to return.
-            first_n_observations: Number of first observations to return.
-            compress: Whether to request gzip compression.
-            dimensions: Normalised dimension filters as
-                ``{dim_name: [value, ...]}``.
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-            response_format: Desired response format enum value.
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-            response_format_version: Format version string (e.g. ``"1.0"``).
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-            lang: Language code for label localisation (e.g. ``"en"``).
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-            labels: Label display mode (e.g. ``"name"``).
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-            attributes: Attribute selection string (e.g. ``"dsd"``, ``"none"``).
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-            measures: Measure selection string.
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-            return_data: Return-data flag.
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-            dimension_at_observation: Dimension serialised at observation
-                level (e.g. ``"AllDimensions"``).
-                **SDMX 2.1 only** — ignored by the 3.0 builder.
-            detail: Data detail level (e.g. ``"full"``, ``"dataonly"``).
-                **SDMX 2.1 only** — ignored by the 3.0 builder.
-
-        Returns:
-            Query-parameter dictionary.
-        """
-
-    # ── Structure endpoints ───────────────────────────────────────────
-    # Méthode abstraite de construction du endpoint de téléchargement de la structure des données
-    @abstractmethod
-    def build_structure_endpoint(
-        self,
-        resource_type: "StructureResourceType",
-        resource_id: str,
-        agency: str,
-        version: Optional[str],
-    ) -> str:
-        """Build the URL path for a structure query.
-
-        The wildcard token ``"*"`` is accepted for both *resource_id* and
-        *agency* on all versions; subclasses map it to the
-        version-appropriate token (e.g. ``"all"`` for SDMX 2.1).
-
-        Args:
-            resource_type: Type of structure artefact.
-            resource_id: Artefact identifier, or ``"*"`` for all artefacts.
-            agency: Maintaining agency, or ``"*"`` for all agencies.
-            version: Artefact version.  Use ``"+"`` for the latest version,
-                ``"*"`` for all versions, ``"~"`` for the SDMX 3.0
-                latest-per-resource wildcard, or ``None`` to omit the version
-                segment entirely (required for the Dataset listing special case).
-
-        Returns:
-            URL path segment (without base URL).
-        """
-
-    # Méthode abstraite de construction des paramètres de téléchargement de la structure des données
-    @abstractmethod
-    def build_structure_params(
-        self,
-        references: Optional[StructureReferences] = "none",
-        detail: Optional[StructureDetail] = "full",
-        # Spécifique SDMX 3.0
-        format: Optional[str] = None,
-        format_version: Optional[str] = None,
-        compress: Optional[StructureCompress] = None,
-    ) -> Dict[str, str]:
-        """Build query parameters for a structure request.
-
-        Args:
-            references: Related artefacts to include (default: ``"none"``).
-            detail: Level of detail (default: ``"full"``).
-            format: Response format string (e.g. ``"structure"``).
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-            format_version: Format version string (e.g. ``"3.0"``).
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-            compress: Whether to request gzip compression (``"true"`` /
-                ``"false"``).
-                **SDMX 3.0 only** — ignored by the 2.1 builder.
-
-        Returns:
-            Query-parameter dictionary.
-        """
-
-
 # Constructeur d'endpoints pour l'API SDMX 3.0 (version principale)
-class EndpointBuilderV30(EndpointBuilder):
+class EurostatEndpointBuilderV30(SDMXEndpointBuilder):
     """Endpoint builder for the Eurostat SDMX 3.0 API.
 
     Implements URL construction and query-parameter encoding following the
@@ -342,6 +140,7 @@ class EndpointBuilderV30(EndpointBuilder):
         self,
         accept_encoding: Optional[str] = None,
         accept_language: Optional[str] = None,
+        response_format: Optional[Any] = None,
     ) -> Dict[str, str]:
         """Build HTTP request headers for SDMX 3.0.
 
@@ -350,6 +149,7 @@ class EndpointBuilderV30(EndpointBuilder):
                 (e.g. ``"gzip"``).
             accept_language: Value for the ``Accept-Language`` header
                 (e.g. ``"en"``).
+            response_format: Ignored — Eurostat uses a fixed MIME type.
 
         Returns:
             HTTP headers dictionary with at minimum the ``Accept`` header
@@ -599,7 +399,7 @@ class EndpointBuilderV30(EndpointBuilder):
 
 
 # Constructeur d'endpoints pour l'API SDMX 2.1 (version legacy)
-class EndpointBuilderV21(EndpointBuilder):
+class EurostatEndpointBuilderV21(SDMXEndpointBuilder):
     """Endpoint builder for the Eurostat SDMX 2.1 API.
 
     Implements URL construction and query-parameter encoding following the
@@ -654,6 +454,7 @@ class EndpointBuilderV21(EndpointBuilder):
         self,
         accept_encoding: Optional[str] = None,
         accept_language: Optional[str] = None,
+        response_format: Optional[Any] = None,
     ) -> Dict[str, str]:
         """Build HTTP request headers for SDMX 2.1.
 
@@ -662,6 +463,7 @@ class EndpointBuilderV21(EndpointBuilder):
                 (e.g. ``"gzip"``).
             accept_language: Value for the ``Accept-Language`` header
                 (e.g. ``"en"``).
+            response_format: Ignored — Eurostat uses a fixed MIME type.
 
         Returns:
             HTTP headers dictionary with at minimum the ``Accept`` header
@@ -905,9 +707,9 @@ class EndpointBuilderV21(EndpointBuilder):
 
 
 # Registre des builders par version d'API
-_ENDPOINT_BUILDERS: Dict[EurostatAPIVersion, EndpointBuilder] = {
-    EurostatAPIVersion.V3_0: EndpointBuilderV30(),
-    EurostatAPIVersion.V2_1: EndpointBuilderV21(),
+_ENDPOINT_BUILDERS: Dict[SDMXVersion, SDMXEndpointBuilder] = {
+    SDMXVersion.V3: EurostatEndpointBuilderV30(),
+    SDMXVersion.V2_1: EurostatEndpointBuilderV21(),
 }
 
 
@@ -918,7 +720,7 @@ _ENDPOINT_BUILDERS: Dict[EurostatAPIVersion, EndpointBuilder] = {
 
 # Classe de base contenant les paramètres communs aux deux versions d'API
 @dataclass
-class BaseEurostatQueryRequest:
+class EurostatQueryRequest:
     """Base class for Eurostat query requests.
 
     Contains all parameters shared by both SDMX 3.0 and 2.1 API versions.
@@ -988,12 +790,12 @@ class BaseEurostatQueryRequest:
 
 # Classe représentant une requête de données Eurostat via l'API SDMX 3.0
 @dataclass
-class EurostatQueryRequestV30(BaseEurostatQueryRequest):
+class EurostatQueryRequestV30(EurostatQueryRequest):
     """Query request for the Eurostat SDMX 3.0 API.
 
-    Extends :class:`BaseEurostatQueryRequest` with parameters specific to
+    Extends :class:`EurostatQueryRequest` with parameters specific to
     the SDMX 3.0 endpoint. Use this class when the client is configured with
-    ``api_version=EurostatAPIVersion.V3_0`` (the default).
+    ``api_version=SDMXVersion.V3`` (the default).
 
     Attributes:
         attributes: Attribute selection string (e.g., ``"dataStructure"``).
@@ -1038,12 +840,12 @@ class EurostatQueryRequestV30(BaseEurostatQueryRequest):
 
 # Classe représentant une requête de données Eurostat via l'API SDMX 2.1
 @dataclass
-class EurostatQueryRequestV21(BaseEurostatQueryRequest):
+class EurostatQueryRequestV21(EurostatQueryRequest):
     """Query request for the Eurostat SDMX 2.1 API (legacy).
 
-    Extends :class:`BaseEurostatQueryRequest` with parameters specific to
+    Extends :class:`EurostatQueryRequest` with parameters specific to
     the SDMX 2.1 endpoint. Use this class when the client is configured with
-    ``api_version=EurostatAPIVersion.V2_1``.
+    ``api_version=SDMXVersion.V2_1``.
 
     Attributes:
         dimension_at_observation: Dimension serialised at observation
@@ -1085,7 +887,7 @@ class EurostatQueryRequestV21(BaseEurostatQueryRequest):
 
 
 # Initialisation du client haut niveau pour l'API SDMX Eurostat
-class EurostatClient:
+class EurostatClient(AbstractSDMXClient):
     """High-level client for the Eurostat SDMX API.
 
     Supports SDMX 3.0 (default) and SDMX 2.1 API versions. The API version
@@ -1113,15 +915,15 @@ class EurostatClient:
     """
 
     # URLs de base par défaut pour chaque version d'API
-    _DEFAULT_BASE_URLS: Dict[EurostatAPIVersion, str] = {
-        EurostatAPIVersion.V3_0: "https://ec.europa.eu/eurostat/api/dissemination",
-        EurostatAPIVersion.V2_1: "https://ec.europa.eu/eurostat/api/dissemination",
+    _DEFAULT_BASE_URLS: Dict[SDMXVersion, str] = {
+        SDMXVersion.V3: "https://ec.europa.eu/eurostat/api/dissemination",
+        SDMXVersion.V2_1: "https://ec.europa.eu/eurostat/api/dissemination",
     }
 
     # URLs Comext par version d'API (pour les datasets DS-*)
-    _COMEXT_BASE_URLS: Dict[EurostatAPIVersion, str] = {
-        EurostatAPIVersion.V3_0: "https://ec.europa.eu/eurostat/api/comext/dissemination",
-        EurostatAPIVersion.V2_1: "https://ec.europa.eu/eurostat/api/comext/dissemination",
+    _COMEXT_BASE_URLS: Dict[SDMXVersion, str] = {
+        SDMXVersion.V3: "https://ec.europa.eu/eurostat/api/comext/dissemination",
+        SDMXVersion.V2_1: "https://ec.europa.eu/eurostat/api/comext/dissemination",
     }
 
     # Namespaces XML SDMX 3.0
@@ -1141,7 +943,7 @@ class EurostatClient:
     # Initialisation
     def __init__(
         self,
-        api_version: EurostatAPIVersion = EurostatAPIVersion.V3_0,
+        api_version: SDMXVersion = SDMXVersion.V3,
         base_url: Optional[str] = None,
         timeout: int = 90,
         structure_registry: Optional[DataflowStructureRegistry] = None,
@@ -1149,13 +951,29 @@ class EurostatClient:
         rate_limiter: Optional[RateLimiter] = None,
         auto_load_rate_limit: bool = True,
     ):
+        # Validation du sous-ensemble de versions SDMX supportées par Eurostat
+        if api_version not in SUPPORTED_API_VERSIONS:
+            supported = ", ".join(v.name for v in SUPPORTED_API_VERSIONS)
+            raise ValueError(
+                f"Unsupported Eurostat API version {api_version!r}; "
+                f"supported versions: {supported}"
+            )
+
+        # Initialisation de la base (structure_registry, auto_fetch_structure,
+        # rate_limiter via _load_rate_limiter)
+        super().__init__(
+            structure_registry=structure_registry,
+            auto_fetch_structure=auto_fetch_structure,
+            rate_limiter=rate_limiter,
+            auto_load_rate_limit=auto_load_rate_limit,
+        )
+
         # Version d'API et builder d'endpoints associé
         self.api_version = api_version
-        self.endpoint_builder: EndpointBuilder = _ENDPOINT_BUILDERS[api_version]
+        self.endpoint_builder: SDMXEndpointBuilder = _ENDPOINT_BUILDERS[api_version]
 
         # URL de base (résolution par défaut selon la version)
         self.base_url = base_url or self._DEFAULT_BASE_URLS[api_version]
-        self.auto_fetch_structure = auto_fetch_structure
 
         # Client HTTP principal
         self.api_client = APIClient(base_url=self.base_url, timeout=timeout)
@@ -1163,14 +981,6 @@ class EurostatClient:
 
         # Client HTTP Comext (initialisation paresseuse)
         self._comext_client: Optional[APIClient] = None
-
-        # Registre des structures de dataflows
-        self.structure_registry = structure_registry or DataflowStructureRegistry()
-
-        # Chargement automatique du rate limiter si demandé
-        if auto_load_rate_limit and rate_limiter is None:
-            rate_limiter = self._load_rate_limiter()
-        self.rate_limiter = rate_limiter
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes publiques — Données
@@ -1259,10 +1069,6 @@ class EurostatClient:
             ...     split_dimensions=["GEO"],
             ... )
         """
-        # Application du rate limiter avant la requête
-        if self.rate_limiter:
-            self.rate_limiter.wait()
-
         # Chargement de la structure (non fatal en cas d'échec)
         structure = None
         try:
@@ -1278,11 +1084,11 @@ class EurostatClient:
         # Normalisation des dimensions (conversion str → List[str], validation des noms)
         normalized_dims = self._normalize_dimensions(dimensions, structure)
 
-        is_v21 = self.api_version == EurostatAPIVersion.V2_1
+        # Booléen indiquant la version de l'API
+        is_v21 = self.api_version == SDMXVersion.V2_1
 
-        # Génération des combinaisons (dims_for_url, dims_for_params) — appel
-        # systématique, même sans split_dimensions (retourne une seule combinaison)
-        request_combinations = self._generate_request_combinations(
+        # Génération des combinaisons (dims_for_url, dims_for_params)
+        raw_combinations = self._generate_request_combinations(
             dimensions=normalized_dims,
             split_dims=split_dimensions,
             max_combinations=max_split_combinations,
@@ -1290,100 +1096,56 @@ class EurostatClient:
             structure=structure,
         )
 
-        # Requêtes multiples (split_dimensions) : délégation directe sans récursion
-        if len(request_combinations) > 1:
-            return self._execute_split_requests(
-                request_combinations=request_combinations,
-                structure=structure,
-                dataflow=dataflow,
-                version=version,
-                start_period=start_period,
-                end_period=end_period,
-                last_n_observations=last_n_observations,
-                first_n_observations=first_n_observations,
-                response_format=format,
-                compress=compress,
-                attributes=attributes,
-                measures=measures,
-                lang=lang,
-                labels=labels,
-                response_format_version=response_format_version,
-                dimension_at_observation=dimension_at_observation,
-                detail=detail,
+        # Empaquetage au format attendu par AbstractSDMXClient :
+        # tuple (dims_for_request, dims_for_postfilter). Eurostat n'utilise pas
+        # le post-filtre par combinaison (côté serveur via c[DIM]=…), donc
+        # postfilter est vide ; les deux sous-dicts sont passés ensemble à
+        # _execute_single_request via la clé dims_for_request.
+        request_combinations: List[Tuple[Dict, Dict]] = [
+            (
+                {"dims_for_url": dims_for_url, "dims_for_params": dims_for_params},
+                {},
             )
+            for dims_for_url, dims_for_params in raw_combinations
+        ]
 
-        # Requête unique : extraction du tuple (dims_for_url, dims_for_params)
-        dims_for_url, dims_for_params = request_combinations[0]
-
-        # Construction de la clé positionnelle si des dimensions sont destinées au key
-        key_str: Optional[str] = None
-        if dims_for_url and structure:
-            key_str = self._build_key_string(dims_for_url, structure)
-        elif is_v21:
-            # V21 : clé obligatoire dans le path — fallback à "all" sans structure
-            key_str = "all"
-
-        # Construction de l'endpoint et des paramètres via le builder
-        endpoint = self.endpoint_builder.build_data_endpoint(
-            dataflow=dataflow,
-            agency=AGENCY_ID,
-            version=version,
-            key=key_str,
+        # Délégation à AbstractSDMXClient._execute_split_requests (rate limiting,
+        # logging et concaténation gérés uniformément).
+        logger.info(
+            f"Fetching data from {dataflow} ({len(request_combinations)} request(s))"
         )
-        params = self.endpoint_builder.build_data_params(
-            dimensions=dims_for_params or None,
+        df = self._execute_split_requests(
+            request_combinations,
+            dataflow=dataflow,
+            version=version,
+            structure=structure,
+            response_format=format,
+            compress=compress,
             start_period=start_period,
             end_period=end_period,
             last_n_observations=last_n_observations,
             first_n_observations=first_n_observations,
-            compress=compress,
-            response_format=format,
-            response_format_version=response_format_version,
-            lang=lang,
-            labels=labels,
             attributes=attributes,
             measures=measures,
+            lang=lang,
+            labels=labels,
+            response_format_version=response_format_version,
             dimension_at_observation=dimension_at_observation,
             detail=detail,
         )
 
-        # Sélection du client API (standard ou Comext)
-        client = self._get_api_client(dataflow)
+        # Vérification des doublons dans le DataFrame résultant
+        self._check_duplicates(df, normalized_dims, structure, on_duplicate)
 
-        # Requête des données et parsing selon le format
-        try:
-            response = client.get(endpoint, params=params)
+        # Post-filtrage en fallback uniquement : sans structure toutes les dims
+        # partent en query params server-side mais le serveur peut renvoyer
+        # des valeurs plus larges que demandé
+        if normalized_dims and not structure:
+            df = self._filter_dataframe_by_dimensions(df, normalized_dims)
 
-            # Décompression si nécessaire (gzip transparent)
-            raw_bytes = self._decompress_response_bytes(response.content)
-
-            # Parsing de la réponse selon le format demandé
-            if format == EurostatResponseFormat.CSV:
-                df = self._parse_csv_response(raw_bytes.decode("utf-8"))
-            elif format == EurostatResponseFormat.TSV:
-                df = self._parse_tsv_response(raw_bytes.decode("utf-8"))
-            elif format == EurostatResponseFormat.JSON:
-                df = self._parse_json_response(
-                    json.loads(raw_bytes.decode("utf-8"))
-                )
-            else:
-                raise ValueError(f"Unsupported format: {format}")
-
-            # Vérification des doublons dans le DataFrame résultant
-            self._check_duplicates(df, normalized_dims, structure, on_duplicate)
-
-            # Post-filtrage en fallback uniquement : sans structure toutes les dims
-            # partent en query params server-side mais le serveur peut renvoyer
-            # des valeurs plus larges que demandé
-            if normalized_dims and not structure:
-                df = self._filter_dataframe_by_dimensions(df, normalized_dims)
-
-            logger.info(f"Retrieved {len(df)} rows from {dataflow}")
-            return df
-        # Gestion des erreurs de requête et de parsing
-        except Exception as e:
-            logger.error(f"Data retrieval failed: {e}")
-            raise ValueError(f"Failed to retrieve data from {dataflow}: {e}")
+        # Logging
+        logger.info(f"Retrieved {len(df)} rows from {dataflow}")
+        return df
 
     # Méthode publique d'exécution d'un objet EurostatQueryRequest
     def execute_query(
@@ -1512,12 +1274,14 @@ class EurostatClient:
             ... )
         """
         # Construction de l'endpoint et des paramètres via le builder
+        # Construction de l'endpoint
         endpoint = self.endpoint_builder.build_structure_endpoint(
             resource_type=resource_type,
             resource_id=resource_id,
             agency=agency,
             version=version,
         )
+        # Construction des paramètres de requête
         params = self.endpoint_builder.build_structure_params(
             references=references,
             detail=detail,
@@ -1525,6 +1289,7 @@ class EurostatClient:
             format_version=format_version,
             compress=compress,
         )
+        # Construction des headers de requête
         headers = self.endpoint_builder.build_headers(
             accept_encoding=accept_encoding,
             accept_language=accept_language,
@@ -1541,9 +1306,11 @@ class EurostatClient:
             return content.decode("utf-8")
         # Gestion des erreurs de requête
         except Exception as e:
+            # Logging
             logger.error(
                 f"Failed to fetch {resource_type.value}/{resource_id}: {e}"
             )
+            # Erreur
             raise ValueError(
                 f"Failed to fetch {resource_type.value} '{resource_id}': {e}"
             )
@@ -1636,7 +1403,7 @@ class EurostatClient:
         # Sélection du token de version adapté à la version d'API :
         # SDMX 3.0 → None pour omettre le segment de version (cas spécial Dataset listing)
         # SDMX 2.1 → "+" converti en "latest" par le builder V2.1
-        version: Optional[str] = None if self.api_version == EurostatAPIVersion.V3_0 else "+"
+        version: Optional[str] = None if self.api_version == SDMXVersion.V3 else "+"
 
         # Requête du catalogue via get_structure avec wildcards
         xml_text = self.get_structure(
@@ -1655,21 +1422,6 @@ class EurostatClient:
         return self._parse_dataflow_list_response(xml_text)
 
     # ──────────────────────────────────────────────────────────────────
-    # Méthodes publiques — Registre de structures
-    # ──────────────────────────────────────────────────────────────────
-
-    # Méthode publique d'enregistrement d'une structure pré-chargée
-    def register_structure(self, structure: DataflowStructure) -> None:
-        """Register a pre-loaded structure in the internal registry.
-
-        Args:
-            structure: DataflowStructure to register.
-        """
-        # Enregistrement de la structure dans le registre interne
-        self.structure_registry.register(structure)
-        logger.info(f"Registered structure for {structure.dataflow}")
-
-    # ──────────────────────────────────────────────────────────────────
     # Context manager et fermeture des ressources
     # ──────────────────────────────────────────────────────────────────
 
@@ -1683,26 +1435,6 @@ class EurostatClient:
         if self._comext_client:
             self._comext_client.close()
         logger.info("Eurostat client closed")
-
-    # Entrée du context manager
-    def __enter__(self) -> "EurostatClient":
-        """Context manager entry.
-
-        Returns:
-            Self for use in with statement.
-        """
-        return self
-
-    # Sortie du context manager avec fermeture des ressources
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit.
-
-        Args:
-            exc_type: Exception type if raised.
-            exc_val: Exception value if raised.
-            exc_tb: Exception traceback if raised.
-        """
-        self.close()
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes privées — Sélection du client API
@@ -1774,19 +1506,117 @@ class EurostatClient:
                     config = json.load(f)
                 # Extraction de la configuration du rate limiter
                 if "RATE_LIMIT" in config:
-                    rate_config = config["RATE_LIMIT"]
-                    return RateLimiter(
-                        requests=rate_config.get("requests", 30),
-                        unit=rate_config.get("unit", "minutes"),
-                        count=rate_config.get("count", 1),
-                    )
+                    # Logging
+                    logger.info("Loading rate limiter from parameters/eurostat.json")
+                    return RateLimiter.from_dict(config["RATE_LIMIT"])
             # Logging si aucune configuration de rate limit trouvée
             logger.debug("No RATE_LIMIT configuration found")
             return None
         # Gestion des erreurs de lecture ou de parsing
         except Exception as e:
+            # Logging
             logger.warning(f"Failed to load rate limiter config: {e}")
             return None
+
+    # ──────────────────────────────────────────────────────────────────
+    # Méthodes abstraites — Implémentations requises par AbstractSDMXClient
+    # ──────────────────────────────────────────────────────────────────
+
+    # Implémentation de l'abstraction : fetch de structure sans cache
+    def _fetch_structure(
+        self, agency: str, dataflow: str, version: str = "*"
+    ) -> DataflowStructure:
+        """Fetch structure from Eurostat API (no cache).
+
+        Args:
+            agency: Maintaining agency (unused — Eurostat always uses ESTAT).
+            dataflow: Dataflow identifier.
+            version: Dataflow version (``"*"`` for latest).
+
+        Returns:
+            Parsed ``DataflowStructure``.
+        """
+        # Délégation à get_dataflow_structure qui gère le remapping des wildcards
+        return self.get_dataflow_structure(dataflow, version)
+
+    # Implémentation de l'abstraction : exécution d'une seule requête de données
+    def _execute_single_request(
+        self,
+        dims_for_request: Dict[str, List[str]],
+        **request_kwargs,
+    ) -> pd.DataFrame:
+        """Execute a single Eurostat data request.
+
+        For Eurostat the ``dims_for_request`` dict has two keys:
+        ``dims_for_url`` (embedded in the positional key) and
+        ``dims_for_params`` (passed as server-side ``c[DIM]=...`` filters).
+
+        Args:
+            dims_for_request: Dict with keys ``"dims_for_url"`` and
+                ``"dims_for_params"``.
+            **request_kwargs: Extra keyword arguments forwarded from
+                :meth:`get_data` (``dataflow``, ``version``,
+                ``response_format``, etc.).
+
+        Returns:
+            Parsed DataFrame for this single request.
+        """
+        # Extraction des dimensions URL et paramètres depuis le dict structuré
+        dims_for_url: Dict[str, List[str]] = dims_for_request.get("dims_for_url", {})
+        dims_for_params: Dict[str, List[str]] = dims_for_request.get("dims_for_params", {})
+
+        dataflow: str = request_kwargs["dataflow"]
+        version: str = request_kwargs.get("version", "*")
+        structure: Optional[DataflowStructure] = request_kwargs.get("structure")
+        response_format: EurostatResponseFormat = request_kwargs.get(
+            "response_format", EurostatResponseFormat.CSV
+        )
+        is_v21 = self.api_version == SDMXVersion.V2_1
+
+        # Construction de la clé positionnelle
+        key_str: Optional[str] = None
+        if dims_for_url and structure:
+            key_str = self._build_key_string(dims_for_url, structure)
+        elif is_v21:
+            key_str = "all"
+
+        # Construction de l'endpoint et des paramètres
+        endpoint = self.endpoint_builder.build_data_endpoint(
+            dataflow=dataflow,
+            agency=AGENCY_ID,
+            version=version,
+            key=key_str,
+        )
+        params = self.endpoint_builder.build_data_params(
+            dimensions=dims_for_params or None,
+            start_period=request_kwargs.get("start_period"),
+            end_period=request_kwargs.get("end_period"),
+            last_n_observations=request_kwargs.get("last_n_observations"),
+            first_n_observations=request_kwargs.get("first_n_observations"),
+            compress=request_kwargs.get("compress", False),
+            response_format=response_format,
+            response_format_version=request_kwargs.get("response_format_version"),
+            lang=request_kwargs.get("lang"),
+            labels=request_kwargs.get("labels"),
+            attributes=request_kwargs.get("attributes"),
+            measures=request_kwargs.get("measures"),
+            dimension_at_observation=request_kwargs.get("dimension_at_observation"),
+            detail=request_kwargs.get("detail"),
+        )
+
+        # Exécution de la requête et parsing de la réponse
+        client = self._get_api_client(dataflow)
+        response = client.get(endpoint, params=params)
+        raw_bytes = self._decompress_response_bytes(response.content)
+
+        if response_format == EurostatResponseFormat.CSV:
+            return self._parse_csv_response(raw_bytes.decode("utf-8"))
+        elif response_format == EurostatResponseFormat.TSV:
+            return self._parse_tsv_response(raw_bytes.decode("utf-8"))
+        elif response_format == EurostatResponseFormat.JSON:
+            return self._parse_json_response(json.loads(raw_bytes.decode("utf-8")))
+        else:
+            raise ValueError(f"Unsupported format: {response_format}")
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes privées — Parsing des réponses
@@ -1814,28 +1644,6 @@ class EurostatClient:
         if content[:2] == b"\x1f\x8b":
             return gzip.decompress(content)
         return content
-
-    # Méthode statique de parsing de réponse SDMX-CSV
-    @staticmethod
-    def _parse_csv_response(text: str) -> pd.DataFrame:
-        """Parse an SDMX-CSV response.
-
-        Args:
-            text: CSV response text.
-
-        Returns:
-            Parsed DataFrame.
-
-        Raises:
-            ValueError: If CSV parsing fails.
-        """
-        # Parsing direct du CSV avec pandas
-        try:
-            return pd.read_csv(StringIO(text))
-        # Gestion des erreurs de parsing
-        except Exception as e:
-            logger.error(f"CSV parsing failed: {e}")
-            raise ValueError(f"Failed to parse CSV response: {e}")
 
     # Méthode statique de parsing du format TSV Eurostat (format large avec flags)
     @staticmethod
@@ -1896,43 +1704,91 @@ class EurostatClient:
     def _parse_json_response(data: Dict[str, Any]) -> pd.DataFrame:
         """Parse a JSON-stat 2.0 response.
 
+        Eurostat serialises responses in JSON-stat 2.0:
+
+        - ``id``: ordered list of dimension identifiers.
+        - ``size``: number of categories per dimension, same order as ``id``.
+        - ``dimension[dim_id].category.index``: either a ``{code: position}``
+          mapping or an ordered list of codes.
+        - ``value``: observations indexed by a single flat row-major position
+          over the multi-dimensional array described by ``size``. May be
+          serialised as a ``{position_string: value}`` dictionary (sparse)
+          or as a plain list (dense, with ``None`` for missing values).
+
         Args:
             data: JSON-stat dictionary.
 
         Returns:
-            Parsed DataFrame.
+            Parsed DataFrame with one column per dimension (using the
+            dimension code, e.g. ``"FR"``, ``"M"``, ``"2024-01"``) plus a
+            ``value`` column. Empty when the response has no observations.
 
         Raises:
             ValueError: If JSON parsing fails.
         """
         try:
-            # Extraction des dimensions et des observations depuis la réponse
-            dimensions = data.get("dimension", {})
-            observations = data.get("observation", {})
+            # Récupération de l'ordre des dimensions, de leurs tailles et des valeurs
+            dim_ids: List[str] = list(data.get("id", []))
+            sizes: List[int] = list(data.get("size", []))
+            dimensions: Dict[str, Any] = data.get("dimension", {})
+            values = data.get("value", {})
 
-            # Construction des lignes du DataFrame à partir des observations
-            rows = []
-            for obs_key, value in observations.items():
-                # Parsing de la clé d'observation (format : "0:1:2:...")
-                indices = list(map(int, obs_key.split(":")))
+            # Réponse vide ou mal formée
+            if not dim_ids or not sizes or len(dim_ids) != len(sizes):
+                return pd.DataFrame(columns=[*dim_ids, "value"])
+
+            # Construction d'un mapping position -> code pour chaque dimension
+            codes_by_dim: Dict[str, List[Optional[str]]] = {}
+            for dim_id, dim_size in zip(dim_ids, sizes):
+                cat_index = (
+                    dimensions.get(dim_id, {}).get("category", {}).get("index", {})
+                )
+                # Format objet {code: position} → inversion en liste ordonnée
+                if isinstance(cat_index, dict):
+                    pos_to_code: List[Optional[str]] = [None] * dim_size
+                    for code, pos in cat_index.items():
+                        pos_int = int(pos)
+                        if 0 <= pos_int < dim_size:
+                            pos_to_code[pos_int] = code
+                    codes_by_dim[dim_id] = pos_to_code
+                # Format tableau : codes déjà ordonnés
+                elif isinstance(cat_index, list):
+                    codes_by_dim[dim_id] = list(cat_index)
+                else:
+                    codes_by_dim[dim_id] = [None] * dim_size
+
+            # Normalisation des observations en itérable (index_plat, valeur)
+            # JSON-stat 2.0 autorise un dict sparse ou une list dense
+            if isinstance(values, dict):
+                obs_items = ((int(k), v) for k, v in values.items())
+            else:
+                obs_items = (
+                    (i, v) for i, v in enumerate(values) if v is not None
+                )
+
+            # Décomposition row-major de l'index plat en indices multidimensionnels
+            n_dims = len(sizes)
+            rows: List[Dict[str, Any]] = []
+            for flat_idx, value in obs_items:
+                multi_idx = [0] * n_dims
+                remainder = flat_idx
+                for axis in range(n_dims - 1, -1, -1):
+                    multi_idx[axis] = remainder % sizes[axis]
+                    remainder //= sizes[axis]
+
+                # Mapping de chaque indice de dimension vers son code
                 row: Dict[str, Any] = {}
-
-                # Mapping des indices positionnels vers les codes de dimensions
-                for i, (dim_name, dim_info) in enumerate(dimensions.items()):
-                    if i < len(indices):
-                        dim_idx = indices[i]
-                        if "category" in dim_info and "index" in dim_info["category"]:
-                            categories = dim_info["category"]["index"]
-                            if dim_idx in categories:
-                                row[dim_name] = categories[dim_idx]
-
-                # Ajout de la valeur d'observation à la ligne courante
+                for axis, dim_id in enumerate(dim_ids):
+                    codes = codes_by_dim[dim_id]
+                    idx = multi_idx[axis]
+                    row[dim_id] = codes[idx] if 0 <= idx < len(codes) else None
                 row["value"] = value
                 rows.append(row)
 
-            return pd.DataFrame(rows)
+            return pd.DataFrame(rows, columns=[*dim_ids, "value"])
         # Gestion des erreurs de parsing
         except Exception as e:
+            # Logging
             logger.error(f"JSON parsing failed: {e}")
             raise ValueError(f"Failed to parse JSON response: {e}")
 
@@ -2122,7 +1978,7 @@ class EurostatClient:
             >>> # Returns e.g. "*.FR+DE.Q.*.*" depending on positions
         """
         # Jeton wildcard selon la version d'API
-        wildcard = "*" if self.api_version == EurostatAPIVersion.V3_0 else "all"
+        wildcard = "*" if self.api_version == SDMXVersion.V3 else "all"
         # Index lowercase pour la comparaison insensible à la casse
         dims_lower = {k.lower(): v for k, v in dims.items()}
         # Itération sur les dimensions triées par position (positions XML 1-based)
@@ -2169,82 +2025,6 @@ class EurostatClient:
                         f"Dimension '{name}' not found in structure for this dataflow"
                     )
         return normalized
-
-    # Méthode statique de post-filtrage du DataFrame par valeurs de dimensions
-    @staticmethod
-    def _filter_dataframe_by_dimensions(
-        df: pd.DataFrame,
-        filters: Optional[Dict[str, Union[str, List[str]]]],
-    ) -> pd.DataFrame:
-        """Post-filter a DataFrame by dimension values.
-
-        Args:
-            df: Input DataFrame.
-            filters: Filters to apply.
-
-        Returns:
-            Filtered DataFrame.
-        """
-        # Retour immédiat si pas de filtres ou DataFrame vide
-        if not filters or df.empty:
-            return df
-        # Application successive des filtres par dimension
-        result = df.copy()
-        for col, values in filters.items():
-            if col in result.columns:
-                # Normalisation des valeurs scalaires en liste
-                if isinstance(values, str):
-                    values = [values]
-                # Filtrage par appartenance à la liste de valeurs autorisées
-                result = result[result[col].isin(values)]
-        return result
-
-    # Méthode statique de détection et de gestion des doublons
-    @staticmethod
-    def _check_duplicates(
-        df: pd.DataFrame,
-        dimensions: Optional[Dict[str, Union[str, List[str]]]],
-        structure: Optional[DataflowStructure],
-        on_duplicate: DuplicateHandling,
-    ) -> None:
-        """Check for and optionally report duplicate rows.
-
-        Args:
-            df: DataFrame to check.
-            dimensions: Dimension names.
-            structure: Dataflow structure (used for column names).
-            on_duplicate: Handling strategy.
-
-        Raises:
-            ValueError: If ``on_duplicate='raise'`` and duplicates found.
-        """
-        # Retour immédiat si le DataFrame est vide ou sans dimensions
-        if df.empty or not dimensions:
-            return
-
-        # Identification des colonnes de dimensions disponibles dans le DataFrame
-        dim_cols = (
-            [d.name for d in structure.dimensions]
-            if structure
-            else list(dimensions.keys())
-        )
-        available_cols = [c for c in dim_cols if c in df.columns]
-        if not available_cols:
-            return
-
-        # Construction de la liste de colonnes pour la détection des doublons
-        check_cols = available_cols + (
-            ["TIME_PERIOD"] if "TIME_PERIOD" in df.columns else []
-        )
-        duplicates = df[check_cols].duplicated().sum()
-
-        # Application de la stratégie de gestion des doublons
-        if duplicates > 0:
-            message = f"Found {duplicates} duplicate rows"
-            if on_duplicate == "raise":
-                raise ValueError(message)
-            elif on_duplicate == "warn":
-                logger.warning(message)
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes privées — Chargement de structure à la demande
@@ -2379,121 +2159,3 @@ class EurostatClient:
 
         return result
 
-    # Méthode d'exécution des requêtes splitées et de concaténation des résultats
-    def _execute_split_requests(
-        self,
-        request_combinations: List[Tuple[Dict[str, List[str]], Dict[str, List[str]]]],
-        structure: Optional[DataflowStructure],
-        dataflow: str,
-        version: str,
-        start_period: Optional[str],
-        end_period: Optional[str],
-        last_n_observations: Optional[int],
-        first_n_observations: Optional[int],
-        response_format: EurostatResponseFormat,
-        compress: bool,
-        attributes: Optional[str],
-        measures: Optional[str],
-        lang: Optional[str],
-        labels: Optional[str],
-        response_format_version: Optional[str],
-        dimension_at_observation: Optional[str],
-        detail: Optional[DataDetail],
-    ) -> pd.DataFrame:
-        """Execute multiple split requests and concatenate results.
-
-        Builds each sub-request directly from its
-        ``(dims_for_url, dims_for_params)`` tuple without recursing into
-        :meth:`get_data`, so the structure is reused rather than
-        re-fetched for every combination.
-
-        Args:
-            request_combinations: List of ``(dims_for_url, dims_for_params)``
-                tuples produced by :meth:`_generate_request_combinations`.
-            structure: Dataflow structure, used to build the positional URL
-                key via :meth:`_build_key_string`.
-            dataflow: Dataflow identifier.
-            version: Dataflow version.
-            start_period: Start period.
-            end_period: End period.
-            last_n_observations: Number of last observations.
-            first_n_observations: Number of first observations.
-            response_format: Response format.
-            compress: Whether to compress.
-            attributes: Attributes to include (SDMX 3.0 only).
-            measures: Measures to include (SDMX 3.0 only).
-            lang: Language code (SDMX 3.0 only).
-            labels: Label display mode (SDMX 3.0 only).
-            response_format_version: Format version string (SDMX 3.0 only).
-            dimension_at_observation: Dimension at observation level
-                (SDMX 2.1 only).
-            detail: Data detail level (SDMX 2.1 only).
-
-        Returns:
-            Concatenated DataFrame from all requests.
-        """
-        is_v21 = self.api_version == EurostatAPIVersion.V2_1
-        client = self._get_api_client(dataflow)
-        # Initialisation de la liste des DataFrames résultants
-        dfs: list[pd.DataFrame] = []
-
-        # Exécution de chaque sous-requête correspondant à une combinaison de dimensions
-        for dims_for_url, dims_for_params in request_combinations:
-            try:
-                # Construction de la clé positionnelle
-                key_str: Optional[str] = None
-                if dims_for_url and structure:
-                    key_str = self._build_key_string(dims_for_url, structure)
-                elif is_v21:
-                    key_str = "all"
-
-                # Construction de l'endpoint et des paramètres via le builder
-                endpoint = self.endpoint_builder.build_data_endpoint(
-                    dataflow=dataflow,
-                    agency=AGENCY_ID,
-                    version=version,
-                    key=key_str,
-                )
-                params = self.endpoint_builder.build_data_params(
-                    dimensions=dims_for_params or None,
-                    start_period=start_period,
-                    end_period=end_period,
-                    last_n_observations=last_n_observations,
-                    first_n_observations=first_n_observations,
-                    compress=compress,
-                    response_format=response_format,
-                    response_format_version=response_format_version,
-                    lang=lang,
-                    labels=labels,
-                    attributes=attributes,
-                    measures=measures,
-                    dimension_at_observation=dimension_at_observation,
-                    detail=detail,
-                )
-
-                # Exécution de la requête
-                response = client.get(endpoint, params=params)
-                raw_bytes = self._decompress_response_bytes(response.content)
-
-                # Parsing de la réponse selon le format demandé
-                if response_format == EurostatResponseFormat.CSV:
-                    df = self._parse_csv_response(raw_bytes.decode("utf-8"))
-                elif response_format == EurostatResponseFormat.TSV:
-                    df = self._parse_tsv_response(raw_bytes.decode("utf-8"))
-                elif response_format == EurostatResponseFormat.JSON:
-                    df = self._parse_json_response(
-                        json.loads(raw_bytes.decode("utf-8"))
-                    )
-                else:
-                    raise ValueError(f"Unsupported format: {response_format}")
-
-                dfs.append(df)
-            # Gestion des erreurs par sous-requête (non fatale)
-            except Exception as e:
-                logger.error(f"Split request failed for {dims_for_url}: {e}")
-                continue
-
-        # Concaténation des résultats ou retour d'un DataFrame vide si tout a échoué
-        if dfs:
-            return pd.concat(dfs, ignore_index=True)
-        return pd.DataFrame()
