@@ -1,436 +1,248 @@
-"""SDMX URL builder for OECD API.
+"""SDMX shared abstractions.
 
-This module constructs SDMX-compliant URLs according to OECD API specification.
-Supports both SDMX API v1 and v2 formats.
+This module provides provider-agnostic SDMX abstractions usable across all
+SDMX provider clients:
+
+- ``SDMXVersion``: SDMX / OECD API version enum.
+- ``DimensionAtObservation``: observation-level dimension options.
+- ``StructureResourceType``: queryable SDMX artefact types.
+- ``DuplicateHandling``: duplicate-row handling strategy literal type.
+- ``SDMXEndpointBuilder``: abstract base class for URL builders.
+
+OECD-specific elements (``OECDResponseFormat``, ``OECDDataQuery``,
+``OECDEndpointBuilder``) are defined in ``sources/oecd.py``.
 """
 # Importation des modules
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Tuple, Union
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Literal, Optional
 from enum import Enum
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Éléments transversaux à tous les providers SDMX
+# ──────────────────────────────────────────────────────────────────────
+
+# Type pour la gestion des doublons (commun à tous les providers)
+DuplicateHandling = Literal["ignore", "warn", "raise"]
 
 
 # Classe spécifiant les types de versions de l'API SDMX
 class SDMXVersion(str, Enum):
-    """SDMX API version."""
+    """SDMX API version.
+
+    Attributes:
+        V1: OECD SDMX API v1 (legacy REST format).
+        V2: OECD SDMX API v2 (current REST format).
+        V2_1: SDMX 2.1 standard (used by Eurostat legacy endpoint).
+        V3: SDMX 3.0 standard (used by Eurostat primary endpoint).
+    """
+
     V1 = "v1"
     V2 = "v2"
     V2_1 = "v2_1"
     V3 = "v3"
 
 
-# Classe spécifiant les types des formats pouvant être retournés
-class ResponseFormat(str, Enum):
-    """Response format options.
-    
-    Attributes:
-        JSON: JSON format (jsondata parameter)
-        CSV: CSV format without labels (csvfile parameter)
-        CSV_LABELS: CSV format with labels (csvfilewithlabels parameter)
-        XML: XML generic data format (genericdata parameter)
-    """
-    JSON = "json"
-    CSV = "csv"
-    CSV_LABELS = "csv_labels"
-    XML = "xml"
-
-
-# Dictionnaire de mapping des formats vers les paramètres API
-FORMAT_PARAM_MAP = {
-    ResponseFormat.JSON: "jsondata",
-    ResponseFormat.CSV: "csvfile",
-    ResponseFormat.CSV_LABELS: "csvfilewithlabels",
-    ResponseFormat.XML: "genericdata",
-}
-
-
 # Classe spécifiant les valeurs possibles pour dimensionAtObservation
 class DimensionAtObservation(str, Enum):
     """Dimension at observation level options.
-    
+
     Attributes:
-        ALL_DIMENSIONS: Flat representation of observations
-        TIME_PERIOD: Time series view with observations grouped by time
+        ALL_DIMENSIONS: Flat representation of observations.
+        TIME_PERIOD: Time series view with observations grouped by time.
     """
+
     ALL_DIMENSIONS = "AllDimensions"
     TIME_PERIOD = "TIME_PERIOD"
 
 
-# Classe spécifiant les paramètres d'une requête SDMX
-@dataclass
-class SDMXDataQuery:
-    """SDMX data query parameters.
-    
-    Args:
-        agency: Agency identifier (e.g., 'OECD.ENV.EPI')
-        dataflow: Dataflow identifier (e.g., 'DSD_ECH@EXT_DROUGHT')
-        version: Dataflow version (default: '1.0', use '+' for latest)
-        dimensions: Dictionary mapping dimension positions to values
-        start_period: Start time period (inclusive)
-        end_period: End time period (inclusive)
-        last_n_observations: Number of recent observations to retrieve
-        format: Response format (json, csv, csv_labels, xml)
-        sdmx_version: SDMX API version to use
-        dimension_at_observation: Dimension to present at observation level
-        num_dimensions: Total number of dimensions in the dataflow (for padding)
-        attributes: Attributes to include (dsd, all, none)
-        measures: Measures to include (all, none)
-    
-    Example:
-        >>> query = SDMXDataQuery(
-        ...     agency="OECD",
-        ...     dataflow="KEI",
-        ...     dimensions={0: ["FRA", "DEU"], 1: ["PRINTO01"]},
-        ...     num_dimensions=7,
-        ... )
-    """
-    # Attributs obligatoires
-    agency: str
-    dataflow: str
-    
-    # Attributs optionnels avec valeurs par défaut
-    version: str = "1.0"
-    dimensions: Dict[int, List[str]] = field(default_factory=dict)
-    start_period: Optional[str] = None
-    end_period: Optional[str] = None
-    last_n_observations: Optional[int] = None
-    format: ResponseFormat = ResponseFormat.JSON
-    sdmx_version: SDMXVersion = SDMXVersion.V1
-    dimension_at_observation: DimensionAtObservation = DimensionAtObservation.ALL_DIMENSIONS
-    num_dimensions: Optional[int] = None
-    attributes: Optional[str] = None  # "dsd", "all", "none" ou None
-    measures: Optional[str] = None    # "all", "none" ou None
-    
-    # Méthode convertissant les attributs en dictionnaires
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert query to dictionary representation.
-        
-        Returns:
-            Dictionary containing all query parameters.
-        """
-        return {
-            "agency": self.agency,
-            "dataflow": self.dataflow,
-            "version": self.version,
-            "dimensions": self.dimensions,
-            "start_period": self.start_period,
-            "end_period": self.end_period,
-            "last_n_observations": self.last_n_observations,
-            "format": self.format.value,
-            "sdmx_version": self.sdmx_version.value,
-            "dimension_at_observation": self.dimension_at_observation.value,
-            "num_dimensions": self.num_dimensions,
-            "attributes": self.attributes,
-            "measures": self.measures,
-        }
+# Énumération des types d'artefacts structurels SDMX interrogeables
+class StructureResourceType(str, Enum):
+    """SDMX structure resource types.
 
+    Standard SDMX artefact types queryable via the structure endpoint.
+    Applicable to any SDMX provider regardless of API version.
 
-# Classe de construction des URL pour les formats de données SDMX
-class SDMXURLBuilder:
-    """Builder for SDMX-compliant URLs.
-    
-    This class constructs URLs according to OECD SDMX API specifications,
-    supporting both v1 and v2 API versions.
-    
-    Example:
-        >>> builder = SDMXURLBuilder()
-        >>> query = SDMXDataQuery(
-        ...     agency="OECD",
-        ...     dataflow="KEI",
-        ...     dimensions={0: ["FRA"], 1: ["PRINTO01"]},
-        ...     num_dimensions=7,
-        ... )
-        >>> url, params = builder.build_data_url(query)
+    Attributes:
+        DATAFLOW: Dataflow definition.
+        DATASTRUCTURE: Data Structure Definition (DSD).
+        DATACONSTRAINT: Data constraint (valid dimension combinations).
+        CONCEPTSCHEME: Concept scheme.
+        CODELIST: Codelist (controlled vocabulary for a dimension).
     """
 
-    # Méthode de construction de l'URL
-    @staticmethod
-    def build_data_url(query: SDMXDataQuery) -> Tuple[str, Dict[str, Any]]:
-        """Build data query URL and parameters.
-        
-        Args:
-            query: SDMX data query parameters.
-            
-        Returns:
-            Tuple of (endpoint_path, query_parameters).
-        """
-        # Distinction suivant la version de l'API SDMX
-        if query.sdmx_version == SDMXVersion.V1:
-            # Construction en utilisant la V1 de l'API
-            return SDMXURLBuilder._build_v1_data_url(query)
-        else:
-            # Construction en utilisant la V2 de l'API
-            return SDMXURLBuilder._build_v2_data_url(query)
-    
-    # Méthode auxiliaire de construction de l'URL de requête pour la première version
-    @staticmethod
-    def _build_v1_data_url(query: SDMXDataQuery) -> Tuple[str, Dict[str, Any]]:
-        """Build SDMX v1 data URL.
-        
-        Format: /rest/data/<agency>,<dataflow>,<version>/<filter>
-        
-        Args:
-            query: SDMX data query parameters.
-            
-        Returns:
-            Tuple of (endpoint_path, query_parameters).
-        """
-        # Construction du filtre de dimensions
-        dim_filter = SDMXURLBuilder._build_dimension_filter_v1(
-            query.dimensions,
-            query.num_dimensions,
-        )
-        
-        # Construction du path
-        path_parts = [
-            "data",
-            f"{query.agency},{query.dataflow},{query.version}",
-            dim_filter,
-        ]
-        endpoint = "/".join(path_parts)
-        
-        # Construction des paramètres
-        params = {}
-        
-        # Ajout du paramètre de début de période de requête
-        if query.start_period:
-            params["startPeriod"] = query.start_period
-        
-        # Ajout du paramètre de fin de période de requête
-        if query.end_period:
-            params["endPeriod"] = query.end_period
-        
-        # Ajout du paramètre des dernières observations
-        if query.last_n_observations:
-            params["lastNObservations"] = query.last_n_observations
-        
-        # Ajout du paramètre dimensionAtObservation
-        params["dimensionAtObservation"] = query.dimension_at_observation.value
-        
-        # Ajout du paramètre de format
-        params["format"] = FORMAT_PARAM_MAP[query.format]
-        
-        # Retourne l'URL et les paramètres de requête
-        return endpoint, params
-    
-    # Méthode auxiliaire de construction de l'URL de requête pour la deuxième version
-    @staticmethod
-    def _build_v2_data_url(query: SDMXDataQuery) -> Tuple[str, Dict[str, Any]]:
-        """Build SDMX v2 data URL.
-        
-        Format: /rest/v2/data/dataflow/<agency>/<dataflow>/<version>/<filter>
-        
-        Args:
-            query: SDMX data query parameters.
-            
-        Returns:
-            Tuple of (endpoint_path, query_parameters).
-        """
-        # Construction du filtre de dimensions
-        dim_filter = SDMXURLBuilder._build_dimension_filter_v2(
-            query.dimensions,
-            query.num_dimensions,
-        )
-        
-        # Construction du path
-        path_parts = [
-            "v2/data/dataflow",
-            query.agency,
-            query.dataflow,
-            query.version,
-            dim_filter,
-        ]
-        endpoint = "/".join(path_parts)
-        
-        # Construction des paramètres
-        params = {}
-        
-        # Gestion du filtre temporel en v2
-        if query.start_period and query.end_period:
-            params["c[TIME_PERIOD]"] = f"ge:{query.start_period}+le:{query.end_period}"
-        elif query.start_period:
-            params["c[TIME_PERIOD]"] = f"ge:{query.start_period}"
-        elif query.end_period:
-            params["c[TIME_PERIOD]"] = f"le:{query.end_period}"
-        
-        # Ajout du paramètre des dernières observations
-        if query.last_n_observations:
-            params["lastNObservations"] = query.last_n_observations
-        
-        # Ajout du paramètre dimensionAtObservation
-        params["dimensionAtObservation"] = query.dimension_at_observation.value
-        
-        # Ajout du paramètre de format
-        params["format"] = FORMAT_PARAM_MAP[query.format]
-        
-        # Ajout du paramètre optionnel d'attributs
-        if query.attributes:
-            params["attributes"] = query.attributes
-        
-        # Ajout du paramètre optionnel de mesure
-        if query.measures:
-            params["measures"] = query.measures
-        
-        return endpoint, params
-    
-    # Méthode auxiliaire de construction du filtre de dimensions en V1
-    @staticmethod
-    def _build_dimension_filter_v1(
-        dimensions: Dict[int, List[str]],
-        num_dimensions: Optional[int] = None,
-    ) -> str:
-        """Build dimension filter for SDMX v1.
-        
-        Format: value1,value2.value3,value4
-        Multiple values for same dimension: separated by ','
-        Different dimensions: separated by '.'
-        All values: empty string between dots
-        
-        Args:
-            dimensions: Dictionary mapping dimension position to list of values.
-            num_dimensions: Total number of dimensions (for padding with empty strings).
-            
-        Returns:
-            Formatted dimension filter string.
-        """
-        # Cas où aucune dimension n'est spécifiée
-        if not dimensions:
-            if num_dimensions:
-                # Retourne le bon nombre de positions vides
-                return ".".join([""] * num_dimensions)
-            return "all"
-        
-        # Détermination du nombre de positions à générer
-        max_dim = max(dimensions.keys())
-        total_dims = num_dimensions if num_dimensions else max_dim + 1
-        
-        # Construction du filtre
-        filter_parts = []
-        for i in range(total_dims):
-            if i in dimensions:
-                # Jonction des valeurs de cette dimension avec ','
-                filter_parts.append(",".join(dimensions[i]))
-            else:
-                # Dimension non spécifiée = toutes les valeurs (chaîne vide en v1)
-                filter_parts.append("")
-        
-        return ".".join(filter_parts)
-    
-    # Méthode auxiliaire de construction du filtre de dimensions en V2
-    @staticmethod
-    def _build_dimension_filter_v2(
-        dimensions: Dict[int, List[str]],
-        num_dimensions: Optional[int] = None,
-    ) -> str:
-        """Build dimension filter for SDMX v2.
+    DATAFLOW = "dataflow"
+    DATASTRUCTURE = "datastructure"
+    DATACONSTRAINT = "dataconstraint"
+    CONCEPTSCHEME = "conceptscheme"
+    CODELIST = "codelist"
 
-        IMPORTANT: SDMX v2 does not support multiple values per dimension
-        (comma-separated). Each dimension must have exactly one value or use
-        wildcard (*). Use split_dimensions parameter in get_data() to handle
-        multiple values via separate requests.
 
-        Format: value1.value2.value3
-        All values: '*'
+# Classe abstraite de construction d'endpoints et de paramètres par version d'API
+class SDMXEndpointBuilder(ABC):
+    """Abstract base for version- and provider-specific URL construction.
+
+    Subclasses implement the endpoint layout and query-parameter conventions
+    for a given SDMX API version and provider.
+
+    All method signatures span the **union** of parameters supported across
+    SDMX versions and providers. Version-specific or provider-specific
+    parameters that are not applicable to a given subclass are silently
+    ignored by that subclass. Callers must always use keyword arguments so
+    that optional parameters can be forwarded transparently.
+
+    Examples:
+        >>> builder = EurostatEndpointBuilderV30()
+        >>> endpoint = builder.build_data_endpoint("nama_10_gdp", "ESTAT", "*")
+        >>> params = builder.build_data_params(
+        ...     start_period="2020",
+        ...     dimensions={"GEO": ["FR", "DE"]},
+        ... )
+    """
+
+    # Headers
+    @abstractmethod
+    def build_headers(
+        self,
+        accept_encoding: Optional[str] = None,
+        accept_language: Optional[str] = None,
+        response_format: Optional[Any] = None,
+    ) -> Dict[str, str]:
+        """Build HTTP request headers.
 
         Args:
-            dimensions: Dictionary mapping dimension position to list of values.
-                       Each list must contain exactly ONE value.
-            num_dimensions: Total number of dimensions (for padding with '*').
+            accept_encoding: Value for the ``Accept-Encoding`` header
+                (e.g. ``"gzip, deflate"``).
+            accept_language: Value for the ``Accept-Language`` header
+                (e.g. ``"en"``).
+            response_format: Desired response format, used by providers that
+                communicate the format via the ``Accept`` header rather than a
+                query parameter (e.g. OECD). Ignored by providers that use a
+                fixed MIME type (e.g. Eurostat).
 
         Returns:
-            Formatted dimension filter string.
-
-        Raises:
-            ValueError: If any dimension has more than one value.
+            HTTP headers dictionary including at minimum the ``Accept`` header.
         """
-        # Cas où aucune dimension n'est spécifiée
-        if not dimensions:
-            if num_dimensions:
-                # Retourne le bon nombre de wildcards
-                return ".".join(["*"] * num_dimensions)
-            return "*"
 
-        # VALIDATION: Vérifier qu'aucune dimension n'a plusieurs valeurs
-        for position, values in dimensions.items():
-            if len(values) > 1:
-                raise ValueError(
-                    f"SDMX v2 does not support multiple values for a single dimension. "
-                    f"Dimension at position {position} has {len(values)} values: {values}. "
-                    f"Use split_dimensions parameter in get_data() to handle multiple values."
-                )
-
-        # Détermination du nombre de positions à générer
-        max_dim = max(dimensions.keys())
-        total_dims = num_dimensions if num_dimensions else max_dim + 1
-
-        # Construction du filtre
-        filter_parts = []
-        for i in range(total_dims):
-            if i in dimensions:
-                # Une seule valeur (garanti par validation ci-dessus)
-                filter_parts.append(dimensions[i][0])  # Prendre la première (et unique) valeur
-            else:
-                # Toutes les valeurs = '*'
-                filter_parts.append("*")
-
-        return ".".join(filter_parts)
-    
-    # Méthode de construction de la structure de l'URL de requête pour chaque version
-    @staticmethod
-    def build_structure_url(
-        agency: str,
+    # Data endpoints
+    @abstractmethod
+    def build_data_endpoint(
+        self,
         dataflow: str,
-        version: str = "1.0",
-        sdmx_version: SDMXVersion = SDMXVersion.V1,
-    ) -> Tuple[str, Dict[str, str]]:
-        """Build structure query URL.
-        
+        agency: str,
+        version: str,
+        key: Optional[str] = None,
+    ) -> str:
+        """Build the URL path for a data query.
+
         Args:
-            agency: Agency identifier.
             dataflow: Dataflow identifier.
+            agency: Maintaining agency.
             version: Dataflow version.
-            sdmx_version: SDMX API version.
-            
+            key: Optional positional key for dimension filtering.
+                Used by SDMX 2.1 (path-based filtering); typically unused
+                in SDMX 3.0 where dimension filters are query parameters.
+
         Returns:
-            Tuple of (endpoint_path, query_parameters).
+            URL path segment (without base URL).
         """
-        # Distinction suivant la version
-        if sdmx_version == SDMXVersion.V1:
-            endpoint = f"dataflow/{agency}/{dataflow}/{version}"
-        else:
-            endpoint = f"v2/structure/dataflow/{agency}/{dataflow}/{version}"
-        
-        # Construction des paramètres
-        params = {
-            "references": "all",
-            "detail": "referencepartial",
-        }
-        
-        return endpoint, params
-    
-    # Méthode de construction du header
-    @staticmethod
-    def get_accept_header(format: ResponseFormat, version: SDMXVersion) -> str:
-        """Get appropriate Accept header for format and version.
-        
+
+    # Data endpoints params
+    @abstractmethod
+    def build_data_params(
+        self,
+        *,
+        # Commun à toutes les versions
+        start_period: Optional[str] = None,
+        end_period: Optional[str] = None,
+        last_n_observations: Optional[int] = None,
+        first_n_observations: Optional[int] = None,
+        compress: bool = False,
+        # SDMX 3.0
+        dimensions: Optional[Dict[str, List[str]]] = None,
+        response_format: Optional[Any] = None,
+        response_format_version: Optional[str] = None,
+        lang: Optional[str] = None,
+        labels: Optional[str] = None,
+        attributes: Optional[str] = None,
+        measures: Optional[str] = None,
+        return_data: Optional[str] = None,
+        # SDMX 2.1
+        dimension_at_observation: Optional[str] = None,
+        detail: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build query parameters for a data request.
+
+        All parameters are keyword-only to support transparent forwarding
+        across versions without relying on positional ordering.
+
         Args:
-            format: Desired response format.
-            version: SDMX API version.
-            
+            start_period: Start period filter.
+            end_period: End period filter.
+            last_n_observations: Number of most-recent observations to return.
+            first_n_observations: Number of first observations to return.
+            compress: Whether to request gzip compression.
+            dimensions: Dimension filters as ``{name: [values]}``.
+                Used by SDMX 3.0 (Eurostat). Ignored by SDMX 2.1 builders.
+            response_format: Desired response format enum value.
+            response_format_version: Format version string.
+            lang: Language code for label localisation (e.g. ``"en"``).
+            labels: Label display mode. SDMX 3.0 only.
+            attributes: Attribute selection string.
+            measures: Measure selection string.
+            return_data: Return-data flag. SDMX 3.0 only.
+            dimension_at_observation: Dimension serialised at observation
+                level. SDMX 2.1 / OECD only.
+            detail: Data detail level. SDMX 2.1 / OECD only.
+
         Returns:
-            Accept header value.
+            Query-parameter dictionary.
         """
-        # Distinction suivant le format de la réponse attendu
-        if format == ResponseFormat.JSON:
-            if version == SDMXVersion.V2:
-                return "application/vnd.sdmx.data+json; charset=utf-8; version=2"
-            return "application/vnd.sdmx.data+json; charset=utf-8; version=1.0"
-        
-        elif format in (ResponseFormat.CSV, ResponseFormat.CSV_LABELS):
-            if version == SDMXVersion.V2:
-                return "application/vnd.sdmx.data+csv; charset=utf-8; version=2"
-            return "application/vnd.sdmx.data+csv; charset=utf-8"
-        
-        elif format == ResponseFormat.XML:
-            return "application/vnd.sdmx.structurespecificdata+xml; charset=utf-8; version=2.1"
-        
-        return "application/json"
+
+    # Structure endpoints
+    @abstractmethod
+    def build_structure_endpoint(
+        self,
+        resource_type: "StructureResourceType",
+        resource_id: str,
+        agency: str,
+        version: Optional[str],
+    ) -> str:
+        """Build the URL path for a structure query.
+
+        Args:
+            resource_type: Type of structure artefact.
+            resource_id: Artefact identifier, or ``"*"`` for all artefacts.
+            agency: Maintaining agency, or ``"*"`` for all agencies.
+            version: Artefact version. Use ``"+"`` for latest, ``"*"`` for
+                all versions, or ``None`` to omit the version segment.
+
+        Returns:
+            URL path segment (without base URL).
+        """
+
+    # Structure endpoints params
+    @abstractmethod
+    def build_structure_params(
+        self,
+        references: Optional[str] = "none",
+        detail: Optional[str] = "full",
+        # SDMX 3.0 only
+        format: Optional[str] = None,
+        format_version: Optional[str] = None,
+        compress: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Build query parameters for a structure request.
+
+        Args:
+            references: Related artefacts to include (default: ``"none"``).
+            detail: Level of detail (default: ``"full"``).
+            format: Response format string. SDMX 3.0 only.
+            format_version: Version of the response format. SDMX 3.0 only.
+            compress: Whether to request gzip compression (``"true"`` /
+                ``"false"``). SDMX 3.0 only.
+
+        Returns:
+            Query-parameter dictionary.
+        """
+

@@ -1,22 +1,30 @@
 # Importation des éléments d'intérêt du module
 # Client
-from .client import APIClient
+from .client import APIClient, AbstractSDMXClient
 # Rate limiter
 from .rate_limiter import RateLimiter
 # SDMX
-from .sdmx import SDMXDataQuery, SDMXURLBuilder, SDMXVersion, ResponseFormat
+from .sdmx import (
+    SDMXVersion,
+    DimensionAtObservation,
+    StructureResourceType,
+    DuplicateHandling,
+    SDMXEndpointBuilder,
+)
 # Structures
 from .structures import DimensionInfo, DataflowStructure, DataflowStructureRegistry
 
 # Réexport des éléments d'intérêt du module
 __all__ = [
     'APIClient',
+    'AbstractSDMXClient',
     'RateLimiter',
-    'SDMXDataQuery',
-    'SDMXURLBuilder',
     'SDMXVersion',
-    'ResponseFormat',
+    'DimensionAtObservation',
+    'StructureResourceType',
+    'DuplicateHandling',
+    'SDMXEndpointBuilder',
     'DimensionInfo',
     'DataflowStructure',
-    'DataflowStructureRegistry'
+    'DataflowStructureRegistry',
 ]
