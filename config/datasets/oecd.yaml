@@ -100,8 +100,7 @@ queries:
     dimensions:
       FREQ: "Q"
       ADJUSTMENT: "Y"
-      REF_AREA:
-        - *g7
+      REF_AREA: *g7
       SECTOR: "S1"
       COUNTERPART_SECTOR: "S1"
       TRANSACTION:
