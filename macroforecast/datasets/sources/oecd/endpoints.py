@@ -121,11 +121,8 @@ class OECDEndpointBuilder(SDMXEndpointBuilder):
         return "application/json"
 
     @staticmethod
-    def get_structure_accept_header(version: SDMXVersion) -> str:
+    def get_structure_accept_header() -> str:
         """Get the Accept header for an OECD structure JSON query.
-
-        Args:
-            version: SDMX API version.
 
         Returns:
             ``Accept`` header value string for the structure endpoint.
@@ -211,12 +208,14 @@ class OECDEndpointBuilderV1(OECDEndpointBuilder):
         return_data: Optional[str] = None,
         dimension_at_observation: Optional[str] = None,
         detail: Optional[str] = None,
+        updated_after: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build query parameters for an OECD v1 data request.
 
         Recognised parameters: ``start_period``, ``end_period``,
         ``last_n_observations``, ``response_format``,
-        ``dimension_at_observation``. Other arguments are accepted for
+        ``dimension_at_observation``. Other arguments (including
+        ``updated_after``, which is SDMX-CSV v2 only) are accepted for
         interface compatibility and silently ignored.
 
         Returns:
@@ -342,12 +341,18 @@ class OECDEndpointBuilderV2(OECDEndpointBuilder):
         return_data: Optional[str] = None,
         dimension_at_observation: Optional[str] = None,
         detail: Optional[str] = None,
+        updated_after: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build query parameters for an OECD v2 data request.
 
         v2 encodes the time-period filter via ``c[TIME_PERIOD]=ge:…+le:…``
         rather than ``startPeriod``/``endPeriod``, and additionally supports
         ``attributes`` and ``measures`` query parameters.
+
+        Args:
+            updated_after: ISO-8601 dateTime (with timezone). When set, the
+                response only includes observations inserted, updated or
+                deleted since that instant (SDMX-CSV v2 ``updatedAfter``).
 
         Returns:
             Query-parameter dictionary.
@@ -373,6 +378,10 @@ class OECDEndpointBuilderV2(OECDEndpointBuilder):
             params["measures"] = measures
         if last_n_observations:
             params["lastNObservations"] = last_n_observations
+        # Synchronisation incrémentale : seules les observations modifiées depuis
+        # cet instant sont renvoyées (SDMX-CSV v2 uniquement)
+        if updated_after:
+            params["updatedAfter"] = updated_after
         return params
 
     def build_structure_endpoint(

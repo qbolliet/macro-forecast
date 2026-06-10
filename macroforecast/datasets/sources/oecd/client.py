@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import xml.etree.ElementTree as ET
 
 import pandas as pd
+import requests
 
 # Utilitaires internes au package pour la requête de données au format SDMX
 from ...core.client import AbstractSDMXClient, APIClient
@@ -540,7 +541,7 @@ class OECDClient(AbstractSDMXClient):
 
         # Construction des headers de requête (Accept dynamique selon la version)
         headers = {
-            "Accept": self.endpoint_builder.get_structure_accept_header(self.sdmx_version),
+            "Accept": self.endpoint_builder.get_structure_accept_header(),
         }
 
         # Exécution de la requête
@@ -715,21 +716,22 @@ class OECDClient(AbstractSDMXClient):
         # Parcours des dataflow
         for key, query in unique_dataflows.items():
             try:
-                # Extraction de la dernière mise à jour du jeu de données
-                last_updated = self._get_dataflow_last_update(
+                # Vérification de l'existence d'observations modifiées depuis la date
+                has_updates = self._has_updates_since(
                     query.agency,
                     query.dataflow,
-                    query.version
+                    cutoff_date,
+                    query.version,
                 )
-                # Vérification que la mise à jour est postérieure à la date d'intéret
-                if last_updated and last_updated > cutoff_date:
+                # Conservation du dataflow uniquement s'il a été mis à jour
+                if has_updates:
                     # Ajout à la liste des dataflows à requêter
                     updated_dataflows.add(key)
                     # Logging
-                    logger.info(f"✓ {key} updated on {last_updated}")
+                    logger.info(f"✓ {key} has updates since {cutoff_date}")
                 else:
                     # Logging
-                    logger.debug(f"✗ {key} not updated (last: {last_updated})")
+                    logger.debug(f"✗ {key} no updates since {cutoff_date}")
 
             except Exception as e:
                 # Loggin
@@ -751,61 +753,114 @@ class OECDClient(AbstractSDMXClient):
 
         return filtered_queries
 
-    # Méthode auxiliaire d'extraction de la dernière date de mise à jour d'un dataflow
-    def _get_dataflow_last_update(
+    # Méthode auxiliaire de vérification des mises à jour d'un dataflow
+    def _has_updates_since(
         self,
         agency: str,
         dataflow: str,
+        cutoff_date: datetime,
         version: str = "+",
-    ) -> Optional[datetime]:
-        """Get the last update date for a dataflow via ContentConstraint.
+    ) -> bool:
+        """Check whether a dataflow has observations updated since a date.
+
+        Uses the SDMX-CSV v2 ``updatedAfter`` data-query parameter (OECD's
+        recommended mechanism for incremental synchronisation) instead of
+        relying on a guessed ContentConstraint identifier. A single
+        observation is requested (``lastNObservations=1``): if the response
+        carries any row, the dataflow was inserted/updated/deleted after the
+        cutoff. An empty body or a ``404`` response means "no updates".
 
         Args:
             agency: Agency identifier.
             dataflow: Dataflow identifier.
+            cutoff_date: Threshold datetime. Naive datetimes are interpreted
+                as UTC.
             version: Dataflow version.
 
         Returns:
-            Datetime of last update, or None if unavailable.
+            ``True`` if at least one observation changed since ``cutoff_date``.
+
+        Raises:
+            ValueError: If :attr:`sdmx_version` is not ``SDMXVersion.V2``
+                (``updatedAfter`` is unsupported by the v1 API and would be
+                silently ignored, wrongly flagging every dataflow as updated).
+            requests.exceptions.RequestException: On HTTP errors other than
+                ``404`` (which is treated as "no updates").
 
         Note:
-            This method intentionally does **not** invoke the rate limiter:
-            metadata queries are lightweight enough that the OECD 60
-            requests/hour quota is unlikely to be hit by ordinary update
-            checks. If batched across many dataflows in a tight loop, the
-            caller should add its own throttling.
+            ``updatedAfter`` requires SDMX-CSV v2; this check is therefore
+            meaningful only with :attr:`sdmx_version` set to ``SDMXVersion.V2``.
         """
-        # Construction de l'identifiant ContentConstraint
-        # Format: CR_A_{DATASET_ID} où DATASET_ID est extrait du dataflow
-        # Ex: "DSD_KEI@DF_KEI" → dataset_id = "DF_KEI"
-        if "@" in dataflow:
-            dataset_id = dataflow.split("@")[1]
-        else:
-            dataset_id = dataflow
+        # Garde-fou : updatedAfter est réservé au SDMX-CSV v2. En v1, le paramètre
+        # serait silencieusement ignoré et tous les dataflows seraient considérés
+        # comme mis à jour. On échoue explicitement plutôt que de retourner un
+        # résultat faux.
+        if self.sdmx_version != SDMXVersion.V2:
+            raise ValueError(
+                f"Update checking via 'updatedAfter' requires SDMXVersion.V2, "
+                f"but this client uses {self.sdmx_version}. The v1 API does not "
+                f"support 'updatedAfter'. Instantiate OECDClient with "
+                f"sdmx_version=SDMXVersion.V2 to filter queries by update date."
+            )
 
-        constraint_id = f"CR_A_{dataset_id}"
+        # Formatage de la date au format dateTime ISO-8601 avec fuseau horaire
+        updated_after = self._format_updated_after(cutoff_date)
 
-        # Endpoint ContentConstraint
-        endpoint = f"contentconstraint/{agency}/{constraint_id}"
+        # Endpoint data avec clé wildcard (toutes dimensions confondues)
+        endpoint = self.endpoint_builder.build_data_endpoint(
+            dataflow=dataflow,
+            agency=agency,
+            version=version,
+            key=None,
+        )
+        # Paramètres : une seule observation suffit pour détecter un changement
+        params = self.endpoint_builder.build_data_params(
+            response_format=OECDResponseFormat.CSV,
+            last_n_observations=1,
+            updated_after=updated_after,
+        )
+        headers = self.endpoint_builder.build_headers(
+            response_format=OECDResponseFormat.CSV
+        )
 
-        # Headers pour JSON (plus facile à parser)
-        headers = {
-            "Accept": "application/vnd.sdmx.structure+json;version=1.0.0",
-            "Accept-Encoding": "gzip, deflate",
-        }
+        # Application du rate limiter (quota OCDE de 60 requêtes/heure)
+        if self.rate_limiter:
+            self.rate_limiter.acquire()
 
         try:
-            # Requête (pas de rate limiting pour metadata)
-            response = self.api_client.get(endpoint, headers=headers)
-            data = response.json()
+            # Exécution de la requête
+            response = self.api_client.get(endpoint, params=params, headers=headers)
+        except requests.exceptions.HTTPError as e:
+            # 404 : l'OCDE ne renvoie aucune donnée quand rien n'a changé
+            if e.response is not None and e.response.status_code == 404:
+                return False
+            raise
 
-            # Parsing la réponse pour extraire la date de mise à jour
-            last_update = parsing.parse_contentconstraint_date(data)
-            return last_update
+        # Réponse vide (204 No Content ou corps vide) → aucune mise à jour
+        if response.status_code == 204 or not response.text.strip():
+            return False
 
-        except Exception as e:
-            logger.debug(f"Could not retrieve ContentConstraint for {agency}/{dataflow}: {e}")
-            return None
+        # Présence d'au moins une observation → mise à jour détectée
+        df = self._parse_csv_response(response.text)
+        return not df.empty
+
+    # Méthode auxiliaire de formatage de la date pour le paramètre updatedAfter
+    @staticmethod
+    def _format_updated_after(cutoff_date: datetime) -> str:
+        """Format a datetime for the ``updatedAfter`` query parameter.
+
+        Args:
+            cutoff_date: Threshold datetime. Naive datetimes are assumed UTC.
+
+        Returns:
+            ISO-8601 dateTime string including a timezone offset, e.g.
+            ``"2024-01-01T00:00:00Z"``.
+        """
+        # Datetime naïf → interprété comme UTC (suffixe "Z")
+        if cutoff_date.tzinfo is None:
+            return cutoff_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Datetime avec fuseau → format ISO natif (offset inclus)
+        return cutoff_date.isoformat()
 
     # ──────────────────────────────────────────────────────────────────
     # Méthodes abstraites — Implémentations requises par AbstractSDMXClient

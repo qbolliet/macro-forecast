@@ -6,10 +6,9 @@ ContentConstraint update dates. They carry no client state and are therefore
 exposed as module-level functions rather than methods.
 """
 # Importation des modules
-from datetime import datetime
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import pandas as pd
 
@@ -178,51 +177,3 @@ def create_structure_from_api_response(
     except Exception as e:
         logger.error(f"Error parsing structure: {e}")
         raise ValueError(f"Unable to parse structure: {e}")
-
-
-# Fonction de parsing de la date de mise à jour depuis la réponse ContentConstraint
-def parse_contentconstraint_date(data: Dict[str, Any]) -> Optional[datetime]:
-    """Parse ContentConstraint response to extract last update date.
-
-    Args:
-        data: JSON response from ContentConstraint endpoint.
-
-    Returns:
-        Datetime of last update, or None.
-    """
-    try:
-        # Structure SDMX-JSON ContentConstraint:
-        # {
-        #   "meta": {
-        #     "prepared": "2024-11-15T10:30:00Z",
-        #     ...
-        #   },
-        #   "data": {
-        #     "contentConstraints": [{
-        #       "validFrom": "2024-01-01",
-        #       "validTo": "2024-12-31",
-        #       ...
-        #     }]
-        #   }
-        # }
-
-        # Stratégie 1: Chercher "prepared" dans meta
-        if "meta" in data and "prepared" in data["meta"]:
-            prepared_str = data["meta"]["prepared"]
-            return datetime.fromisoformat(prepared_str.replace("Z", "+00:00"))
-
-        # Stratégie 2: Chercher validFrom/validTo dans contentConstraints
-        if "data" in data and "contentConstraints" in data["data"]:
-            constraints = data["data"]["contentConstraints"]
-            if constraints and "validTo" in constraints[0]:
-                valid_to_str = constraints[0]["validTo"]
-                return datetime.fromisoformat(valid_to_str)
-
-        # Logging
-        logger.warning("Could not find update date in ContentConstraint response")
-        return None
-
-    except Exception as e:
-        # Logging
-        logger.warning(f"Error parsing ContentConstraint date: {e}")
-        return None
