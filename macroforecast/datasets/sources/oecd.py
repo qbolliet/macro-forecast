@@ -7,6 +7,7 @@ their SDMX API and converting responses to pandas DataFrames.
 # Modules de base
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from io import StringIO
 import logging
 from typing import Optional, Dict, List, Any, Union, Literal, Tuple
@@ -20,17 +21,17 @@ from functools import reduce
 import itertools
 
 # Utilitaires internes au package pour la requête de données au format SDMX
-from ..core.client import APIClient
+from ..core.client import AbstractSDMXClient, APIClient
 from ..core.sdmx import (
-    SDMXURLBuilder,
-    SDMXDataQuery,
-    SDMXVersion,
-    ResponseFormat,
     DimensionAtObservation,
+    DuplicateHandling,
+    SDMXEndpointBuilder,
+    SDMXResponseFormat,
+    SDMXVersion,
 )
 from ..core.structures import (
-    DataflowStructureRegistry,
     DataflowStructure,
+    DataflowStructureRegistry,
     DimensionInfo,
 )
 from ..core.rate_limiter import RateLimiter
@@ -39,8 +40,551 @@ from ..core.rate_limiter import RateLimiter
 logger = logging.getLogger(__name__)
 
 
-# Types pour la gestion des doublons
-DuplicateHandling = Literal["ignore", "warn", "raise"]
+# ──────────────────────────────────────────────────────────────────────
+# Types et énumérations
+# ──────────────────────────────────────────────────────────────────────
+
+# DuplicateHandling est défini dans core.sdmx et importé ci-dessus
+
+# Énumération des formats de réponse pour les requêtes de données OECD
+class OECDResponseFormat(SDMXResponseFormat):
+    """Response format options for the OECD API.
+
+    Attributes:
+        JSON: JSON format (jsondata parameter).
+        CSV: CSV format without labels (csvfile parameter).
+        CSV_LABELS: CSV format with labels (csvfilewithlabels parameter).
+        XML: XML generic data format (genericdata parameter).
+    """
+
+    JSON = "json"
+    CSV = "csv"
+    CSV_LABELS = "csv_labels"
+    XML = "xml"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Dataclass de requête interne (DTO)
+# ──────────────────────────────────────────────────────────────────────
+
+# Classe spécifiant les paramètres d'une requête de données OECD
+@dataclass
+class OECDDataQuery:
+    """OECD SDMX data query parameters.
+
+    Internal DTO used by :class:`OECDEndpointBuilder` and
+    :class:`OECDClient` to carry all parameters for a single API request.
+
+    Args:
+        agency: Agency identifier (e.g., ``'OECD.SDD.STES'``).
+        dataflow: Dataflow identifier (e.g., ``'DSD_KEI@DF_KEI'``).
+        version: Dataflow version (default: ``'+'`` for latest).
+        dimensions: Dimension position → values mapping.
+        start_period: Start time period (inclusive).
+        end_period: End time period (inclusive).
+        last_n_observations: Number of recent observations to retrieve.
+        format: Response format.
+        sdmx_version: SDMX API version to use.
+        dimension_at_observation: Dimension to present at observation level.
+        num_dimensions: Total number of dimensions (for URL padding).
+        attributes: Attributes to include (``"dsd"``, ``"all"``, ``"none"``).
+        measures: Measures to include (``"all"``, ``"none"``).
+
+    Example:
+        >>> query = OECDDataQuery(
+        ...     agency="OECD",
+        ...     dataflow="KEI",
+        ...     dimensions={0: ["FRA", "DEU"], 1: ["PRINTO01"]},
+        ...     num_dimensions=7,
+        ... )
+    """
+
+    # Attributs obligatoires
+    agency: str
+    dataflow: str
+
+    # Attributs optionnels avec valeurs par défaut
+    version: str = "1.0"
+    dimensions: Dict[int, List[str]] = None
+    start_period: Optional[str] = None
+    end_period: Optional[str] = None
+    last_n_observations: Optional[int] = None
+    format: OECDResponseFormat = OECDResponseFormat.JSON
+    sdmx_version: SDMXVersion = SDMXVersion.V1
+    dimension_at_observation: DimensionAtObservation = DimensionAtObservation.ALL_DIMENSIONS
+    num_dimensions: Optional[int] = None
+    attributes: Optional[str] = None
+    measures: Optional[str] = None
+
+    def __post_init__(self):
+        if self.dimensions is None:
+            self.dimensions = {}
+
+    # Méthode convertissant les attributs en dictionnaire
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert query to dictionary representation.
+
+        Returns:
+            Dictionary containing all query parameters.
+        """
+        return {
+            "agency": self.agency,
+            "dataflow": self.dataflow,
+            "version": self.version,
+            "dimensions": self.dimensions,
+            "start_period": self.start_period,
+            "end_period": self.end_period,
+            "last_n_observations": self.last_n_observations,
+            "format": self.format.value,
+            "sdmx_version": self.sdmx_version.value,
+            "dimension_at_observation": self.dimension_at_observation.value,
+            "num_dimensions": self.num_dimensions,
+            "attributes": self.attributes,
+            "measures": self.measures,
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Endpoint builder OECD
+# ──────────────────────────────────────────────────────────────────────
+
+# Mapping des formats vers les valeurs de paramètre API OECD
+_OECD_FORMAT_PARAM_MAP = {
+    OECDResponseFormat.JSON: "jsondata",
+    OECDResponseFormat.CSV: "csvfile",
+    OECDResponseFormat.CSV_LABELS: "csvfilewithlabels",
+    OECDResponseFormat.XML: "genericdata",
+}
+
+
+# Classe de base abstraite pour les endpoint builders OCDE
+class OECDEndpointBuilder(SDMXEndpointBuilder):
+    """Base endpoint builder for the OECD SDMX API.
+
+    Common logic (HTTP headers, Accept MIME types, structure query
+    parameters) is implemented here; URL paths, query parameters and the
+    positional dimension key are version-specific and implemented by the
+    :class:`OECDEndpointBuilderV1` and :class:`OECDEndpointBuilderV2`
+    subclasses.
+
+    Attributes:
+        sdmx_version: OECD SDMX API version associated with this builder.
+
+    Note:
+        Do not instantiate this base class directly — use the registry
+        :data:`_OECD_ENDPOINT_BUILDERS` or the V1/V2 subclasses.
+    """
+
+    # Version d'API associée au builder (surchargée par les sous-classes)
+    sdmx_version: SDMXVersion
+
+    # Construction des headers HTTP (Accept basé sur le format et la version)
+    def build_headers(
+        self,
+        accept_encoding: Optional[str] = None,
+        accept_language: Optional[str] = None,
+        response_format: Optional[OECDResponseFormat] = None,
+    ) -> Dict[str, str]:
+        """Build HTTP request headers for the OECD API.
+
+        Args:
+            accept_encoding: Value for the ``Accept-Encoding`` header.
+                Defaults to ``"gzip, deflate"`` when ``None``.
+            accept_language: Value for the ``Accept-Language`` header.
+            response_format: Desired response format. Controls the
+                ``Accept`` header value.
+
+        Returns:
+            HTTP headers dictionary.
+        """
+        fmt = response_format or OECDResponseFormat.CSV_LABELS
+        headers: Dict[str, str] = {
+            "Accept": self.get_accept_header(fmt, self.sdmx_version),
+            "Accept-Encoding": accept_encoding or "gzip, deflate",
+        }
+        if accept_language is not None:
+            headers["Accept-Language"] = accept_language
+        return headers
+
+    # Construction des paramètres de requête de structure (identiques v1/v2)
+    def build_structure_params(
+        self,
+        references: Optional[str] = "all",
+        detail: Optional[str] = "referencepartial",
+        format: Optional[str] = None,
+        format_version: Optional[str] = None,
+        compress: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Build query parameters for an OECD structure request.
+
+        Args:
+            references: Related artefacts to embed (default: ``"all"``).
+            detail: Level of detail (default: ``"referencepartial"``).
+            format: Ignored — OECD uses the ``Accept`` header.
+            format_version: Ignored.
+            compress: Ignored.
+
+        Returns:
+            Query-parameter dictionary.
+        """
+        params: Dict[str, str] = {}
+        if references is not None:
+            params["references"] = references
+        if detail is not None:
+            params["detail"] = detail
+        return params
+
+    @staticmethod
+    def get_accept_header(
+        format: OECDResponseFormat,
+        version: SDMXVersion,
+    ) -> str:
+        """Get appropriate Accept header for a data query format and SDMX version.
+
+        Args:
+            format: Desired response format.
+            version: SDMX API version.
+
+        Returns:
+            ``Accept`` header value string.
+        """
+        if format == OECDResponseFormat.JSON:
+            if version == SDMXVersion.V2:
+                return "application/vnd.sdmx.data+json; charset=utf-8; version=2"
+            return "application/vnd.sdmx.data+json; charset=utf-8; version=1.0"
+        elif format in (OECDResponseFormat.CSV, OECDResponseFormat.CSV_LABELS):
+            if version == SDMXVersion.V2:
+                return "application/vnd.sdmx.data+csv; charset=utf-8; version=2"
+            return "application/vnd.sdmx.data+csv; charset=utf-8"
+        elif format == OECDResponseFormat.XML:
+            return "application/vnd.sdmx.structurespecificdata+xml; charset=utf-8; version=2.1"
+        return "application/json"
+
+    @staticmethod
+    def get_structure_accept_header(version: SDMXVersion) -> str:
+        """Get the Accept header for an OECD structure JSON query.
+
+        Args:
+            version: SDMX API version.
+
+        Returns:
+            ``Accept`` header value string for the structure endpoint.
+        """
+        # Format SDMX-JSON de structure : seule la version 1.0 est proposée par
+        # l'OCDE (cf. liste des types acceptés renvoyée dans les réponses 406),
+        # indépendamment de la version v1/v2 de l'API REST (qui ne concerne que
+        # le chemin d'URL). Demander version=2 provoque une erreur 406.
+        return "application/vnd.sdmx.structure+json; charset=utf-8; version=1.0"
+
+    # ── Méthodes spécifiques à la version, à implémenter par les sous-classes ──
+
+    @staticmethod
+    def build_dimension_filter(
+        dimensions: Dict[int, List[str]],
+        num_dimensions: Optional[int] = None,
+    ) -> str:
+        """Build the positional dimension key string for the data URL.
+
+        Implemented by version-specific subclasses.
+
+        Args:
+            dimensions: Dimension position → list of values.
+            num_dimensions: Total dimension count (for wildcard padding).
+
+        Returns:
+            Dimension filter string (e.g., ``"FRA.M.LI"``).
+        """
+        raise NotImplementedError
+
+
+# Builder concret pour l'API OCDE SDMX v1 (legacy REST)
+class OECDEndpointBuilderV1(OECDEndpointBuilder):
+    """Endpoint builder for the OECD SDMX v1 API (legacy REST format).
+
+    URL patterns:
+        data: ``/data/{agency},{dataflow},{version}/{key}``
+        structure: ``/dataflow/{agency}/{dataflow}/{version}``
+
+    The positional dimension key supports comma-separated multi-values
+    inside a dimension (``"FRA,DEU.M.LI"``).
+    """
+
+    sdmx_version = SDMXVersion.V1
+
+    def build_data_endpoint(
+        self,
+        dataflow: str,
+        agency: str,
+        version: str,
+        key: Optional[str] = None,
+    ) -> str:
+        """Build the URL path for a data query.
+
+        Args:
+            dataflow: Dataflow identifier.
+            agency: Agency identifier.
+            version: Dataflow version.
+            key: Pre-built positional dimension filter, or ``None`` for the
+                ``"all"`` wildcard.
+
+        Returns:
+            URL path segment.
+        """
+        dim_filter = key or "all"
+        return f"data/{agency},{dataflow},{version}/{dim_filter}"
+
+    def build_data_params(
+        self,
+        *,
+        start_period: Optional[str] = None,
+        end_period: Optional[str] = None,
+        last_n_observations: Optional[int] = None,
+        first_n_observations: Optional[int] = None,
+        compress: bool = False,
+        dimensions: Optional[Dict[str, List[str]]] = None,
+        response_format: Optional[OECDResponseFormat] = None,
+        response_format_version: Optional[str] = None,
+        lang: Optional[str] = None,
+        labels: Optional[str] = None,
+        attributes: Optional[str] = None,
+        measures: Optional[str] = None,
+        return_data: Optional[str] = None,
+        dimension_at_observation: Optional[str] = None,
+        detail: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build query parameters for an OECD v1 data request.
+
+        Recognised parameters: ``start_period``, ``end_period``,
+        ``last_n_observations``, ``response_format``,
+        ``dimension_at_observation``. Other arguments are accepted for
+        interface compatibility and silently ignored.
+
+        Returns:
+            Query-parameter dictionary.
+        """
+        fmt = response_format or OECDResponseFormat.CSV_LABELS
+        params: Dict[str, Any] = {
+            "dimensionAtObservation": (
+                dimension_at_observation
+                or DimensionAtObservation.ALL_DIMENSIONS.value
+            ),
+            "format": _OECD_FORMAT_PARAM_MAP[fmt],
+        }
+        if start_period:
+            params["startPeriod"] = start_period
+        if end_period:
+            params["endPeriod"] = end_period
+        if last_n_observations:
+            params["lastNObservations"] = last_n_observations
+        return params
+
+    def build_structure_endpoint(
+        self,
+        resource_type: Any,
+        resource_id: str,
+        agency: str,
+        version: Optional[str],
+    ) -> str:
+        """Build the URL path for a structure query.
+
+        Args:
+            resource_type: Ignored — OECD v1 structure queries use a fixed
+                ``dataflow`` path format.
+            resource_id: Dataflow identifier.
+            agency: Agency identifier.
+            version: Dataflow version (defaults to ``"+"``).
+
+        Returns:
+            URL path segment.
+        """
+        v = version or "+"
+        return f"dataflow/{agency}/{resource_id}/{v}"
+
+    @staticmethod
+    def build_dimension_filter(
+        dimensions: Dict[int, List[str]],
+        num_dimensions: Optional[int] = None,
+    ) -> str:
+        """Build the positional dimension filter string for SDMX v1.
+
+        Format: ``value1,value2.value3.value4`` (comma-separated multi-values
+        within a dimension, dot-separated dimensions).
+
+        Args:
+            dimensions: Dimension position → list of values.
+            num_dimensions: Total dimension count (for wildcard padding).
+
+        Returns:
+            Dimension filter string.
+        """
+        if not dimensions:
+            if num_dimensions:
+                return ".".join([""] * num_dimensions)
+            return "all"
+        max_dim = max(dimensions.keys())
+        total_dims = num_dimensions if num_dimensions else max_dim + 1
+        parts = [",".join(dimensions[i]) if i in dimensions else "" for i in range(total_dims)]
+        return ".".join(parts)
+
+
+# Builder concret pour l'API OCDE SDMX v2 (current REST)
+class OECDEndpointBuilderV2(OECDEndpointBuilder):
+    """Endpoint builder for the OECD SDMX v2 API (current REST format).
+
+    URL patterns:
+        data: ``/v2/data/dataflow/{agency}/{dataflow}/{version}/{key}``
+        structure: ``/v2/structure/dataflow/{agency}/{dataflow}/{version}``
+
+    SDMX v2 does not support comma-separated multi-values in the positional
+    key. Use the ``split_dimensions`` parameter of
+    :meth:`OECDClient.get_data` to iterate on multi-value dimensions.
+    """
+
+    sdmx_version = SDMXVersion.V2
+
+    def build_data_endpoint(
+        self,
+        dataflow: str,
+        agency: str,
+        version: str,
+        key: Optional[str] = None,
+    ) -> str:
+        """Build the URL path for a data query.
+
+        Args:
+            dataflow: Dataflow identifier.
+            agency: Agency identifier.
+            version: Dataflow version.
+            key: Pre-built positional dimension filter, or ``None`` for the
+                ``"*"`` wildcard.
+
+        Returns:
+            URL path segment.
+        """
+        dim_filter = key or "*"
+        return f"v2/data/dataflow/{agency}/{dataflow}/{version}/{dim_filter}"
+
+    def build_data_params(
+        self,
+        *,
+        start_period: Optional[str] = None,
+        end_period: Optional[str] = None,
+        last_n_observations: Optional[int] = None,
+        first_n_observations: Optional[int] = None,
+        compress: bool = False,
+        dimensions: Optional[Dict[str, List[str]]] = None,
+        response_format: Optional[OECDResponseFormat] = None,
+        response_format_version: Optional[str] = None,
+        lang: Optional[str] = None,
+        labels: Optional[str] = None,
+        attributes: Optional[str] = None,
+        measures: Optional[str] = None,
+        return_data: Optional[str] = None,
+        dimension_at_observation: Optional[str] = None,
+        detail: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build query parameters for an OECD v2 data request.
+
+        v2 encodes the time-period filter via ``c[TIME_PERIOD]=ge:…+le:…``
+        rather than ``startPeriod``/``endPeriod``, and additionally supports
+        ``attributes`` and ``measures`` query parameters.
+
+        Returns:
+            Query-parameter dictionary.
+        """
+        fmt = response_format or OECDResponseFormat.CSV_LABELS
+        params: Dict[str, Any] = {
+            "dimensionAtObservation": (
+                dimension_at_observation
+                or DimensionAtObservation.ALL_DIMENSIONS.value
+            ),
+            "format": _OECD_FORMAT_PARAM_MAP[fmt],
+        }
+        # Filtre temporel encodé dans c[TIME_PERIOD]
+        if start_period and end_period:
+            params["c[TIME_PERIOD]"] = f"ge:{start_period}+le:{end_period}"
+        elif start_period:
+            params["c[TIME_PERIOD]"] = f"ge:{start_period}"
+        elif end_period:
+            params["c[TIME_PERIOD]"] = f"le:{end_period}"
+        if attributes:
+            params["attributes"] = attributes
+        if measures:
+            params["measures"] = measures
+        if last_n_observations:
+            params["lastNObservations"] = last_n_observations
+        return params
+
+    def build_structure_endpoint(
+        self,
+        resource_type: Any,
+        resource_id: str,
+        agency: str,
+        version: Optional[str],
+    ) -> str:
+        """Build the URL path for a structure query.
+
+        Args:
+            resource_type: Ignored — OECD v2 structure queries use a fixed
+                ``dataflow`` path format.
+            resource_id: Dataflow identifier.
+            agency: Agency identifier.
+            version: Dataflow version (defaults to ``"+"``).
+
+        Returns:
+            URL path segment.
+        """
+        v = version or "+"
+        return f"v2/structure/dataflow/{agency}/{resource_id}/{v}"
+
+    @staticmethod
+    def build_dimension_filter(
+        dimensions: Dict[int, List[str]],
+        num_dimensions: Optional[int] = None,
+    ) -> str:
+        """Build the positional dimension filter string for SDMX v2.
+
+        Each dimension must carry exactly one value or be a wildcard
+        (``"*"``).
+
+        Args:
+            dimensions: Dimension position → list of values (each list must
+                contain exactly one element).
+            num_dimensions: Total dimension count (for wildcard padding).
+
+        Returns:
+            Dimension filter string.
+
+        Raises:
+            ValueError: If any dimension has more than one value.
+        """
+        if not dimensions:
+            if num_dimensions:
+                return ".".join(["*"] * num_dimensions)
+            return "*"
+        for position, values in dimensions.items():
+            if len(values) > 1:
+                raise ValueError(
+                    f"SDMX v2 does not support multiple values for a single dimension. "
+                    f"Dimension at position {position} has {len(values)} values: {values}. "
+                    f"Use split_dimensions parameter in get_data() to handle multiple values."
+                )
+        max_dim = max(dimensions.keys())
+        total_dims = num_dimensions if num_dimensions else max_dim + 1
+        parts = [dimensions[i][0] if i in dimensions else "*" for i in range(total_dims)]
+        return ".".join(parts)
+
+
+# Registre des builders par version d'API (à l'image du registre Eurostat)
+_OECD_ENDPOINT_BUILDERS: Dict[SDMXVersion, OECDEndpointBuilder] = {
+    SDMXVersion.V1: OECDEndpointBuilderV1(),
+    SDMXVersion.V2: OECDEndpointBuilderV2(),
+}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Dataclass de requête publique
+# ──────────────────────────────────────────────────────────────────────
 
 
 # Classe représentant une requête de données
@@ -82,7 +626,7 @@ class OECDQueryRequest:
     start_period: Optional[str] = None
     end_period: Optional[str] = None
     last_n_observations: Optional[int] = None
-    format: ResponseFormat = ResponseFormat.CSV_LABELS
+    format: OECDResponseFormat = OECDResponseFormat.CSV_LABELS
     dimension_at_observation: DimensionAtObservation = DimensionAtObservation.ALL_DIMENSIONS
     attributes: Optional[str] = None
     measures: Optional[str] = None
@@ -125,7 +669,7 @@ class OECDQueryRequest:
 
 
 # Initialisation du client pour la requête de données
-class OECDClient:
+class OECDClient(AbstractSDMXClient):
     """High-level client for OECD data API.
     
     This client handles data retrieval from OECD's SDMX API and provides
@@ -161,22 +705,21 @@ class OECDClient:
         rate_limiter: Optional[RateLimiter] = None,
         auto_load_rate_limit: bool = True,
     ):
-        # Initialisation des attributs
+        # Initialisation de la base (structure_registry, auto_fetch_structure,
+        # rate_limiter via _load_rate_limiter)
+        super().__init__(
+            structure_registry=structure_registry,
+            auto_fetch_structure=auto_fetch_structure,
+            rate_limiter=rate_limiter,
+            auto_load_rate_limit=auto_load_rate_limit,
+        )
+
+        # Attributs spécifiques OECD
         self.base_url = base_url
         self.sdmx_version = sdmx_version
-        self.auto_fetch_structure = auto_fetch_structure
         self.api_client = APIClient(base_url=base_url, timeout=timeout)
-        self.url_builder = SDMXURLBuilder()
-
-        # Registre des structures de dataflows
-        self.structure_registry = structure_registry or DataflowStructureRegistry()
-
-        # Chargement automatique du rate limiter si demandé
-        if auto_load_rate_limit and rate_limiter is None:
-            rate_limiter = self._load_rate_limiter()
-
-        # Rate limiter pour respecter les limites API
-        self.rate_limiter = rate_limiter
+        # Sélection du builder versionné depuis le registre
+        self.endpoint_builder: OECDEndpointBuilder = _OECD_ENDPOINT_BUILDERS[sdmx_version]
 
     # Méthode auxiliaire de chargement du rate limiter depuis le fichier de configuration
     def _load_rate_limiter(self) -> Optional[RateLimiter]:
@@ -220,7 +763,7 @@ class OECDClient:
         start_period: Optional[str] = None,
         end_period: Optional[str] = None,
         last_n_observations: Optional[int] = None,
-        format: ResponseFormat = ResponseFormat.CSV_LABELS,
+        format: OECDResponseFormat = OECDResponseFormat.CSV_LABELS,
         dimension_at_observation: DimensionAtObservation = DimensionAtObservation.ALL_DIMENSIONS,
         attributes: Optional[str] = None,
         measures: Optional[str] = None,
@@ -291,16 +834,9 @@ class OECDClient:
         if dataflow is None:
             raise ValueError("dataflow is required")
 
-        # Application du rate limiter si configuré
-        if self.rate_limiter:
-            self.rate_limiter.acquire()
-
         # Récupération de la structure du dataflow si nécessaire
         structure = self._ensure_structure(agency=agency, dataflow=dataflow)
-        
-        # Détermination du nombre de dimensions
-        num_dimensions = structure.num_dimensions if structure else None
-        
+
         # Normalisation des dimensions au format Dict[int, List[str]]
         normalized_dims = self._normalize_dimensions(
             dimensions=dimensions,
@@ -314,102 +850,42 @@ class OECDClient:
             split_dimensions, structure, normalized_dims
         )
 
-        # Génération des combinaisons de requêtes
+        # Génération des combinaisons (dims_for_url, dims_for_postfilter)
         request_combinations = self._generate_request_combinations(
             normalized_dims, split_dimension_names, structure, max_split_combinations
         )
 
-        # Headers appropriés pour le format
-        headers = {
-            "Accept": self.url_builder.get_accept_header(format, self.sdmx_version),
-            "Accept-Encoding": "gzip, deflate",
-        }
+        # Délégation à AbstractSDMXClient._execute_split_requests qui gère
+        # uniformément le cas mono-requête et multi-requêtes (rate limiting,
+        # post-filtrage, concaténation).
+        logger.info(
+            f"Fetching data from {dataflow} ({len(request_combinations)} request(s))"
+        )
+        df = self._execute_split_requests(
+            request_combinations,
+            agency=agency,
+            dataflow=dataflow,
+            version=version,
+            structure=structure,
+            format=format,
+            dimension_at_observation=dimension_at_observation,
+            start_period=start_period,
+            end_period=end_period,
+            last_n_observations=last_n_observations,
+            attributes=attributes,
+            measures=measures,
+        )
 
-        # Branchement selon le nombre de combinaisons
-        if len(request_combinations) == 1:
-            # Une seule requête (comportement par défaut ou toutes dims single-value)
-            dims_for_url, dims_for_postfilter = request_combinations[0]
-
-            # Construction de la requête
-            query = SDMXDataQuery(
-                agency=agency,
-                dataflow=dataflow,
-                version=version,
-                dimensions=dims_for_url,
-                start_period=start_period,
-                end_period=end_period,
-                last_n_observations=last_n_observations,
-                format=format,
-                sdmx_version=self.sdmx_version,
-                dimension_at_observation=dimension_at_observation,
-                num_dimensions=num_dimensions,
-                attributes=attributes,
-                measures=measures,
+        # Vérification des doublons sur le résultat final (déjà post-filtré)
+        if on_duplicate != "ignore":
+            self._check_duplicates(
+                df,
+                normalized_dims,
+                structure,
+                on_duplicate,
             )
 
-            # Construction de l'URL et des paramètres
-            endpoint, params = self.url_builder.build_data_url(query)
-
-            # Logging
-            logger.info(f"Fetching data from {dataflow}")
-            logger.debug(f"Endpoint: {endpoint}")
-            logger.debug(f"Parameters: {params}")
-
-            # Exécution de la requête
-            response = self.api_client.get(endpoint, params=params, headers=headers)
-
-            # Parsing de la réponse
-            if format == ResponseFormat.JSON:
-                df = self._parse_json_response(response.json())
-            elif format in (ResponseFormat.CSV, ResponseFormat.CSV_LABELS):
-                df = self._parse_csv_response(response.text)
-            else:
-                raise NotImplementedError(f"Format {format} not yet implemented")
-
-            # IMPORTANT: Filtre AVANT check_duplicates
-            if dims_for_postfilter:
-                df = self._filter_dataframe_by_dimensions(df, dims_for_postfilter)
-
-            # Vérification des doublons (sur df filtré)
-            if on_duplicate != "ignore":
-                # Détermination des dimensions avec wildcards pour la vérification des doublons
-                wildcard_positions = self._get_wildcard_positions(
-                    dims_for_url,
-                    num_dimensions,
-                )
-                if wildcard_positions:
-                    self._check_duplicates(
-                        df,
-                        normalized_dims,
-                        structure,
-                        on_duplicate,
-                    )
-
-            return df
-
-        else:
-            # Requêtes multiples
-            logger.info(f"Fetching data from {dataflow} using {len(request_combinations)} split requests")
-            df = self._execute_split_requests(
-                request_combinations,
-                agency, dataflow, version, structure,
-                start_period, end_period, last_n_observations,
-                format, dimension_at_observation, attributes, measures,
-                headers
-            )
-            # Note: _execute_split_requests applique déjà _filter_dataframe_by_dimensions
-            # sur chaque réponse individuelle avant concaténation
-
-            # Vérification des doublons sur résultat final (déjà filtré)
-            if on_duplicate != "ignore":
-                self._check_duplicates(
-                    df,
-                    normalized_dims,
-                    structure,
-                    on_duplicate,
-                )
-
-            return df
+        return df
 
     # Méthode d'exécution d'une requête QueryRequest
     def execute_query(self, query: OECDQueryRequest) -> pd.DataFrame:
@@ -431,43 +907,6 @@ class OECDClient:
         """
         return self.get_data(**query.to_dict())
 
-    # Méthode auxiliaire de vérification de la disponibilité des méta-données pour le dataflow
-    def _ensure_structure(
-        self,
-        agency: str,
-        dataflow: str,
-    ) -> Optional[DataflowStructure]:
-        """Ensure structure metadata is available for the dataflow.
-        
-        Args:
-            agency: Agency identifier.
-            dataflow: Dataflow identifier.
-            
-        Returns:
-            DataflowStructure or None if not available.
-        """
-        # Vérification si la structure est déjà enregistrée
-        if self.structure_registry.has(agency, dataflow):
-            return self.structure_registry.get(agency, dataflow)
-        
-        # Récupération automatique si activée
-        if self.auto_fetch_structure:
-            try:
-                # Logging
-                logger.info(f"Fetching structure for {agency}::{dataflow}")
-                # Récupération de la structure par appel API
-                structure = self.get_structure(agency, dataflow)
-                # Enregistrement de la structure
-                self.structure_registry.register(structure)
-                return structure
-            except Exception as e:
-                # Logging
-                logger.warning(
-                    f"Failed to fetch structure for {agency}::{dataflow}: {e}"
-                )
-        
-        return None
-    
     # Méthode auxiliaire de normalisation des dimensions du filtre sous la forme d'un dictionnaire position : valeur
     def _normalize_dimensions(
         self,
@@ -620,7 +1059,7 @@ class OECDClient:
         self,
         dimensions: Dict[int, List[str]],
         split_dimension_names: List[str],
-        structure: DataflowStructure,
+        structure: Optional[DataflowStructure],
         max_combinations: int = 100,
     ) -> List[Tuple[Dict[int, List[str]], Dict[str, List[str]]]]:
         """Generate request combinations and post-filter dimensions.
@@ -639,11 +1078,13 @@ class OECDClient:
         Raises:
             ValueError: If cartesian product exceeds max_combinations
         """
-        # Conversion des noms en positions
-        split_positions = [
-            structure.get_position(name)
-            for name in split_dimension_names
-        ]
+        # Conversion des noms en positions (structure garantie non-None si
+        # split_dimension_names est non vide grâce à _normalize_split_dimensions)
+        split_positions = (
+            [structure.get_position(name) for name in split_dimension_names]
+            if structure is not None
+            else []
+        )
 
         # Identification des dimensions à split (valeurs multiples et dans split_positions)
         split_dims: Dict[int, List[str]] = {}
@@ -664,12 +1105,14 @@ class OECDClient:
             for pos in postfilter_dims.keys():
                 dims_for_url[pos] = ["*"]
 
-            # Convertir postfilter_dims en noms
+            # Convertir postfilter_dims en noms (skip si pas de structure :
+            # le post-filtrage par nom de colonne n'est alors pas possible)
             postfilter_dims_by_name: Dict[str, List[str]] = {}
-            for pos, values in postfilter_dims.items():
-                dim_name = structure.get_name(pos)
-                if dim_name:
-                    postfilter_dims_by_name[dim_name] = values
+            if structure is not None:
+                for pos, values in postfilter_dims.items():
+                    dim_name = structure.get_name(pos)
+                    if dim_name:
+                        postfilter_dims_by_name[dim_name] = values
 
             return [(dims_for_url, postfilter_dims_by_name)]
 
@@ -726,293 +1169,6 @@ class OECDClient:
 
         return combinations
 
-    # Méthode auxiliaire d'extraction des dimensions qui ne sont pas explicitement filtrées
-    def _get_wildcard_positions(
-        self,
-        dimensions: Dict[int, List[str]],
-        num_dimensions: Optional[int],
-    ) -> List[int]:
-        """Get positions that will use wildcards (not explicitly filtered).
-        
-        Args:
-            dimensions: Normalized dimension filters.
-            num_dimensions: Total number of dimensions.
-            
-        Returns:
-            List of positions that are not explicitly filtered.
-        """
-        # Cas où les dimensions ne sont pas spécifiées
-        if num_dimensions is None:
-            return []
-        # Extraction des positions filtrées
-        filtered_positions = set(dimensions.keys())
-        # Retourne le complémentaire de ces dimensions
-        return [i for i in range(num_dimensions) if i not in filtered_positions]
-
-    # Méthode auxiliaire de filtrage du DataFrame selon des valeurs de dimensions
-    def _filter_dataframe_by_dimensions(
-        self,
-        df: pd.DataFrame,
-        dimension_filters: Dict[str, List[str]],
-    ) -> pd.DataFrame:
-        """Filter DataFrame by dimension values after retrieval.
-
-        Args:
-            df: DataFrame to filter
-            dimension_filters: Dict mapping dimension NAME to list of allowed values
-
-        Returns:
-            Filtered DataFrame
-        """
-        # Cas où le DataFrame est vide
-        if df.empty:
-            return df
-
-        # Cas où il n'y a pas de filtres
-        if not dimension_filters:
-            return df
-
-        # Initialisation du masque (toutes les lignes acceptées)
-        mask = pd.Series([True] * len(df), index=df.index)
-
-        # Parcours des dimensions à filtrer
-        for dim_name, allowed_values in dimension_filters.items():
-            # Vérification que la colonne existe
-            if dim_name not in df.columns:
-                logger.warning(
-                    f"Dimension column '{dim_name}' not found in DataFrame. "
-                    f"Available columns: {list(df.columns)}. Skipping this filter."
-                )
-                continue
-
-            # Application du filtre
-            mask &= df[dim_name].isin(allowed_values)
-
-        # Application du masque
-        filtered_df = df[mask]
-
-        # Logging si des lignes ont été filtrées
-        if len(filtered_df) < len(df):
-            logger.info(
-                f"Filtered {len(df) - len(filtered_df)} rows by dimensions "
-                f"{list(dimension_filters.keys())}"
-            )
-
-        return filtered_df
-
-    # Méthode auxiliaire d'exécution de requêtes multiples
-    def _execute_split_requests(
-        self,
-        request_combinations: List[Tuple[Dict[int, List[str]], Dict[str, List[str]]]],
-        agency: str,
-        dataflow: str,
-        version: str,
-        structure: Optional[DataflowStructure],
-        start_period: Optional[str],
-        end_period: Optional[str],
-        last_n_observations: Optional[int],
-        format: ResponseFormat,
-        dimension_at_observation: DimensionAtObservation,
-        attributes: Optional[str],
-        measures: Optional[str],
-        headers: Dict[str, str],
-    ) -> pd.DataFrame:
-        """Execute multiple API requests and concatenate results.
-
-        Args:
-            request_combinations: List of (dims_for_url, dims_for_postfilter) tuples
-                - dims_for_url: Dict[int, List[str]] for URL construction
-                - dims_for_postfilter: Dict[str, List[str]] dimension names → values
-            agency: Agency identifier
-            dataflow: Dataflow identifier
-            version: Dataflow version
-            structure: Dataflow structure
-            start_period: Start period
-            end_period: End period
-            last_n_observations: Number of recent observations
-            format: Response format
-            dimension_at_observation: How to group observations
-            attributes: Attributes to include
-            measures: Measures to include
-            headers: HTTP headers
-
-        Returns:
-            Concatenated DataFrame from all requests
-
-        Raises:
-            ValueError: If all requests failed or returned empty results
-        """
-        # Initialisation de la liste des DataFrames
-        all_dataframes: List[pd.DataFrame] = []
-        errors: List[str] = []
-
-        # Logging
-        logger.info(f"Executing {len(request_combinations)} API requests")
-
-        # Extraction du nombre de dimensions (pour la requête)
-        num_dimensions = structure.num_dimensions if structure else None
-
-        # Parcours des combinaisons
-        for i, (dims_url, dims_postfilter) in enumerate(request_combinations):
-            # Application du rate limiter
-            if self.rate_limiter:
-                self.rate_limiter.acquire()
-
-            # Construction de la requête
-            query = SDMXDataQuery(
-                agency=agency,
-                dataflow=dataflow,
-                version=version,
-                dimensions=dims_url,
-                start_period=start_period,
-                end_period=end_period,
-                last_n_observations=last_n_observations,
-                format=format,
-                sdmx_version=self.sdmx_version,
-                dimension_at_observation=dimension_at_observation,
-                num_dimensions=num_dimensions,
-                attributes=attributes,
-                measures=measures,
-            )
-
-            # Construction de l'URL
-            endpoint, params = self.url_builder.build_data_url(query)
-
-            # Logging progress tous les 10 requêtes
-            if (i + 1) % 10 == 0 or i == 0 or i == len(request_combinations) - 1:
-                logger.info(f"Processing request {i+1}/{len(request_combinations)}")
-                logger.debug(f"Endpoint: {endpoint}")
-
-            # Exécution de la requête avec gestion d'erreur
-            try:
-                # Exécution
-                response = self.api_client.get(endpoint, params=params, headers=headers)
-
-                # Parsing de la réponse
-                if format == ResponseFormat.JSON:
-                    df = self._parse_json_response(response.json())
-                elif format in (ResponseFormat.CSV, ResponseFormat.CSV_LABELS):
-                    df = self._parse_csv_response(response.text)
-                else:
-                    raise NotImplementedError(f"Format {format} not yet implemented")
-
-                # Vérification que le DataFrame n'est pas vide
-                if not df.empty:
-                    # Application du post-filtre si nécessaire
-                    if dims_postfilter:
-                        df = self._filter_dataframe_by_dimensions(df, dims_postfilter)
-
-                    # Ajout à la liste si toujours non vide après filtrage
-                    if not df.empty:
-                        all_dataframes.append(df)
-                    else:
-                        logger.debug(f"Request {i+1} returned empty after filtering")
-                else:
-                    logger.debug(f"Request {i+1} returned empty DataFrame")
-
-            except Exception as e:
-                # Logging de l'erreur avec contexte
-                dim_values_str = ", ".join(
-                    f"{pos}={values[0] if len(values) == 1 else values}"
-                    for pos, values in sorted(dims_url.items())
-                )
-                error_msg = f"Request {i+1} failed for dimensions [{dim_values_str}]: {str(e)}"
-                logger.error(error_msg)
-                errors.append(error_msg)
-                continue
-
-        # Vérification qu'au moins une requête a réussi
-        if not all_dataframes:
-            error_summary = "\n".join(errors) if errors else "All requests returned empty results"
-            raise ValueError(
-                f"All {len(request_combinations)} requests failed or returned empty results.\n"
-                f"Errors encountered:\n{error_summary}"
-            )
-
-        # Logging des résultats
-        if errors:
-            logger.warning(
-                f"{len(errors)} out of {len(request_combinations)} requests failed. "
-                f"Successfully retrieved {len(all_dataframes)} DataFrames."
-            )
-
-        # Concaténation des DataFrames
-        logger.info(f"Concatenating {len(all_dataframes)} DataFrames")
-        result = pd.concat(all_dataframes, ignore_index=True)
-
-        logger.info(f"Final result: {len(result)} rows")
-
-        return result
-
-    # Méthode auxiliaire de vérification des éventuels duplicats induits par les dimensions non filtrées
-    def _check_duplicates(
-        self,
-        df: pd.DataFrame,
-        dimensions: Dict[int, List[str]],
-        structure: Optional[DataflowStructure],
-        on_duplicate: DuplicateHandling,
-    ) -> None:
-        """Check for duplicate rows based on filtered dimensions.
-        
-        Args:
-            df: DataFrame to check.
-            dimensions: Dimension filters used in the query.
-            structure: Dataflow structure for column name mapping.
-            on_duplicate: How to handle duplicates ("warn" or "raise").
-            
-        Raises:
-            DuplicateRowsError: If on_duplicate="raise" and duplicates found.
-        """
-        # Vérification liminaire que le DataFrame est non vide
-        if df.empty:
-            return
-        
-        # Détermination des colonnes à utiliser pour la vérification
-        check_columns = []
-        
-        # Récupération des noms des dimensions filtrées
-        for position in dimensions.keys():
-            if structure:
-                # Extraction du nom associé à la position
-                dim_name = structure.get_name(position)
-                # Ajout de la dimension de filtre si elle est bien comprise 
-                if dim_name and dim_name in df.columns:
-                    check_columns.append(dim_name)
-        
-        # Ajout de 'TIME_PERIOD' si présent
-        if "TIME_PERIOD" in df.columns:
-            check_columns.append("TIME_PERIOD")
-        
-        # Si aucune colonne identifiée, utilisation de toutes les colonnes sauf 'value'
-        if not check_columns:
-            check_columns = [
-                col for col in df.columns
-                if col.lower() not in ("value", "obs_value", "obsvalue")
-            ]
-        
-        # Vérification des doublons
-        duplicates = df.duplicated(subset=check_columns, keep=False)
-        num_duplicates = duplicates.sum()
-        
-        # Renvoi d'un message si des duplicats sont identifiés
-        if num_duplicates > 0:
-            # Construction du message
-            dup_df = df[duplicates].head(10)
-            message = (
-                f"Found {num_duplicates} duplicate rows for columns {check_columns}. "
-                f"This may indicate that undesired values are included via wildcards (*). "
-                f"Examples:\n{dup_df.to_string()}"
-            )
-            # Cas d'erreur
-            if on_duplicate == "raise":
-                raise ValueError(message)
-            # Warning
-            else:
-                # Warning
-                warnings.warn(message, UserWarning)
-                # Logging
-                logger.warning(message)
-    
     # Méthode auxiliaire de parsing d'une réponse au format json
     def _parse_json_response(self, data: Dict[str, Any]) -> pd.DataFrame:
         """Parse SDMX-JSON response to DataFrame.
@@ -1080,28 +1236,6 @@ class OECDClient:
             logger.debug(f"Response structure: {json.dumps(data, indent=2)[:1000]}")
             raise
     
-    # Méthode auxiliaire de parsing d'une réponse au format csv
-    def _parse_csv_response(self, text: str) -> pd.DataFrame:
-        """Parse SDMX-CSV response to DataFrame.
-        
-        Args:
-            text: CSV text from OECD API
-            
-        Returns:
-            DataFrame with parsed data
-        """
-        try:
-            # Lecture du jeu de données
-            df = pd.read_csv(StringIO(text))
-            # Logging
-            logger.info(f"Parsed {len(df)} rows from CSV")
-            return df
-            
-        except Exception as e:
-            # Logging
-            logger.error(f"Failed to parse CSV response: {e}")
-            raise
-    
     # Méthode d'extraction de la structure des métadonnées associées à un flux
     # /!\ Voir si ne pourrait pas être mis en commun dans le cas de plusieurs sources de données (par exemple en utilisant eurostat)
     def get_structure(
@@ -1126,18 +1260,20 @@ class OECDClient:
         # Vérification que le flux de données est spécifié
         if dataflow is None:
             raise ValueError("dataflow is required")
-        
-        # Construction de l'url et des paramètres de requête
-        endpoint, params = self.url_builder.build_structure_url(
+
+        # Construction de l'URL et des paramètres de structure via le builder versionné
+        endpoint = self.endpoint_builder.build_structure_endpoint(
+            resource_type=None,
+            resource_id=dataflow,
             agency=agency,
-            dataflow=dataflow,
             version=version,
-            sdmx_version=self.sdmx_version,
         )
-        
-        # Construction des headers de requête
+        params = self.endpoint_builder.build_structure_params()
+
+        # Construction des headers de requête (Accept dynamique selon la version)
+        # /!\
         headers = {
-            "Accept": "application/vnd.sdmx.structure+json; charset=utf-8; version=3.0",
+            "Accept": self.endpoint_builder.get_structure_accept_header(self.sdmx_version),
         }
         
         # Exécution de la requête
@@ -1238,22 +1374,15 @@ class OECDClient:
             logger.error(f"Error parsing structure: {e}")
             raise ValueError(f"Unable to parse structure: {e}")
     
-    # Méthode d'enregistrement de la structure d'un dataflow
-    def register_structure(self, structure: DataflowStructure) -> None:
-        """Register a dataflow structure for dimension name resolution.
-        
-        Args:
-            structure: DataflowStructure to register.
-        """
-        self.structure_registry.register(structure)
-    
     # Méthode de listing de tous les dataflows disponibles
     # /!\ Voir si ne pourrait pas être mis en commun dans le cas de plusieurs sources de données (par exemple en utilisant eurostat)
     def list_all_dataflows(self) -> pd.DataFrame:
         """List all available OECD dataflows.
 
         Retrieves the complete list of dataflows from OECD SDMX API
-        and parses them into a pandas DataFrame.
+        and parses them into a pandas DataFrame. The API always returns
+        JSON regardless of the Accept header, using a SDMX v2 structure
+        format where dataflows are keyed by URN in a ``references`` dict.
 
         Returns:
             DataFrame with columns: dataflow, agency, version, name
@@ -1266,8 +1395,8 @@ class OECDClient:
         # Endpoint pour lister tous les dataflows
         endpoint = "dataflow/all"
 
-        # Headers pour XML
-        headers = {"Accept": "application/xml"}
+        # Headers
+        headers = None
 
         # Application du rate limiter si configuré
         if self.rate_limiter:
@@ -1278,7 +1407,7 @@ class OECDClient:
 
         # Exécution de la requête
         response = self.api_client.get(endpoint, headers=headers)
-
+        
         # Parsing XML
         root = ET.fromstring(response.content)
 
@@ -1316,6 +1445,70 @@ class OECDClient:
         logger.info(f"Found {len(df_result)} dataflows")
 
         return df_result
+
+    # Méthode auxiliaire de parsing de la réponse JSON des dataflows
+    def _parse_dataflows_json(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Parse OECD JSON structure response to extract dataflow list.
+
+        Handles two response shapes:
+        - SDMX v2 with ``references`` dict keyed by URN
+          (``urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow=AGENCY:ID(VERSION)``)
+        - SDMX v1/v2 with ``data.dataflows`` list
+
+        Args:
+            data: Parsed JSON response from the OECD structure endpoint.
+
+        Returns:
+            List of dicts with keys ``dataflow``, ``agency``, ``version``, ``name``.
+        """
+        dataflows: List[Dict[str, Any]] = []
+
+        # Format SDMX v2 : clés URN dans "references"
+        if "references" in data and isinstance(data["references"], dict):
+            for urn, obj in data["references"].items():
+                # Filtrage des entrées qui ne sont pas des Dataflow
+                if "Dataflow=" not in urn:
+                    continue
+
+                # Extraction agency, id et version depuis l'URN
+                # Format : urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow=AGENCY:ID(VERSION)
+                try:
+                    after_eq = urn.split("Dataflow=", 1)[1]
+                    agency, rest = after_eq.split(":", 1)
+                    dataflow_id = rest.split("(")[0]
+                    version = rest.split("(")[1].rstrip(")") if "(" in rest else None
+                except (IndexError, ValueError):
+                    logger.debug(f"Could not parse URN: {urn}")
+                    continue
+
+                # Extraction du nom depuis l'objet référencé
+                name = None
+                if isinstance(obj, dict):
+                    name = (
+                        obj.get("name")
+                        or obj.get("names", {}).get("en")
+                        or obj.get("label")
+                    )
+
+                dataflows.append({
+                    "dataflow": dataflow_id,
+                    "agency": agency,
+                    "version": version,
+                    "name": name,
+                })
+            return dataflows
+
+        # Format SDMX v1/v2 avec data.dataflows
+        nested = data.get("data", data)
+        for df_obj in nested.get("dataflows", []):
+            dataflows.append({
+                "dataflow": df_obj.get("id"),
+                "agency": df_obj.get("agencyID") or df_obj.get("agency"),
+                "version": df_obj.get("version"),
+                "name": df_obj.get("name") or df_obj.get("names", {}).get("en"),
+            })
+
+        return dataflows
 
     # Méthode de filtrage des requêtes mises à jour
     def filter_updated_queries(
@@ -1435,6 +1628,13 @@ class OECDClient:
 
         Returns:
             Datetime of last update, or None if unavailable.
+
+        Note:
+            This method intentionally does **not** invoke the rate limiter:
+            metadata queries are lightweight enough that the OECD 60
+            requests/hour quota is unlikely to be hit by ordinary update
+            checks. If batched across many dataflows in a tight loop, the
+            caller should add its own throttling.
         """
         # Construction de l'identifiant ContentConstraint
         # Format: CR_A_{DATASET_ID} où DATASET_ID est extrait du dataflow
@@ -1515,17 +1715,103 @@ class OECDClient:
             logger.warning(f"Error parsing ContentConstraint date: {e}")
             return None
 
+    # ──────────────────────────────────────────────────────────────────
+    # Méthodes abstraites — Implémentations requises par AbstractSDMXClient
+    # ──────────────────────────────────────────────────────────────────
+
+    # Implémentation de l'abstraction : fetch de structure sans cache
+    def _fetch_structure(
+        self, agency: str, dataflow: str, **kwargs
+    ) -> DataflowStructure:
+        """Fetch structure from OECD API (no cache).
+
+        Args:
+            agency: Agency identifier.
+            dataflow: Dataflow identifier.
+            **kwargs: Accepts ``version`` (ignored — OECD uses ``"+"``).
+
+        Returns:
+            Parsed ``DataflowStructure``.
+        """
+        # Délégation à get_structure qui gère l'appel API et le parsing
+        return self.get_structure(agency, dataflow)
+
+    # Implémentation de l'abstraction : exécution d'une seule requête de données
+    def _execute_single_request(
+        self,
+        dims_for_request: Dict[int, List[str]],
+        **request_kwargs,
+    ) -> pd.DataFrame:
+        """Execute a single OECD data request.
+
+        Builds the data endpoint via :attr:`endpoint_builder`, executes the
+        request, and parses the response.
+
+        Args:
+            dims_for_request: Dimension position → values for URL construction
+                (``Dict[int, List[str]]``).
+            **request_kwargs: Keyword arguments forwarded from
+                ``_execute_split_requests`` or ``get_data``: ``agency``,
+                ``dataflow``, ``version``, ``structure``, ``format``,
+                ``dimension_at_observation``, ``start_period``,
+                ``end_period``, ``last_n_observations``, ``attributes``,
+                ``measures``.
+
+        Returns:
+            Parsed DataFrame for this single request.
+        """
+        agency: str = request_kwargs["agency"]
+        dataflow: str = request_kwargs["dataflow"]
+        version: str = request_kwargs.get("version", "+")
+        structure: Optional[DataflowStructure] = request_kwargs.get("structure")
+        fmt: OECDResponseFormat = request_kwargs.get("format", OECDResponseFormat.CSV_LABELS)
+        dimension_at_observation: DimensionAtObservation = request_kwargs.get(
+            "dimension_at_observation", DimensionAtObservation.ALL_DIMENSIONS
+        )
+        num_dimensions = structure.num_dimensions if structure else None
+
+        # Construction du filtre de dimensions positionnel via le builder versionné
+        dim_filter = self.endpoint_builder.build_dimension_filter(
+            dims_for_request, num_dimensions
+        )
+
+        # Construction de l'endpoint, des paramètres et des headers
+        endpoint = self.endpoint_builder.build_data_endpoint(
+            dataflow=dataflow,
+            agency=agency,
+            version=version,
+            key=dim_filter,
+        )
+        params = self.endpoint_builder.build_data_params(
+            start_period=request_kwargs.get("start_period"),
+            end_period=request_kwargs.get("end_period"),
+            last_n_observations=request_kwargs.get("last_n_observations"),
+            response_format=fmt,
+            attributes=request_kwargs.get("attributes"),
+            measures=request_kwargs.get("measures"),
+            dimension_at_observation=(
+                dimension_at_observation.value
+                if isinstance(dimension_at_observation, DimensionAtObservation)
+                else dimension_at_observation
+            ),
+        )
+        headers = self.endpoint_builder.build_headers(response_format=fmt)
+
+        # Exécution de la requête
+        logger.debug(f"Single request: {endpoint}")
+        response = self.api_client.get(endpoint, params=params, headers=headers)
+
+        # Parsing de la réponse
+        if fmt == OECDResponseFormat.JSON:
+            return self._parse_json_response(response.json())
+        elif fmt in (OECDResponseFormat.CSV, OECDResponseFormat.CSV_LABELS):
+            return self._parse_csv_response(response.text)
+        else:
+            raise NotImplementedError(f"Format {fmt} not yet implemented")
+
+    # ──────────────────────────────────────────────────────────────────
+
     # Méthode de fermeture de la session
-    def close(self):
+    def close(self) -> None:
         """Close the client and release resources."""
         self.api_client.close()
-    
-    # Entrée dans le client
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-    
-    # Sortie du client
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        self.close()

@@ -1,22 +1,41 @@
 # Importation des éléments d'intérêt du module
 # OECD
-from .oecd import OECDQueryRequest, OECDClient
+from .oecd import (
+    OECDResponseFormat,
+    OECDDataQuery,
+    OECDEndpointBuilder,
+    OECDEndpointBuilderV1,
+    OECDEndpointBuilderV2,
+    OECDQueryRequest,
+    OECDClient,
+)
 # Eurostat
 from .eurostat import (
-    BaseEurostatQueryRequest,
+    EurostatResponseFormat,
+    EurostatEndpointBuilderV30,
+    EurostatEndpointBuilderV21,
+    EurostatQueryRequest,
     EurostatQueryRequestV30,
     EurostatQueryRequestV21,
     EurostatClient,
-    EurostatResponseFormat,
 )
 
 # Réexport des éléments d'intérêt du module
 __all__ = [
+    # OECD
+    'OECDResponseFormat',
+    'OECDDataQuery',
+    'OECDEndpointBuilder',
+    'OECDEndpointBuilderV1',
+    'OECDEndpointBuilderV2',
     'OECDQueryRequest',
     'OECDClient',
-    'BaseEurostatQueryRequest',
+    # Eurostat
+    'EurostatResponseFormat',
+    'EurostatEndpointBuilderV30',
+    'EurostatEndpointBuilderV21',
+    'EurostatQueryRequest',
     'EurostatQueryRequestV30',
     'EurostatQueryRequestV21',
     'EurostatClient',
-    'EurostatResponseFormat',
 ]

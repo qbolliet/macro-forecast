@@ -137,7 +137,12 @@ class DataflowStructure:
         Returns:
             Position index or None if not found.
         """
-        return self._name_to_position.get(name) or self._name_to_position.get(name.lower())
+        # Test explicite de None : la position 0 est falsy, un `or` masquerait
+        # donc la première dimension (ex. REF_AREA en position 0).
+        position = self._name_to_position.get(name)
+        if position is None:
+            position = self._name_to_position.get(name.lower())
+        return position
     
     # Méthode d'extraction d'un nom à partir d'une position
     def get_name(self, position: int) -> Optional[str]:
