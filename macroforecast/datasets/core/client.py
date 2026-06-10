@@ -8,9 +8,14 @@ This module provides:
 """
 # Importation des modules
 from abc import ABC, abstractmethod
+from functools import reduce
 from io import StringIO
+import itertools
+import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+import operator
+from pathlib import Path
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 from urllib.parse import urljoin
 import warnings
 
@@ -19,10 +24,13 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Import runtime du rate limiter (rate_limiter.py n'a pas de dépendance interne
+# au package, aucun risque de circularité)
+from .rate_limiter import RateLimiter
+
 # Imports internes — éviter les imports circulaires en utilisant TYPE_CHECKING
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from .rate_limiter import RateLimiter
     from .sdmx import DuplicateHandling
     from .structures import DataflowStructure, DataflowStructureRegistry
 
@@ -172,6 +180,11 @@ class AbstractSDMXClient(ABC):
     Provides the shared logic common to all SDMX provider clients :
 
     - Structure registry management (``register_structure``, ``_ensure_structure``)
+    - Rate-limiter loading from ``parameters/{PROVIDER_CONFIG_NAME}.json``
+      (``_load_rate_limiter``)
+    - Query-object execution (``execute_query``)
+    - Cartesian product of split dimensions (``_cartesian_split``)
+    - Data-retrieval pipeline orchestration (``_execute_query_pipeline``)
     - Split-request execution loop (``_execute_split_requests``)
     - Post-request DataFrame filtering (``_filter_dataframe_by_dimensions``)
     - Duplicate detection (``_check_duplicates``)
@@ -179,12 +192,20 @@ class AbstractSDMXClient(ABC):
     - Context manager protocol
 
     Subclasses must implement:
-    - ``get_data``: provider-specific data retrieval entry point.
+    - ``get_data``: provider-specific data retrieval entry point (typically a
+      thin wrapper packing its arguments and delegating to
+      ``_execute_query_pipeline``).
     - ``close``: release provider-specific resources.
-    - ``_load_rate_limiter``: load rate-limit config from provider JSON file.
     - ``_fetch_structure``: fetch a ``DataflowStructure`` from the provider API.
     - ``_execute_single_request``: execute one API request for a given
       dimension combination and return a parsed DataFrame.
+    - ``_resolve_structure``: resolve/cache the structure for a query.
+    - ``_prepare_requests``: build the split-request combinations and the
+      execution keyword arguments.
+
+    Subclasses must set :attr:`PROVIDER_CONFIG_NAME` to enable automatic
+    rate-limiter loading, and may override ``_postprocess_dataframe`` to apply
+    a provider-specific post-filter.
 
     Args:
         structure_registry: Pre-populated registry of dataflow structures.
@@ -200,12 +221,19 @@ class AbstractSDMXClient(ABC):
 
     Example:
         >>> class MyClient(AbstractSDMXClient):
+        ...     PROVIDER_CONFIG_NAME = "myprovider"
         ...     def get_data(self, ...): ...
         ...     def close(self): ...
-        ...     def _load_rate_limiter(self): return None
         ...     def _fetch_structure(self, agency, dataflow, **kwargs): ...
         ...     def _execute_single_request(self, dims, **kwargs): ...
+        ...     def _resolve_structure(self, params): ...
+        ...     def _prepare_requests(self, structure, params): ...
     """
+
+    # Nom du fichier de configuration du provider (sans extension) utilisé pour
+    # le chargement automatique du rate limiter depuis parameters/{nom}.json.
+    # Laissé à None dans la base ; surchargé par chaque client concret.
+    PROVIDER_CONFIG_NAME: ClassVar[Optional[str]] = None
 
     # Initialisation
     def __init__(
@@ -249,14 +277,49 @@ class AbstractSDMXClient(ABC):
     def close(self) -> None:
         """Release provider-specific resources (HTTP sessions, etc.)."""
 
-    # Méthode abstraite de chargement du rate-limiter
-    @abstractmethod
-    def _load_rate_limiter(self) -> Optional["RateLimiter"]:
-        """Load rate limiter from the provider-specific JSON config file.
+    # Méthode de chargement du rate-limiter depuis le fichier de configuration
+    def _load_rate_limiter(self) -> Optional[RateLimiter]:
+        """Load the rate limiter from ``parameters/{PROVIDER_CONFIG_NAME}.json``.
+
+        Reads the ``RATE_LIMIT`` section of the provider configuration file
+        and builds a :class:`RateLimiter`. Subclasses only need to set
+        :attr:`PROVIDER_CONFIG_NAME`; the lookup is skipped (and ``None``
+        returned) when it is left unset.
 
         Returns:
-            ``RateLimiter`` instance, or ``None`` if no configuration found.
+            ``RateLimiter`` instance, or ``None`` if no configuration is found
+            or loading fails.
         """
+        # Aucun fichier de configuration déclaré → pas de rate limiting
+        if not self.PROVIDER_CONFIG_NAME:
+            return None
+        try:
+            # Construction du chemin vers parameters/{provider}.json (racine du repo)
+            params_path = (
+                Path(__file__).parents[3]
+                / "parameters"
+                / f"{self.PROVIDER_CONFIG_NAME}.json"
+            )
+            # Lecture et parsing du fichier de configuration si présent
+            if params_path.exists():
+                with open(params_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                # Extraction de la configuration du rate limiter
+                if "RATE_LIMIT" in config:
+                    # Logging
+                    logger.info(
+                        f"Loading rate limiter from "
+                        f"parameters/{self.PROVIDER_CONFIG_NAME}.json"
+                    )
+                    return RateLimiter.from_dict(config["RATE_LIMIT"])
+            # Logging si aucune configuration de rate limit trouvée
+            logger.debug("No RATE_LIMIT configuration found")
+            return None
+        # Échec non bloquant de chargement
+        except Exception as e:
+            # Logging
+            logger.warning(f"Could not load rate limiter: {e}")
+            return None
 
     # Méthode abstraire de requête de la structure d'un dataflow
     @abstractmethod
@@ -303,6 +366,183 @@ class AbstractSDMXClient(ABC):
         Returns:
             Parsed DataFrame (before post-filtering).
         """
+
+    # Méthode abstraite de résolution de la structure d'une requête
+    @abstractmethod
+    def _resolve_structure(
+        self, params: Dict[str, Any]
+    ) -> Optional["DataflowStructure"]:
+        """Resolve (and cache) the dataflow structure for a query.
+
+        Called first by :meth:`_execute_query_pipeline`. Implementations read
+        the relevant identifiers from ``params`` (e.g. ``dataflow``,
+        ``agency``, ``version``) and return the structure, fetching it on
+        demand when necessary.
+
+        Args:
+            params: Parameter dict assembled by the provider ``get_data``
+                method (keys match its signature).
+
+        Returns:
+            ``DataflowStructure`` if available, ``None`` otherwise.
+        """
+
+    # Méthode abstraite de préparation des requêtes splitées
+    @abstractmethod
+    def _prepare_requests(
+        self,
+        structure: Optional["DataflowStructure"],
+        params: Dict[str, Any],
+    ) -> Tuple[List[Tuple[Dict, Dict]], Dict, Dict[str, Any]]:
+        """Build the split-request combinations and execution arguments.
+
+        Called by :meth:`_execute_query_pipeline` after structure resolution.
+        Implementations normalise dimensions, generate the request
+        combinations and assemble the keyword arguments forwarded to every
+        ``_execute_single_request`` call.
+
+        Args:
+            structure: Resolved dataflow structure (may be ``None``).
+            params: Parameter dict assembled by the provider ``get_data``
+                method.
+
+        Returns:
+            Tuple ``(request_combinations, normalized_dimensions,
+            execute_kwargs)``:
+
+            - ``request_combinations``: list of ``(dims_for_request,
+              dims_for_postfilter)`` tuples consumed by
+              ``_execute_split_requests``.
+            - ``normalized_dimensions``: dimensions used for duplicate
+              checking.
+            - ``execute_kwargs``: keyword arguments forwarded to every
+              ``_execute_single_request`` call.
+        """
+
+    # ──────────────────────────────────────────────────────────────────
+    # Pipeline de récupération mutualisé
+    # ──────────────────────────────────────────────────────────────────
+
+    # Méthode d'exécution d'un objet requête provider
+    def execute_query(self, query: Any) -> pd.DataFrame:
+        """Execute a provider query object.
+
+        Generic helper relying on the provider query dataclass exposing a
+        ``to_dict()`` method whose keys match the provider ``get_data``
+        parameters.
+
+        Args:
+            query: Provider-specific query request exposing ``to_dict()``
+                (e.g. ``OECDQueryRequest``, ``EurostatQueryRequestV30``).
+
+        Returns:
+            DataFrame with the retrieved data.
+        """
+        # Délégation à get_data avec les paramètres de la requête
+        return self.get_data(**query.to_dict())
+
+    # Méthode patron orchestrant la récupération des données
+    def _execute_query_pipeline(self, params: Dict[str, Any]) -> pd.DataFrame:
+        """Run the shared data-retrieval pipeline (template method).
+
+        Orchestrates the steps common to every provider: structure
+        resolution, request preparation, split-request execution, duplicate
+        checking and optional post-processing. Providers customise the
+        behaviour through :meth:`_resolve_structure`, :meth:`_prepare_requests`
+        and :meth:`_postprocess_dataframe`.
+
+        Args:
+            params: Parameter dict assembled by the provider ``get_data``
+                method (keys match its signature).
+
+        Returns:
+            Retrieved DataFrame.
+        """
+        # Résolution de la structure du dataflow (spécifique au provider)
+        structure = self._resolve_structure(params)
+
+        # Préparation des requêtes : combinaisons, dims normalisées, kwargs d'exécution
+        request_combinations, normalized_dims, execute_kwargs = self._prepare_requests(
+            structure, params
+        )
+
+        # Exécution mutualisée des sous-requêtes (rate limiting, concaténation)
+        df = self._execute_split_requests(request_combinations, **execute_kwargs)
+
+        # Vérification des doublons sauf si explicitement désactivée
+        on_duplicate = params.get("on_duplicate", "warn")
+        if on_duplicate != "ignore":
+            self._check_duplicates(df, normalized_dims, structure, on_duplicate)
+
+        # Post-traitement optionnel (post-filtre de repli côté provider)
+        return self._postprocess_dataframe(df, structure, normalized_dims, params)
+
+    # Hook de post-traitement du DataFrame (no-op par défaut)
+    def _postprocess_dataframe(
+        self,
+        df: pd.DataFrame,
+        structure: Optional["DataflowStructure"],
+        normalized_dims: Dict,
+        params: Dict[str, Any],
+    ) -> pd.DataFrame:
+        """Post-process the retrieved DataFrame (hook, no-op by default).
+
+        Overridden by providers needing a client-side fallback filter (e.g.
+        Eurostat when no structure is available).
+
+        Args:
+            df: DataFrame returned by the split requests.
+            structure: Resolved dataflow structure (may be ``None``).
+            normalized_dims: Normalised dimensions from
+                :meth:`_prepare_requests`.
+            params: Parameter dict from the provider ``get_data`` method.
+
+        Returns:
+            Possibly filtered DataFrame. The default implementation returns
+            ``df`` unchanged.
+        """
+        return df
+
+    # Méthode statique de génération du produit cartésien des dimensions à splitter
+    @staticmethod
+    def _cartesian_split(
+        split_values: Dict[Any, List[str]],
+        max_combinations: int,
+    ) -> List[Dict[Any, str]]:
+        """Build the cartesian product of split-dimension values.
+
+        Args:
+            split_values: Mapping of dimension key (name or position) to the
+                list of values to split into separate requests.
+            max_combinations: Maximum number of combinations allowed.
+
+        Returns:
+            List of ``{key: single_value}`` dicts — one per combination.
+            Returns ``[{}]`` (a single empty combination) when
+            ``split_values`` is empty.
+
+        Raises:
+            ValueError: If the cartesian product exceeds ``max_combinations``.
+        """
+        # Aucune dimension à splitter → une seule combinaison vide
+        keys = list(split_values.keys())
+        if not keys:
+            return [{}]
+
+        # Listes de valeurs dans l'ordre des clés
+        value_lists = [split_values[k] for k in keys]
+
+        # Contrôle du nombre de combinaisons avant génération
+        num_combinations = reduce(operator.mul, (len(v) for v in value_lists), 1)
+        if num_combinations > max_combinations:
+            raise ValueError(
+                f"Cartesian product would generate {num_combinations} requests, "
+                f"exceeding max_split_combinations={max_combinations}. "
+                f"Consider splitting fewer dimensions or filtering values."
+            )
+
+        # Construction des combinaisons {clé: valeur unique}
+        return [dict(zip(keys, combo)) for combo in itertools.product(*value_lists)]
 
     # Structure registry
     # Méthode d'enregistrement d'une structure dans le registre

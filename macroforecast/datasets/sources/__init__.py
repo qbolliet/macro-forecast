@@ -2,7 +2,6 @@
 # OECD
 from .oecd import (
     OECDResponseFormat,
-    OECDDataQuery,
     OECDEndpointBuilder,
     OECDEndpointBuilderV1,
     OECDEndpointBuilderV2,
@@ -24,7 +23,6 @@ from .eurostat import (
 __all__ = [
     # OECD
     'OECDResponseFormat',
-    'OECDDataQuery',
     'OECDEndpointBuilder',
     'OECDEndpointBuilderV1',
     'OECDEndpointBuilderV2',

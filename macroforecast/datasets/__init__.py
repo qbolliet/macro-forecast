@@ -17,7 +17,6 @@ from .core import (
 # Sources
 from .sources import (
     OECDResponseFormat,
-    OECDDataQuery,
     OECDEndpointBuilder,
     OECDEndpointBuilderV1,
     OECDEndpointBuilderV2,
@@ -49,7 +48,6 @@ __all__ = [
     'DataflowStructureRegistry',
     # OECD
     'OECDResponseFormat',
-    'OECDDataQuery',
     'OECDEndpointBuilder',
     'OECDEndpointBuilderV1',
     'OECDEndpointBuilderV2',
