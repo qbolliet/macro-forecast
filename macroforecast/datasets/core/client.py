@@ -110,6 +110,7 @@ class APIClient:
         endpoint: str,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
+        timeout: Optional[int] = None,
     ) -> requests.Response:
         """Make a GET request.
 
@@ -117,6 +118,8 @@ class APIClient:
             endpoint: API endpoint (relative to base_url).
             params: Query parameters.
             headers: Additional headers for this request.
+            timeout: Request timeout in seconds. Overrides the instance-level
+                timeout when provided.
 
         Returns:
             Response object.
@@ -130,7 +133,10 @@ class APIClient:
         request_headers = self.default_headers.copy()
         if headers:
             request_headers.update(headers)
-        
+
+        # Résolution du timeout : surcharge par requête ou valeur par défaut
+        effective_timeout = timeout if timeout is not None else self.timeout
+
         # Logging
         logger.debug(f"GET request to {url} with params: {params}")
         try:
@@ -139,7 +145,7 @@ class APIClient:
                 url,
                 params=params,
                 headers=request_headers,
-                timeout=self.timeout,
+                timeout=effective_timeout,
             )
             # Statut de la requête
             response.raise_for_status()

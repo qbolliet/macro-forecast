@@ -518,6 +518,7 @@ class OECDClient(AbstractSDMXClient):
         agency: str,
         dataflow: str,
         version: str = "+",
+        timeout: Optional[int] = None,
     ) -> DataflowStructure:
         """Retrieve dataflow structure metadata.
 
@@ -525,6 +526,8 @@ class OECDClient(AbstractSDMXClient):
             agency: Agency identifier.
             dataflow: Dataflow identifier.
             version: Dataflow version (default: "+" for latest).
+            timeout: Request timeout in seconds. Overrides the client-level
+                timeout for this call only.
 
         Returns:
             Structure metadata as dictionary.
@@ -551,7 +554,7 @@ class OECDClient(AbstractSDMXClient):
         }
 
         # Exécution de la requête
-        response = self.api_client.get(endpoint, params=params, headers=headers)
+        response = self.api_client.get(endpoint, params=params, headers=headers, timeout=timeout)
         return self.create_structure_from_api_response(
             agency=agency, dataflow=dataflow, api_response=response.json()
         )

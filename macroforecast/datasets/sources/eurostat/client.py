@@ -400,6 +400,7 @@ class EurostatClient(AbstractSDMXClient):
         compress: Optional[StructureCompress] = None,
         accept_encoding: Optional[str] = None,
         accept_language: Optional[str] = None,
+        timeout: Optional[int] = None,
     ) -> str:
         """Query an SDMX structure artefact and return raw XML.
 
@@ -430,6 +431,9 @@ class EurostatClient(AbstractSDMXClient):
                 transparently).
             accept_encoding: Value for the ``Accept-Encoding`` request header.
             accept_language: Value for the ``Accept-Language`` request header.
+            timeout: Request timeout in seconds. Overrides the client-level
+                timeout for this call only. Useful for bulk harvest requests
+                (``resource_id="*"``) that may take longer than the default.
 
         Returns:
             Raw XML response text.
@@ -485,6 +489,17 @@ class EurostatClient(AbstractSDMXClient):
             ...     compress="true",
             ... )
         """
+        # Normalisation de la version pour le cas spécial "metadata harvesting"
+        # (resource_id="*"). En SDMX 3.0 l'API Eurostat exige le segment de
+        # version wildcard "*" : omettre le segment (None) ou demander "+"
+        # (latest) renvoie un conteneur vide avec un HTTP 200 trompeur.
+        if (
+            resource_id == "*"
+            and self.api_version == SDMXVersion.V3
+            and version in (None, "+", "~")
+        ):
+            version = "*"
+
         # Construction de l'endpoint et des paramètres via le builder
         # Construction de l'endpoint
         endpoint = self.endpoint_builder.build_structure_endpoint(
@@ -512,7 +527,7 @@ class EurostatClient(AbstractSDMXClient):
 
         # Requête de l'artefact structurel
         try:
-            response = client.get(endpoint, params=params, headers=headers)
+            response = client.get(endpoint, params=params, headers=headers, timeout=timeout)
             # Décompression si nécessaire (réponses gzip de l'API SDMX 3.0)
             content = parsing.decompress_response_bytes(response.content)
             return content.decode("utf-8")
@@ -613,9 +628,11 @@ class EurostatClient(AbstractSDMXClient):
             >>> all_agencies = client.list_all_dataflows(agency="*")
         """
         # Sélection du token de version adapté à la version d'API :
-        # SDMX 3.0 → None pour omettre le segment de version (cas spécial Dataset listing)
+        # SDMX 3.0 → "*" (wildcard) : le cas spécial Dataset listing exige le
+        #   segment de version "*". Omettre le segment ou demander "+" renvoie
+        #   un conteneur vide (HTTP 200 trompeur).
         # SDMX 2.1 → "+" converti en "latest" par le builder V2.1
-        version: Optional[str] = None if self.api_version == SDMXVersion.V3 else "+"
+        version: Optional[str] = "*" if self.api_version == SDMXVersion.V3 else "+"
 
         # Requête du catalogue via get_structure avec wildcards
         xml_text = self.get_structure(

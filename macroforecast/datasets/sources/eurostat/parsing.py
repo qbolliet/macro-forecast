@@ -224,8 +224,8 @@ def parse_structure_response(
         ValueError: If XML parsing fails.
     """
     try:
-        # Parsing du document XML
-        root = ET.fromstring(xml_content)
+        # Parsing du document XML 
+        root = ET.parse(StringIO(xml_content)).getroot()
 
         # Tentative avec les namespaces SDMX 3.0 puis fallback vers 2.1
         namespaces = _SDMX3_NS
@@ -309,8 +309,8 @@ def parse_dataflow_list_response(xml_content: str) -> pd.DataFrame:
         ValueError: If XML parsing or element extraction fails.
     """
     try:
-        # Parsing du document XML
-        root = ET.fromstring(xml_content)
+        # Parsing du document XML 
+        root = ET.parse(StringIO(xml_content)).getroot()
 
         # Tentative avec les namespaces SDMX 3.0 puis fallback 2.1
         namespaces = _SDMX3_NS

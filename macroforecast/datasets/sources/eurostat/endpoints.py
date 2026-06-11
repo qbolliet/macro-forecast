@@ -256,7 +256,10 @@ class EurostatEndpointBuilderV30(SDMXEndpointBuilder):
             agency: Maintaining agency, or ``"*"`` for all agencies.
             version: Artefact version.  Use ``"+"`` or ``"~"`` for the
                 latest version, ``"*"`` for all versions, or ``None`` to omit
-                the version segment (Dataset listing special case).
+                the version segment.  Note: the bulk / metadata-harvesting
+                special case (``resource_id="*"``) requires ``"*"`` here;
+                omitting the segment or using ``"+"`` returns an empty
+                container with a misleading HTTP 200.
 
         Returns:
             URL path segment (without base URL).
