@@ -599,6 +599,33 @@ class AbstractSDMXClient(ABC):
 
         return None
 
+    # Méthode auxiliaire de détection d'une réponse SDMX « aucun enregistrement »
+    @staticmethod
+    def _is_no_records_error(exc: Exception) -> bool:
+        """Return True if exc is an SDMX '404 NoRecordsFound' response.
+
+        SDMX providers answer a valid query that matches no data with an HTTP
+        404 whose body contains ``NoRecordsFound``. This is an empty result,
+        not a genuine failure, and should be treated as such.
+
+        Args:
+            exc: Exception raised while executing a sub-request.
+
+        Returns:
+            ``True`` if ``exc`` is an HTTP 404 ``NoRecordsFound`` error,
+            ``False`` otherwise.
+        """
+        # Filtre sur les seules erreurs HTTP porteuses d'une réponse
+        if not isinstance(exc, requests.exceptions.HTTPError):
+            return False
+        response = exc.response
+        # Statut 404 et corps signalant explicitement l'absence de données
+        return (
+            response is not None
+            and response.status_code == 404
+            and "NoRecordsFound" in (response.text or "")
+        )
+
     #  Méthode auxiliaire d'exécution de requêtes multiples
     def _execute_split_requests(
         self,
@@ -666,6 +693,12 @@ class AbstractSDMXClient(ABC):
                     logger.debug(f"Request {i + 1} returned empty after filtering")
 
             except Exception as e:
+                # 404 NoRecordsFound : requête valide sans donnée → résultat vide
+                # (et non une erreur), on poursuit sans alimenter la liste d'erreurs
+                if self._is_no_records_error(e):
+                    # Logging
+                    logger.info(f"Request {i + 1}/{n} returned no records (empty result)")
+                    continue
                 # Construction du message d'erreur
                 error_msg = f"Request {i + 1}/{n} failed: {e}"
                 # Logging
@@ -673,16 +706,19 @@ class AbstractSDMXClient(ABC):
                 # Ajout de l'erreur à la liste
                 errors.append(error_msg)
 
-        # Vérification qu'au moins une requête a réussi
+        # Aucun DataFrame collecté : distinction entre échec réel et résultat vide
         if not all_dataframes:
-            # Construction du message d'erreur
-            error_summary = (
-                "\n".join(errors) if errors else "All requests returned empty results"
-            )
-            raise ValueError(
-                f"All {n} split requests failed or returned empty results.\n"
-                f"Errors:\n{error_summary}"
-            )
+            # Vraies erreurs présentes → levée d'exception
+            if errors:
+                error_summary = "\n".join(errors)
+                raise ValueError(
+                    f"All {n} split requests failed or returned empty results.\n"
+                    f"Errors:\n{error_summary}"
+                )
+            # Aucune erreur réelle : toutes les requêtes ont réussi mais ne renvoient
+            # aucune donnée (no-records et/ou vide après post-filtrage) → DataFrame vide
+            logger.info("All requests returned empty results; returning empty DataFrame")
+            return pd.DataFrame()
 
         # Logging si les requêtes ont partiellement échoué
         if errors:

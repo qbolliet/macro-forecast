@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import xml.etree.ElementTree as ET
 
 import pandas as pd
-import requests
 
 # Utilitaires internes au package pour la requête de données au format SDMX
 from ...core.client import AbstractSDMXClient, APIClient
@@ -27,7 +26,6 @@ from ...core.structures import (
 from . import parsing
 from .endpoints import OECDEndpointBuilder, _OECD_ENDPOINT_BUILDERS
 from .formats import OECDResponseFormat
-from .queries import OECDQueryRequest
 
 # Initialisation du logger
 logger = logging.getLogger(__name__)
@@ -106,6 +104,7 @@ class OECDClient(AbstractSDMXClient):
         on_duplicate: DuplicateHandling = "warn",
         split_dimensions: Optional[List[Union[int, str]]] = None,
         max_split_combinations: int = 100,
+        updated_after: Optional[Union[str, datetime]] = None,
     ) -> pd.DataFrame:
         """Retrieve data from OECD API.
 
@@ -137,6 +136,11 @@ class OECDClient(AbstractSDMXClient):
                 NOTE: Internally converted to dimension NAMES for consistent filtering.
             max_split_combinations: Maximum number of requests allowed when splitting.
                 Prevents accidental explosion of API calls. Default: 100
+            updated_after: Incremental-sync threshold (SDMX-CSV v2 only). When
+                set, the response only includes observations inserted, updated
+                or deleted since that instant. Accepts an ISO-8601 dateTime
+                string (with timezone) or a ``datetime`` object (naive datetimes
+                are interpreted as UTC). Ignored when ``sdmx_version`` is V1.
 
         Returns:
             DataFrame with the retrieved data.
@@ -187,6 +191,7 @@ class OECDClient(AbstractSDMXClient):
             "on_duplicate": on_duplicate,
             "split_dimensions": split_dimensions,
             "max_split_combinations": max_split_combinations,
+            "updated_after": updated_after,
         }
         return self._execute_query_pipeline(params)
 
@@ -270,6 +275,7 @@ class OECDClient(AbstractSDMXClient):
             "last_n_observations": params.get("last_n_observations"),
             "attributes": params.get("attributes"),
             "measures": params.get("measures"),
+            "updated_after": params.get("updated_after"),
         }
 
         return request_combinations, normalized_dims, execute_kwargs
@@ -647,222 +653,6 @@ class OECDClient(AbstractSDMXClient):
         return df_result
 
     # ──────────────────────────────────────────────────────────────────
-    # Vérification des mises à jour
-    # ──────────────────────────────────────────────────────────────────
-
-    # Méthode de filtrage des requêtes mises à jour
-    def filter_updated_queries(
-        self,
-        queries: List[OECDQueryRequest],
-        updated_since: Optional[Union[str, datetime]]=None,
-    ) -> List[OECDQueryRequest]:
-        """Filter queries to keep only those with data updated since a given date.
-
-        This method queries the OECD ContentConstraint endpoint for each dataflow
-        to determine if the data has been updated since the specified date.
-
-        Args:
-            queries: List of OECDQueryRequest objects to filter.
-            updated_since: Date/datetime threshold. Only queries for dataflows
-                          updated after this date will be returned.
-                          Can be a string (ISO format), datetime object, or None.
-                          If None, all queries are returned without filtering.
-
-        Returns:
-            Filtered list of OECDQueryRequest objects for updated dataflows only.
-            If updated_since is None, returns all queries unchanged.
-
-        Example:
-            >>> # Get all queries without filtering
-            >>> all_queries = client.filter_updated_queries(queries, updated_since=None)
-
-            >>> # Filter by specific date
-            >>> queries = [
-            ...     OECDQueryRequest(agency="OECD.SDD.STES", dataflow="DSD_KEI@DF_KEI"),
-            ...     OECDQueryRequest(agency="OECD.ELS.SPD", dataflow="DSD_SOCX_AGG@DF_SOCX_AGG"),
-            ... ]
-            >>> updated_queries = client.filter_updated_queries(
-            ...     queries,
-            ...     updated_since="2024-01-01"
-            ... )
-            >>> # Execute only updated queries
-            >>> for query in updated_queries:
-            ...     df = client.execute_query(query)
-        """
-        # Early return si aucun filtrage demandé
-        if updated_since is None:
-            # Logging
-            logger.info(f"No filtering requested (updated_since=None), returning all {len(queries)} queries")
-            return queries
-
-        # Normalisation de la date
-        if isinstance(updated_since, str):
-            cutoff_date = datetime.fromisoformat(updated_since)
-        else:
-            cutoff_date = updated_since
-
-        # Déduplication les dataflows (plusieurs queries peuvent avoir le même dataflow)
-        unique_dataflows = {}
-        for query in queries:
-            key = query.get_dataflow_key()
-            if key not in unique_dataflows:
-                unique_dataflows[key] = query
-
-        # Vérification des mises à jour pour chaque dataflow
-        updated_dataflows = set()
-        # Logging
-        logger.info(f"Checking {len(unique_dataflows)} unique dataflows for updates since {cutoff_date}")
-
-        # Parcours des dataflow
-        for key, query in unique_dataflows.items():
-            try:
-                # Vérification de l'existence d'observations modifiées depuis la date
-                has_updates = self._has_updates_since(
-                    query.agency,
-                    query.dataflow,
-                    cutoff_date,
-                    query.version,
-                )
-                # Conservation du dataflow uniquement s'il a été mis à jour
-                if has_updates:
-                    # Ajout à la liste des dataflows à requêter
-                    updated_dataflows.add(key)
-                    # Logging
-                    logger.info(f"✓ {key} has updates since {cutoff_date}")
-                else:
-                    # Logging
-                    logger.debug(f"✗ {key} no updates since {cutoff_date}")
-
-            except Exception as e:
-                # Loggin
-                logger.warning(f"Could not check update status for {key}: {e}")
-                # En cas d'erreur, inclure la query par sécurité
-                updated_dataflows.add(key)
-
-        # Filtre les queries originales pour ne conserver que celles qui sont concernées par la mise à jour
-        filtered_queries = [
-            q for q in queries
-            if q.get_dataflow_key() in updated_dataflows
-        ]
-
-        # Logging
-        logger.info(
-            f"Filtered {len(queries)} queries → {len(filtered_queries)} "
-            f"with updates since {cutoff_date}"
-        )
-
-        return filtered_queries
-
-    # Méthode auxiliaire de vérification des mises à jour d'un dataflow
-    def _has_updates_since(
-        self,
-        agency: str,
-        dataflow: str,
-        cutoff_date: datetime,
-        version: str = "+",
-    ) -> bool:
-        """Check whether a dataflow has observations updated since a date.
-
-        Uses the SDMX-CSV v2 ``updatedAfter`` data-query parameter (OECD's
-        recommended mechanism for incremental synchronisation) instead of
-        relying on a guessed ContentConstraint identifier. A single
-        observation is requested (``lastNObservations=1``): if the response
-        carries any row, the dataflow was inserted/updated/deleted after the
-        cutoff. An empty body or a ``404`` response means "no updates".
-
-        Args:
-            agency: Agency identifier.
-            dataflow: Dataflow identifier.
-            cutoff_date: Threshold datetime. Naive datetimes are interpreted
-                as UTC.
-            version: Dataflow version.
-
-        Returns:
-            ``True`` if at least one observation changed since ``cutoff_date``.
-
-        Raises:
-            ValueError: If :attr:`sdmx_version` is not ``SDMXVersion.V2``
-                (``updatedAfter`` is unsupported by the v1 API and would be
-                silently ignored, wrongly flagging every dataflow as updated).
-            requests.exceptions.RequestException: On HTTP errors other than
-                ``404`` (which is treated as "no updates").
-
-        Note:
-            ``updatedAfter`` requires SDMX-CSV v2; this check is therefore
-            meaningful only with :attr:`sdmx_version` set to ``SDMXVersion.V2``.
-        """
-        # Garde-fou : updatedAfter est réservé au SDMX-CSV v2. En v1, le paramètre
-        # serait silencieusement ignoré et tous les dataflows seraient considérés
-        # comme mis à jour. On échoue explicitement plutôt que de retourner un
-        # résultat faux.
-        if self.sdmx_version != SDMXVersion.V2:
-            raise ValueError(
-                f"Update checking via 'updatedAfter' requires SDMXVersion.V2, "
-                f"but this client uses {self.sdmx_version}. The v1 API does not "
-                f"support 'updatedAfter'. Instantiate OECDClient with "
-                f"sdmx_version=SDMXVersion.V2 to filter queries by update date."
-            )
-
-        # Formatage de la date au format dateTime ISO-8601 avec fuseau horaire
-        updated_after = self._format_updated_after(cutoff_date)
-
-        # Endpoint data avec clé wildcard (toutes dimensions confondues)
-        endpoint = self.endpoint_builder.build_data_endpoint(
-            dataflow=dataflow,
-            agency=agency,
-            version=version,
-            key=None,
-        )
-        # Paramètres : une seule observation suffit pour détecter un changement
-        params = self.endpoint_builder.build_data_params(
-            response_format=OECDResponseFormat.CSV,
-            last_n_observations=1,
-            updated_after=updated_after,
-        )
-        headers = self.endpoint_builder.build_headers(
-            response_format=OECDResponseFormat.CSV
-        )
-
-        # Application du rate limiter (quota OCDE de 60 requêtes/heure)
-        if self.rate_limiter:
-            self.rate_limiter.acquire()
-
-        try:
-            # Exécution de la requête
-            response = self.api_client.get(endpoint, params=params, headers=headers)
-        except requests.exceptions.HTTPError as e:
-            # 404 : l'OCDE ne renvoie aucune donnée quand rien n'a changé
-            if e.response is not None and e.response.status_code == 404:
-                return False
-            raise
-
-        # Réponse vide (204 No Content ou corps vide) → aucune mise à jour
-        if response.status_code == 204 or not response.text.strip():
-            return False
-
-        # Présence d'au moins une observation → mise à jour détectée
-        df = self._parse_csv_response(response.text)
-        return not df.empty
-
-    # Méthode auxiliaire de formatage de la date pour le paramètre updatedAfter
-    @staticmethod
-    def _format_updated_after(cutoff_date: datetime) -> str:
-        """Format a datetime for the ``updatedAfter`` query parameter.
-
-        Args:
-            cutoff_date: Threshold datetime. Naive datetimes are assumed UTC.
-
-        Returns:
-            ISO-8601 dateTime string including a timezone offset, e.g.
-            ``"2024-01-01T00:00:00Z"``.
-        """
-        # Datetime naïf → interprété comme UTC (suffixe "Z")
-        if cutoff_date.tzinfo is None:
-            return cutoff_date.strftime("%Y-%m-%dT%H:%M:%SZ")
-        # Datetime avec fuseau → format ISO natif (offset inclus)
-        return cutoff_date.isoformat()
-
-    # ──────────────────────────────────────────────────────────────────
     # Méthodes abstraites — Implémentations requises par AbstractSDMXClient
     # ──────────────────────────────────────────────────────────────────
 
@@ -941,6 +731,7 @@ class OECDClient(AbstractSDMXClient):
                 if isinstance(dimension_at_observation, DimensionAtObservation)
                 else dimension_at_observation
             ),
+            updated_after=request_kwargs.get("updated_after"),
         )
         headers = self.endpoint_builder.build_headers(response_format=fmt)
 

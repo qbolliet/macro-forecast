@@ -7,7 +7,8 @@ shared by both API versions; :class:`OECDEndpointBuilderV1` and
 query parameters and positional dimension key.
 """
 # Importation des modules
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
 
 from ...core.sdmx import (
     DimensionAtObservation,
@@ -208,7 +209,7 @@ class OECDEndpointBuilderV1(OECDEndpointBuilder):
         return_data: Optional[str] = None,
         dimension_at_observation: Optional[str] = None,
         detail: Optional[str] = None,
-        updated_after: Optional[str] = None,
+        updated_after: Optional[Union[str, datetime]] = None,
     ) -> Dict[str, Any]:
         """Build query parameters for an OECD v1 data request.
 
@@ -341,7 +342,7 @@ class OECDEndpointBuilderV2(OECDEndpointBuilder):
         return_data: Optional[str] = None,
         dimension_at_observation: Optional[str] = None,
         detail: Optional[str] = None,
-        updated_after: Optional[str] = None,
+        updated_after: Optional[Union[str, datetime]] = None,
     ) -> Dict[str, Any]:
         """Build query parameters for an OECD v2 data request.
 
@@ -350,9 +351,13 @@ class OECDEndpointBuilderV2(OECDEndpointBuilder):
         ``attributes`` and ``measures`` query parameters.
 
         Args:
-            updated_after: ISO-8601 dateTime (with timezone). When set, the
+            updated_after: Threshold instant, as an ISO-8601 dateTime string
+                (with timezone) or a ``datetime`` object. When set, the
                 response only includes observations inserted, updated or
                 deleted since that instant (SDMX-CSV v2 ``updatedAfter``).
+                A ``datetime`` is converted to ISO-8601: naive datetimes are
+                interpreted as UTC (``…Z`` suffix), aware datetimes keep their
+                offset.
 
         Returns:
             Query-parameter dictionary.
@@ -381,6 +386,14 @@ class OECDEndpointBuilderV2(OECDEndpointBuilder):
         # Synchronisation incrémentale : seules les observations modifiées depuis
         # cet instant sont renvoyées (SDMX-CSV v2 uniquement)
         if updated_after:
+            # Conversion d'un datetime au format dateTime ISO-8601 attendu : un
+            # datetime naïf est interprété comme UTC (suffixe "Z"), un datetime
+            # avec fuseau conserve son offset. Une chaîne est utilisée telle quelle.
+            if isinstance(updated_after, datetime):
+                if updated_after.tzinfo is None:
+                    updated_after = updated_after.strftime("%Y-%m-%dT%H:%M:%SZ")
+                else:
+                    updated_after = updated_after.isoformat()
             params["updatedAfter"] = updated_after
         return params
 

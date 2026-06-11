@@ -5,6 +5,7 @@ call, enabling type-safe construction and batching of query requests.
 """
 # Importation des modules
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
 from ...core.sdmx import DimensionAtObservation, DuplicateHandling
@@ -34,6 +35,8 @@ class OECDQueryRequest:
         on_duplicate: Duplicate handling strategy
         split_dimensions: Dimensions to split into separate requests
         max_split_combinations: Max allowed split combinations
+        updated_after: Incremental-sync threshold (SDMX-CSV v2 only); string
+            or datetime restricting the response to observations changed since
 
     Example:
         >>> query = OECDQueryRequest(
@@ -57,6 +60,7 @@ class OECDQueryRequest:
     on_duplicate: DuplicateHandling = "warn"
     split_dimensions: Optional[List[Union[int, str]]] = None
     max_split_combinations: int = 100
+    updated_after: Optional[Union[str, datetime]] = None
 
     # Méthode de conversion des arguments en dictionnaire
     def to_dict(self) -> Dict[str, Any]:
@@ -80,6 +84,7 @@ class OECDQueryRequest:
             "on_duplicate": self.on_duplicate,
             "split_dimensions": self.split_dimensions,
             "max_split_combinations": self.max_split_combinations,
+            "updated_after": self.updated_after,
         }
 
     # Méthode d'extraction de la clé associée au dataflow
