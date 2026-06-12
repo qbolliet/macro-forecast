@@ -5,6 +5,7 @@ description = "Macroeconomic forecasting pipeline"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "dt-ducklake-manager",
     "pandas>=2.3.3",
     "pyyaml>=6.0.3",
     "requests>=2.32.5",
@@ -14,3 +15,6 @@ dependencies = [
 dev = [
     "ipykernel>=7.1.0",
 ]
+
+[tool.uv.sources]
+dt-ducklake-manager = { git = "https://github.com/qbolliet/dt-ducklake-manager", rev = "v0.2.0" }
