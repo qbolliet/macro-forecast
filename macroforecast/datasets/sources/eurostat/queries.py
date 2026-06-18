@@ -9,8 +9,8 @@ parameters shared by both API versions; :class:`EurostatQueryRequestV30` and
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
-from ...core.sdmx import DuplicateHandling
-from .formats import DataDetail, EurostatResponseFormat
+from ...core.sdmx import DuplicateHandling, build_identity_key
+from .formats import AGENCY_ID, DataDetail, EurostatResponseFormat
 
 
 # Classe de base contenant les paramètres communs aux deux versions d'API
@@ -73,6 +73,20 @@ class EurostatQueryRequest:
             "max_split_combinations": self.max_split_combinations,
         }
 
+    # Propriété d'agence (Eurostat publie toujours sous l'agence ESTAT)
+    @property
+    def agency(self) -> str:
+        """Maintaining agency identifier (always ``ESTAT`` for Eurostat).
+
+        Exposed for symmetry with :class:`OECDQueryRequest` so the download
+        orchestrator can resolve the structure-registry key and the DuckLake
+        schema uniformly across providers.
+
+        Returns:
+            The Eurostat agency identifier ``"ESTAT"``.
+        """
+        return AGENCY_ID
+
     # Méthode d'extraction de la clé unique associée au dataflow
     def get_dataflow_key(self) -> str:
         """Get unique key for this dataflow.
@@ -81,6 +95,23 @@ class EurostatQueryRequest:
             Key in format ``'dataflow::version'``.
         """
         return f"{self.dataflow}::{self.version}"
+
+    # Méthode d'extraction d'une clé d'identité stable de la requête
+    def identity_key(self) -> str:
+        """Return a deterministic identity key for this query.
+
+        Used as the primary key of the download registry (the JSON mapping
+        each query to its last-download date). Encodes only the selection
+        fields (agency, dataflow, version, dimensions). See
+        :func:`macroforecast.datasets.core.sdmx.build_identity_key`.
+
+        Returns:
+            Stable identity string.
+        """
+        # Sérialisation déterministe des dimensions (helper mutualisé)
+        return build_identity_key(
+            self.agency, self.dataflow, self.version, self.dimensions
+        )
 
 
 # Classe représentant une requête de données Eurostat via l'API SDMX 3.0

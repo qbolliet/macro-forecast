@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
-from ...core.sdmx import DimensionAtObservation, DuplicateHandling
+from ...core.sdmx import (
+    DimensionAtObservation,
+    DuplicateHandling,
+    build_identity_key,
+)
 from .formats import OECDResponseFormat
 
 
@@ -95,3 +99,23 @@ class OECDQueryRequest:
             Key in format 'agency::dataflow::version'.
         """
         return f"{self.agency}::{self.dataflow}::{self.version}"
+
+    # Méthode d'extraction d'une clé d'identité stable de la requête
+    def identity_key(self) -> str:
+        """Return a deterministic identity key for this query.
+
+        Used as the primary key of the download registry (the JSON file
+        mapping each query to its last-download date). The key encodes only
+        the *selection* fields that define which series is fetched
+        (agency, dataflow, version, dimensions) — not presentation options
+        such as ``format`` or ``attributes`` — so that re-running the same
+        logical query reuses its registry entry regardless of cosmetic
+        differences.
+
+        Returns:
+            Stable identity string.
+        """
+        # Sérialisation déterministe des dimensions (helper mutualisé)
+        return build_identity_key(
+            self.agency, self.dataflow, self.version, self.dimensions
+        )

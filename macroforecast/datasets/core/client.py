@@ -8,6 +8,7 @@ This module provides:
 """
 # Importation des modules
 from abc import ABC, abstractmethod
+from datetime import datetime
 from functools import reduce
 from io import StringIO
 import itertools
@@ -425,6 +426,43 @@ class AbstractSDMXClient(ABC):
               ``_execute_single_request`` call.
         """
 
+    # Méthode abstraite de récupération incrémentale d'une requête
+    @abstractmethod
+    def fetch_updates(
+        self,
+        query: Any,
+        since: Optional[datetime],
+        n_observations: int = 10,
+    ) -> pd.DataFrame:
+        """Fetch the data for a query, incrementally when possible.
+
+        Provider seam used by the download orchestrator
+        (:class:`~macroforecast.datasets.core.download.SDMXDownloader`). This
+        is where each provider encodes *how* to retrieve only the newly
+        published observations:
+
+        - First download (``since`` is ``None``) → retrieve the **full**
+          series.
+        - Subsequent download (``since`` set) → retrieve only what changed
+          since that instant. OECD relies on the ``updated_after`` query
+          parameter; Eurostat issues a ``dataconstraint`` structure request
+          first and, when the data was updated after ``since``, pulls the last
+          ``n_observations`` observations (to avoid leaving gaps).
+
+        Args:
+            query: Provider-specific query request exposing ``to_dict()``
+                (e.g. ``OECDQueryRequest``, ``EurostatQueryRequest``).
+            since: Instant of the previous successful download for this query,
+                or ``None`` if it was never downloaded.
+            n_observations: Number of most-recent observations to retrieve in
+                incremental mode (providers without a per-observation update
+                filter, e.g. Eurostat).
+
+        Returns:
+            DataFrame with the retrieved data. May be empty when nothing was
+            published since ``since``.
+        """
+
     # ──────────────────────────────────────────────────────────────────
     # Pipeline de récupération mutualisé
     # ──────────────────────────────────────────────────────────────────
@@ -439,13 +477,35 @@ class AbstractSDMXClient(ABC):
 
         Args:
             query: Provider-specific query request exposing ``to_dict()``
-                (e.g. ``OECDQueryRequest``, ``EurostatQueryRequestV30``).
+                (e.g. ``OECDQueryRequest``, ``EurostatQueryRequest``).
 
         Returns:
             DataFrame with the retrieved data.
         """
         # Délégation à get_data avec les paramètres de la requête
         return self.get_data(**query.to_dict())
+
+    # Méthode de résolution de la structure associée à un objet requête
+    def resolve_query_structure(
+        self, query: Any
+    ) -> Optional["DataflowStructure"]:
+        """Resolve the dataflow structure backing a provider query object.
+
+        Thin adapter delegating to the provider :meth:`_resolve_structure`
+        hook with the query parameters. Used by the download orchestrator to
+        derive the primary keys (the dataflow dimensions) of the target
+        DuckLake table. Resolving the structure also registers it in
+        :attr:`structure_registry` (side effect of ``_resolve_structure``),
+        so the orchestrator can detect newly fetched structures.
+
+        Args:
+            query: Provider-specific query request exposing ``to_dict()``.
+
+        Returns:
+            Resolved ``DataflowStructure`` or ``None`` when unavailable.
+        """
+        # Délégation au hook provider avec les paramètres de la requête
+        return self._resolve_structure(query.to_dict())
 
     # Méthode patron orchestrant la récupération des données
     def _execute_query_pipeline(self, params: Dict[str, Any]) -> pd.DataFrame:

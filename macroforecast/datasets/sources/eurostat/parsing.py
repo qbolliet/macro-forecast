@@ -6,9 +6,11 @@ structure / dataflow-catalogue responses. They carry no client state and are
 therefore exposed as module-level functions rather than methods.
 """
 # Importation des modules
+from datetime import datetime, timezone
 import gzip
 from io import StringIO
 import logging
+import re
 from typing import Any, Dict, List, Optional
 import xml.etree.ElementTree as ET
 
@@ -203,6 +205,124 @@ def parse_json_response(data: Dict[str, Any]) -> pd.DataFrame:
         # Logging
         logger.error(f"JSON parsing failed: {e}")
         raise ValueError(f"Failed to parse JSON response: {e}")
+
+
+# Fonction auxiliaire de parsing d'une date ISO en datetime UTC
+def _parse_iso_datetime(text: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO-8601 date or datetime string into a UTC-aware datetime.
+
+    Tolerant of the formats Eurostat uses in structure responses: bare dates
+    (``"2024-03-15"``), datetimes with or without timezone, and the ``Z``
+    suffix. Naive results are assumed to be UTC.
+
+    Args:
+        text: Candidate date/datetime string (may be ``None`` or noisy).
+
+    Returns:
+        UTC-aware ``datetime`` if a date could be extracted, else ``None``.
+    """
+    # Court-circuit si la chaîne est vide
+    if not text:
+        return None
+    candidate = text.strip()
+    # Normalisation du suffixe Z (UTC) accepté par datetime.fromisoformat récent
+    normalized = candidate.replace("Z", "+00:00")
+    # Tentative de parsing ISO complet (date ou datetime)
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        # Repli : extraction d'une date AAAA-MM-JJ noyée dans un texte
+        match = re.search(r"\d{4}-\d{2}-\d{2}", candidate)
+        if not match:
+            return None
+        try:
+            parsed = datetime.fromisoformat(match.group(0))
+        except ValueError:
+            return None
+    # Normalisation en UTC : les datetimes naïfs sont interprétés comme UTC
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+# Fonction de parsing de la date de dernière mise à jour d'un dataconstraint
+def parse_dataconstraint_last_update(xml_content: str) -> Optional[datetime]:
+    """Extract the data last-update instant from a dataconstraint response.
+
+    Eurostat exposes the date a dataset's *data* was last updated through an
+    annotation on the data constraint (commonly typed ``UPDATE_DATA``),
+    carrying the date in its ``AnnotationTitle`` or ``AnnotationText``. This
+    function scans every annotation, preferring those whose type mentions an
+    update of the *data*, and parses the embedded date. When no suitable
+    annotation is found it falls back to the message ``Prepared`` header so
+    callers always get a usable (if conservative) timestamp.
+
+    The conservative fallback is deliberate: returning the response
+    preparation time makes the download orchestrator re-pull the last *N*
+    observations rather than risk missing a genuine update.
+
+    Args:
+        xml_content: Decompressed SDMX-ML dataconstraint response.
+
+    Returns:
+        UTC-aware ``datetime`` of the last data update, or ``None`` if the XML
+        carries no parseable date at all.
+    """
+    try:
+        # Parsing du document XML
+        root = ET.parse(StringIO(xml_content)).getroot()
+    except ET.ParseError as e:
+        logger.warning(f"Could not parse dataconstraint XML: {e}")
+        return None
+
+    # Recherche des annotations dans les deux jeux de namespaces (3.0 puis 2.1)
+    best_update: Optional[datetime] = None
+    best_is_data = False
+    for namespaces in (_SDMX3_NS, _SDMX21_NS):
+        for annotation in root.findall(".//com:Annotation", namespaces):
+            # Type d'annotation (ex. UPDATE_DATA, UPDATE_STRUCTURE)
+            type_elem = annotation.find("com:AnnotationType", namespaces)
+            ann_type = (type_elem.text or "").strip() if type_elem is not None else ""
+            ann_type_upper = ann_type.upper()
+
+            # Filtre sur les annotations relatives à une mise à jour
+            if "UPDATE" not in ann_type_upper:
+                continue
+
+            # Extraction d'une date depuis le titre puis le texte de l'annotation
+            date_value: Optional[datetime] = None
+            for tag in ("com:AnnotationTitle", "com:AnnotationText"):
+                elem = annotation.find(tag, namespaces)
+                if elem is not None:
+                    date_value = _parse_iso_datetime(elem.text)
+                    if date_value is not None:
+                        break
+            if date_value is None:
+                continue
+
+            # Priorité aux annotations de mise à jour des données (UPDATE_DATA)
+            is_data = "DATA" in ann_type_upper
+            if best_update is None or (is_data and not best_is_data):
+                best_update = date_value
+                best_is_data = is_data
+        # Arrêt dès qu'un jeu de namespaces a produit des annotations exploitables
+        if best_update is not None:
+            break
+
+    # Annotation de mise à jour des données trouvée → date retournée
+    if best_update is not None:
+        return best_update
+
+    # Repli conservateur : en-tête mes:Prepared du message
+    for namespaces in (_SDMX3_NS, _SDMX21_NS):
+        prepared = root.find(".//mes:Prepared", namespaces)
+        if prepared is not None:
+            parsed = _parse_iso_datetime(prepared.text)
+            if parsed is not None:
+                return parsed
+
+    # Aucune date exploitable
+    return None
 
 
 # Fonction de parsing d'une réponse SDMX-ML et d'extraction des dimensions

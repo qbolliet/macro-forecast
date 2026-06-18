@@ -28,6 +28,51 @@ from enum import Enum
 DuplicateHandling = Literal["ignore", "warn", "raise"]
 
 
+# Fonction de construction d'une clé d'identité stable d'une requête
+def build_identity_key(
+    agency: str,
+    dataflow: str,
+    version: str,
+    dimensions: Optional[Dict[Any, Any]] = None,
+) -> str:
+    """Build a deterministic identity key from query selection fields.
+
+    Shared by the provider query DTOs (``OECDQueryRequest``,
+    ``EurostatQueryRequest``) so that every download registry uses the same
+    canonical format. Only the *selection* fields that determine which series
+    is fetched are encoded (agency, dataflow, version, dimensions) — not
+    presentation options such as ``format`` — so re-running the same logical
+    query reuses its registry entry. Dimensions are normalised to sorted
+    ``key=value1,value2`` segments, themselves sorted, making the result
+    independent of insertion order.
+
+    Args:
+        agency: Maintaining agency identifier.
+        dataflow: Dataflow identifier.
+        version: Dataflow version token.
+        dimensions: Dimension filters (values may be scalars or lists).
+
+    Returns:
+        Stable identity string ``"agency::dataflow::version::dims"``.
+
+    Examples:
+        >>> build_identity_key("ESTAT", "namq_10_gdp", "*",
+        ...                     {"GEO": ["FR", "DE"], "FREQ": "Q"})
+        'ESTAT::namq_10_gdp::*::FREQ=Q;GEO=DE,FR'
+    """
+    # Normalisation des dimensions en segments triés "clé=valeurs triées"
+    dims_part = ""
+    if dimensions:
+        segments = []
+        for key in sorted(dimensions, key=str):
+            value = dimensions[key]
+            values = [value] if isinstance(value, (str, int)) else list(value)
+            values_str = ",".join(sorted(str(v) for v in values))
+            segments.append(f"{key}={values_str}")
+        dims_part = ";".join(segments)
+    return f"{agency}::{dataflow}::{version}::{dims_part}"
+
+
 # Classe spécifiant les types de versions de l'API SDMX
 class SDMXVersion(str, Enum):
     """SDMX API version.

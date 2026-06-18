@@ -4,9 +4,10 @@ High-level client for querying OECD data through their SDMX API and
 converting responses to pandas DataFrames.
 """
 # Importation des modules
+from dataclasses import replace
 from datetime import datetime
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -26,6 +27,9 @@ from ...core.structures import (
 from . import parsing
 from .endpoints import OECDEndpointBuilder, _OECD_ENDPOINT_BUILDERS
 from .formats import OECDResponseFormat
+
+if TYPE_CHECKING:
+    from .queries import OECDQueryRequest
 
 # Initialisation du logger
 logger = logging.getLogger(__name__)
@@ -194,6 +198,44 @@ class OECDClient(AbstractSDMXClient):
             "updated_after": updated_after,
         }
         return self._execute_query_pipeline(params)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Seam de téléchargement incrémental (orchestrateur core.download)
+    # ──────────────────────────────────────────────────────────────────
+
+    # Implémentation de la récupération incrémentale via ``updated_after``
+    def fetch_updates(
+        self,
+        query: "OECDQueryRequest",
+        since: Optional[datetime],
+        n_observations: int = 10,
+    ) -> pd.DataFrame:
+        """Fetch OECD data for a query, incrementally when possible.
+
+        Uses the SDMX-CSV v2 ``updated_after`` filter, which returns only the
+        observations inserted, updated or deleted since the given instant —
+        the precise, server-side incremental mechanism for OECD. The
+        ``n_observations`` argument is therefore unused (it exists for
+        providers without ``updated_after``, e.g. Eurostat).
+
+        Args:
+            query: OECD query request (``OECDQueryRequest``).
+            since: Instant of the previous successful download, or ``None``
+                for a first (full) download.
+            n_observations: Ignored for OECD (see above).
+
+        Returns:
+            DataFrame with the retrieved data; empty when nothing changed
+            since ``since``.
+        """
+        # Premier téléchargement : récupération complète de la série
+        if since is None:
+            return self.execute_query(query)
+
+        # Téléchargements suivants : seules les observations modifiées depuis
+        # ``since`` via le paramètre serveur ``updated_after`` (SDMX-CSV v2).
+        incremental_query = replace(query, updated_after=since)
+        return self.execute_query(incremental_query)
 
     # ──────────────────────────────────────────────────────────────────
     # Hooks du pipeline (AbstractSDMXClient._execute_query_pipeline)
