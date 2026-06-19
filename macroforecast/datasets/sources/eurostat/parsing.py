@@ -325,6 +325,33 @@ def parse_dataconstraint_last_update(xml_content: str) -> Optional[datetime]:
     return None
 
 
+# Fonction auxiliaire d'extraction de l'identifiant de codelist depuis une URN
+def _codelist_id_from_urn(urn: str) -> Optional[str]:
+    """Extract the codelist identifier from an SDMX codelist URN.
+
+    The data structure references the codelist of each dimension through a URN
+    of the form ``urn:sdmx:org.sdmx.infomodel.codelist.Codelist=ESTAT:CXT_NC(11.0)``.
+    This helper returns the bare codelist identifier (``CXT_NC``), which is the
+    resource id to pass to
+    ``EurostatClient.get_structure(StructureResourceType.CODELIST, ...)``.
+
+    Args:
+        urn: Codelist URN (the text of a ``str:Enumeration`` element).
+
+    Returns:
+        The codelist identifier, or ``None`` when the URN cannot be parsed.
+
+    Examples:
+        >>> _codelist_id_from_urn(
+        ...     "urn:sdmx:org.sdmx.infomodel.codelist.Codelist=ESTAT:CXT_NC(11.0)"
+        ... )
+        'CXT_NC'
+    """
+    # Identifiant entre "Codelist=<agence>:" et la parenthèse de version
+    match = re.search(r"Codelist=[^:]*:([^()]+)", urn)
+    return match.group(1) if match else None
+
+
 # Fonction de parsing d'une réponse SDMX-ML et d'extraction des dimensions
 def parse_structure_response(
     xml_content: str, dataflow: str
@@ -389,11 +416,22 @@ def parse_structure_response(
                 # Résolution de la description via le ConceptScheme
                 description = concept_names.get(dim_id)
 
+                # Résolution de la codelist énumérant les valeurs de la dimension :
+                # la représentation locale référence la codelist via une URN
+                # (ex. "...Codelist=ESTAT:CXT_FREE_ISO(10.0)").
+                enumeration = dim.find(
+                    "str:LocalRepresentation/str:Enumeration", namespaces
+                )
+                codelist = None
+                if enumeration is not None and enumeration.text:
+                    codelist = _codelist_id_from_urn(enumeration.text)
+
                 dimensions.append(
                     DimensionInfo(
                         name=dim_id,
                         position=int(position),
                         description=description,
+                        codelist=codelist,
                     )
                 )
 

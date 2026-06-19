@@ -17,32 +17,41 @@ logger = logging.getLogger(__name__)
 # Structure de données pour une dimension
 class DimensionInfo:
     """Information about a single dimension in a dataflow.
-    
+
     Args:
         name: Dimension identifier (e.g., 'REF_AREA', 'FREQ').
         position: Zero-based position in the dimension filter.
         description: Optional human-readable description.
-    
+        codelist: Optional identifier of the codelist enumerating the
+            dimension's allowed values (e.g., ``'CXT_FREE_ISO'``). Resolved
+            from the dataflow structure (DSD), it tells which codelist to query
+            to obtain the dimension's value codes.
+
     Example:
-        >>> dim = DimensionInfo(name="REF_AREA", position=0, description="Reference area")
+        >>> dim = DimensionInfo(
+        ...     name="REF_AREA", position=0, description="Reference area",
+        ...     codelist="CL_AREA",
+        ... )
     """
-    
+
     # Initialisation
     def __init__(
         self,
         name: str,
         position: int,
         description: Optional[str] = None,
+        codelist: Optional[str] = None,
     ):
         # Initialisation des attributs
         self.name = name
         self.position = position
         self.description = description
-    
+        self.codelist = codelist
+
     # Méthode de conversion en dictionnaire des attributs
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation.
-        
+
         Returns:
             Dictionary with dimension information.
         """
@@ -54,16 +63,19 @@ class DimensionInfo:
         # Ajout de la description si spécifiée
         if self.description:
             result["description"] = self.description
+        # Ajout de la codelist associée si spécifiée
+        if self.codelist:
+            result["codelist"] = self.codelist
         return result
-    
+
     # Méthode de création d'une instance de la classe à partir d'un dictionnaire
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DimensionInfo":
         """Create instance from dictionary.
-        
+
         Args:
             data: Dictionary containing dimension information.
-            
+
         Returns:
             DimensionInfo instance.
         """
@@ -71,6 +83,7 @@ class DimensionInfo:
             name=data["name"],
             position=data["position"],
             description=data.get("description"),
+            codelist=data.get("codelist"),
         )
 
 
