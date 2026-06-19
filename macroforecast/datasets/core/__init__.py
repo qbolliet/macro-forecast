@@ -12,6 +12,8 @@ from .sdmx import (
     SDMXResponseFormat,
     SDMXEndpointBuilder,
 )
+# Queries
+from .queries import SDMXQueryRequest
 # Structures
 from .structures import DimensionInfo, DataflowStructure, DataflowStructureRegistry
 
@@ -26,6 +28,7 @@ __all__ = [
     'DuplicateHandling',
     'SDMXResponseFormat',
     'SDMXEndpointBuilder',
+    'SDMXQueryRequest',
     'DimensionInfo',
     'DataflowStructure',
     'DataflowStructureRegistry',

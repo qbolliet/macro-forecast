@@ -4,21 +4,23 @@ Public DTO encapsulating all parameters of an :meth:`OECDClient.get_data`
 call, enabling type-safe construction and batching of query requests.
 """
 # Importation des modules
+# Modules de base
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
-
+from typing import ClassVar, Dict, List, Optional, Type, Union
+# Modules du package
+from ...core.queries import SDMXQueryRequest
 from ...core.sdmx import (
     DimensionAtObservation,
     DuplicateHandling,
-    build_identity_key,
+    SDMXResponseFormat,
 )
 from .formats import OECDResponseFormat
 
 
 # Classe représentant une requête de données
 @dataclass
-class OECDQueryRequest:
+class OECDQueryRequest(SDMXQueryRequest):
     """Represents an OECD data query request.
 
     This class encapsulates all parameters needed for a get_data() call,
@@ -66,56 +68,6 @@ class OECDQueryRequest:
     max_split_combinations: int = 100
     updated_after: Optional[Union[str, datetime]] = None
 
-    # Méthode de conversion des arguments en dictionnaire
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for get_data() kwargs.
+    # Enum de format du provider (utilisé par SDMXQueryRequest.from_dict)
+    _FORMAT_ENUM: ClassVar[Optional[Type[SDMXResponseFormat]]] = OECDResponseFormat
 
-        Returns:
-            Dictionary of parameters for get_data() method.
-        """
-        return {
-            "agency": self.agency,
-            "dataflow": self.dataflow,
-            "version": self.version,
-            "dimensions": self.dimensions,
-            "start_period": self.start_period,
-            "end_period": self.end_period,
-            "last_n_observations": self.last_n_observations,
-            "format": self.format,
-            "dimension_at_observation": self.dimension_at_observation,
-            "attributes": self.attributes,
-            "measures": self.measures,
-            "on_duplicate": self.on_duplicate,
-            "split_dimensions": self.split_dimensions,
-            "max_split_combinations": self.max_split_combinations,
-            "updated_after": self.updated_after,
-        }
-
-    # Méthode d'extraction de la clé associée au dataflow
-    def get_dataflow_key(self) -> str:
-        """Get unique key for this dataflow.
-
-        Returns:
-            Key in format 'agency::dataflow::version'.
-        """
-        return f"{self.agency}::{self.dataflow}::{self.version}"
-
-    # Méthode d'extraction d'une clé d'identité stable de la requête
-    def identity_key(self) -> str:
-        """Return a deterministic identity key for this query.
-
-        Used as the primary key of the download registry (the JSON file
-        mapping each query to its last-download date). The key encodes only
-        the *selection* fields that define which series is fetched
-        (agency, dataflow, version, dimensions) — not presentation options
-        such as ``format`` or ``attributes`` — so that re-running the same
-        logical query reuses its registry entry regardless of cosmetic
-        differences.
-
-        Returns:
-            Stable identity string.
-        """
-        # Sérialisation déterministe des dimensions (helper mutualisé)
-        return build_identity_key(
-            self.agency, self.dataflow, self.version, self.dimensions
-        )

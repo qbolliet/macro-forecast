@@ -6,16 +6,18 @@ parameters shared by both API versions; :class:`EurostatQueryRequestV30` and
 :class:`EurostatQueryRequestV21` add the version-specific fields.
 """
 # Importation des modules
+# Modules de base
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
-
-from ...core.sdmx import DuplicateHandling, build_identity_key
+from typing import ClassVar, Dict, List, Optional, Type, Union
+# Modules du package
+from ...core.queries import SDMXQueryRequest
+from ...core.sdmx import DuplicateHandling, SDMXResponseFormat
 from .formats import AGENCY_ID, DataDetail, EurostatResponseFormat
 
 
 # Classe de base contenant les paramètres communs aux deux versions d'API
 @dataclass
-class EurostatQueryRequest:
+class EurostatQueryRequest(SDMXQueryRequest):
     """Base class for Eurostat query requests.
 
     Contains all parameters shared by both SDMX 3.0 and 2.1 API versions.
@@ -51,27 +53,8 @@ class EurostatQueryRequest:
     split_dimensions: Optional[List[str]] = None
     max_split_combinations: int = 100
 
-    # Méthode de conversion des paramètres communs en dictionnaire de kwargs
-    def _base_dict(self) -> Dict[str, Any]:
-        """Return the common parameters as a dictionary.
-
-        Returns:
-            Dictionary of parameters shared by both API versions.
-        """
-        return {
-            "dataflow": self.dataflow,
-            "version": self.version,
-            "dimensions": self.dimensions,
-            "start_period": self.start_period,
-            "end_period": self.end_period,
-            "last_n_observations": self.last_n_observations,
-            "first_n_observations": self.first_n_observations,
-            "format": self.format,
-            "compress": self.compress,
-            "on_duplicate": self.on_duplicate,
-            "split_dimensions": self.split_dimensions,
-            "max_split_combinations": self.max_split_combinations,
-        }
+    # Enum de format du provider (utilisé par SDMXQueryRequest.from_dict)
+    _FORMAT_ENUM: ClassVar[Optional[Type[SDMXResponseFormat]]] = EurostatResponseFormat
 
     # Propriété d'agence (Eurostat publie toujours sous l'agence ESTAT)
     @property
@@ -87,31 +70,20 @@ class EurostatQueryRequest:
         """
         return AGENCY_ID
 
-    # Méthode d'extraction de la clé unique associée au dataflow
+    # Surcharge de la clé de dataflow (Eurostat n'inclut pas l'agence, toujours ESTAT)
     def get_dataflow_key(self) -> str:
         """Get unique key for this dataflow.
+
+        Overrides :meth:`SDMXQueryRequest.get_dataflow_key` to preserve the
+        Eurostat-specific format (the agency is always ``ESTAT`` and is left out
+        of the key).
 
         Returns:
             Key in format ``'dataflow::version'``.
         """
         return f"{self.dataflow}::{self.version}"
 
-    # Méthode d'extraction d'une clé d'identité stable de la requête
-    def identity_key(self) -> str:
-        """Return a deterministic identity key for this query.
-
-        Used as the primary key of the download registry (the JSON mapping
-        each query to its last-download date). Encodes only the selection
-        fields (agency, dataflow, version, dimensions). See
-        :func:`macroforecast.datasets.core.sdmx.build_identity_key`.
-
-        Returns:
-            Stable identity string.
-        """
-        # Sérialisation déterministe des dimensions (helper mutualisé)
-        return build_identity_key(
-            self.agency, self.dataflow, self.version, self.dimensions
-        )
+    # to_dict, from_dict et identity_key sont hérités de SDMXQueryRequest.
 
 
 # Classe représentant une requête de données Eurostat via l'API SDMX 3.0
@@ -146,22 +118,6 @@ class EurostatQueryRequestV30(EurostatQueryRequest):
     labels: Optional[str] = None
     response_format_version: Optional[str] = None
 
-    # Méthode de conversion des paramètres en dictionnaire de kwargs
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary suitable for ``get_data()`` kwargs.
-
-        Returns:
-            Dictionary of all parameters. SDMX 2.1-specific fields are
-            included as ``None`` for compatibility with ``get_data()``.
-        """
-        return {
-            **self._base_dict(),
-            "attributes": self.attributes,
-            "measures": self.measures,
-            "lang": self.lang,
-            "labels": self.labels,
-            "response_format_version": self.response_format_version,
-        }
 
 
 # Classe représentant une requête de données Eurostat via l'API SDMX 2.1
@@ -192,16 +148,3 @@ class EurostatQueryRequestV21(EurostatQueryRequest):
     dimension_at_observation: Optional[str] = None
     detail: Optional[DataDetail] = None
 
-    # Méthode de conversion des paramètres en dictionnaire de kwargs
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary suitable for ``get_data()`` kwargs.
-
-        Returns:
-            Dictionary of all parameters. SDMX 3.0-specific fields are
-            included as ``None`` for compatibility with ``get_data()``.
-        """
-        return {
-            **self._base_dict(),
-            "dimension_at_observation": self.dimension_at_observation,
-            "detail": self.detail,
-        }

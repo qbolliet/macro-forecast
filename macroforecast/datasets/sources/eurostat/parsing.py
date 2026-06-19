@@ -471,3 +471,61 @@ def parse_dataflow_list_response(xml_content: str) -> pd.DataFrame:
     except Exception as e:
         logger.error(f"Dataflow catalogue parsing failed: {e}")
         raise ValueError(f"Failed to parse dataflow catalogue: {e}")
+
+
+# Fonction de parsing d'une réponse SDMX-ML contenant une liste de codes
+def parse_codelist_response(xml_content: str) -> pd.DataFrame:
+    """Parse an SDMX-ML codelist response into a ``(code, name)`` DataFrame.
+
+    Tries SDMX 3.0 namespaces first, then falls back to 2.1. Extracts every
+    code of every codelist in the response, with the English name when
+    available (falling back to the first localised name). Useful to enumerate
+    the allowed values of a dimension (e.g. reporters, products) before
+    building split queries.
+
+    Args:
+        xml_content: XML response content (already decompressed), typically
+            from ``EurostatClient.get_structure(StructureResourceType.CODELIST,
+            ...)``.
+
+    Returns:
+        DataFrame with columns: ``code``, ``name``. Empty (with those columns)
+        when the response carries no code.
+
+    Raises:
+        ValueError: If XML parsing or element extraction fails.
+    """
+    try:
+        # Parsing du document XML
+        root = ET.parse(StringIO(xml_content)).getroot()
+
+        # Tentative avec les namespaces SDMX 3.0 puis fallback 2.1
+        namespaces = _SDMX3_NS
+        codes = root.findall(".//str:Codelist/str:Code", namespaces)
+        if not codes:
+            namespaces = _SDMX21_NS
+            codes = root.findall(".//str:Codelist/str:Code", namespaces)
+
+        # Extraction de l'identifiant et du nom de chaque code
+        rows = []
+        for code_elem in codes:
+            code_id = code_elem.get("id")
+
+            # Extraction du nom anglais, ou première langue disponible
+            name: Optional[str] = None
+            for name_elem in code_elem.findall("com:Name", namespaces):
+                lang = name_elem.get(
+                    "{http://www.w3.org/XML/1998/namespace}lang", ""
+                )
+                if name is None or lang == "en":
+                    name = name_elem.text
+
+            rows.append({"code": code_id, "name": name})
+
+        # Logging
+        logger.info(f"Parsed {len(rows)} codes from codelist response")
+        return pd.DataFrame(rows, columns=["code", "name"])
+    # Gestion des erreurs de parsing XML
+    except Exception as e:
+        logger.error(f"Codelist parsing failed: {e}")
+        raise ValueError(f"Failed to parse codelist response: {e}")

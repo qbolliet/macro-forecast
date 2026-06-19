@@ -801,19 +801,26 @@ class EurostatClient(AbstractSDMXClient):
     # Méthodes privées — Sélection du client API
     # ──────────────────────────────────────────────────────────────────
 
-    # Méthode statique de détection des datasets Comext (préfixe DS-)
+    # Méthode statique de détection des artefacts Comext (préfixes DS-/CXT_)
     @staticmethod
-    def _is_comext_dataset(dataflow: str) -> bool:
-        """Detect if a dataflow belongs to the Comext database.
+    def _is_comext_dataset(resource_id: str) -> bool:
+        """Detect if a resource belongs to the Comext database.
+
+        Comext data flows are prefixed ``DS-`` and their structural artefacts
+        (codelists, concept schemes, etc.) are prefixed ``CXT_``. Both are
+        served only by the dedicated Comext endpoint, so structure queries for
+        a ``CXT_*`` codelist (e.g. ``CXT_FREE_ISO`` for reporters, ``CXT_NC``
+        for products) must be routed there too.
 
         Args:
-            dataflow: Dataflow identifier.
+            resource_id: Dataflow or structure-artefact identifier.
 
         Returns:
-            True if the dataflow starts with ``'DS-'``.
+            True if the identifier starts with ``'DS-'`` or ``'CXT_'``.
         """
-        # Détection du préfixe DS- caractéristique des datasets Comext
-        return dataflow.upper().startswith("DS-")
+        # Détection des préfixes DS- (données) et CXT_ (artefacts) de Comext
+        upper = resource_id.upper()
+        return upper.startswith("DS-") or upper.startswith("CXT_")
 
     # Méthode d'accès au client Comext avec initialisation paresseuse
     def _get_comext_client(self) -> APIClient:
