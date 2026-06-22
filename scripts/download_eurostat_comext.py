@@ -1,7 +1,7 @@
 """Script de téléchargement des données Comext (commerce extérieur) Eurostat.
 
 Télécharge le dataflow DS-045409 depuis l'API SDMX 3.0 d'Eurostat en scindant
-les requêtes par pays reporter × code produit. Peut être ordonnancé (Argo, cron)
+les requêtes par pays reporter x code produit. Peut être ordonnancé (Argo, cron)
 ou intégré directement comme nœud Kedro via les fonctions exportées.
 """
 
@@ -10,7 +10,7 @@ import itertools
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
@@ -79,7 +79,7 @@ def build_split_queries(
     reporter_codes: pd.DataFrame,
     product_codes: pd.DataFrame,
     config_path: str,
-    fixed_dims: Optional[Dict[str, str]] = None,
+    fixed_dims: Optional[Dict[str, Union[List[str], str]]] = None,
 ) -> List[Any]:
     """Build the split queries for a Comext dataflow.
 
@@ -119,8 +119,8 @@ def build_split_queries(
         fixed_dims = {
             "freq": "A",
             "partner": "*",
-            "flow": "1",
-            "indicators": "QUANTITY_IN_100KG",
+            "flow": ["1", "2"],                                     # Les flux (import, export)
+            "indicators": ["QUANTITY_IN_100KG", "VALUE_IN_EUROS"],  # Masse et valeur
         }
 
     split_filters = load_split_filters(config_path, dataflow)
