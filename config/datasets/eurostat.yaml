@@ -1,0 +1,54 @@
+# Configuration des dimensions scindées Eurostat
+# Filtres de codes appliqués aux codelists des dimensions itérées pour
+# construire le produit cartésien des requêtes.
+
+# Groupes de codes réutilisables
+code_groups:
+  # 27 États membres de l'Union européenne (codes CXT_FREE_ISO, GR pour la Grèce)
+  eu27: &eu27
+    - AT
+    - BE
+    - BG
+    - HR
+    - CY
+    - CZ
+    - DK
+    - EE
+    - FI
+    - FR
+    - DE
+    - GR
+    - HU
+    - IE
+    - IT
+    - LV
+    - LT
+    - LU
+    - MT
+    - NL
+    - PL
+    - PT
+    - RO
+    - SK
+    - SI
+    - ES
+    - SE
+
+# Filtres de codes par dataflow et par dimension scindée
+split_filters:
+  # Commerce international Comext
+  DS-045409:
+    reporter:
+      include: *eu27          # ne garder que les 27 pays de l'UE
+      include_regex: null
+      exclude: null           # aucune exclusion supplémentaire
+      exclude_regex: null
+    product:
+      include: null           # partir de tous les codes disponibles
+      include_regex: '^(\d{2}|\d{4}|\d{6}|\d{8})$'   # SH2/SH4/SH6/NC8 valides
+      exclude:                # agrégats confidentiels (vrais chapitres = 01-99)
+        - "00"
+        - "0090"
+        - "009000"
+        - "00900000"
+      exclude_regex: null
