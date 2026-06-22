@@ -595,7 +595,7 @@ class SDMXDownloader:
 
     # Méthode de chargement du registre des dates de dernier téléchargement
     def _load_registry(self) -> None:
-        """Load the last-download registry from storage (empty if absent)."""
+        """Load the last-download registry from the JSON file (empty if absent)."""
         # Lecture du registre JSON existant (None si absent)
         data = self._read_json(self._last_download_path) or {}
         self._registry = data.get(_REGISTRY_ROOT, {})
