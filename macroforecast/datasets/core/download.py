@@ -21,15 +21,18 @@ import argparse
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-import json
 import logging
 import os
 from pathlib import Path
 import tempfile
 from typing import Any, Dict, Iterable, List, Optional, Union
 
+from botocore.exceptions import ClientError
 import duckdb
 import pandas as pd
+
+# Importation des modules de connexion
+from storage import Loader, Saver
 
 from dt_ducklake_manager import (
     DatabaseUpdater,
@@ -234,6 +237,15 @@ class SDMXDownloader:
             disables the deadline.
         categorical_threshold: ``categorical_threshold`` forwarded to
             dt_ducklake_manager. ``None`` (default) disables dimension tables.
+        bucket: Optional S3 bucket name. When provided, the structure and
+            last-download JSON registries are read from and written to S3
+            (the registry paths are used as object keys); when ``None``
+            (default) they live on the local filesystem.
+        storage_options: Optional keyword arguments forwarded to the
+            ``Loader``/``Saver`` ``connect()`` method (e.g. ``endpoint_url``,
+            ``aws_access_key_id``, ``aws_secret_access_key``, ``verify``). Only
+            used when ``bucket`` is set; if omitted, the connection is
+            established lazily from the standard AWS environment variables.
     """
 
     # Initialisation
@@ -248,6 +260,8 @@ class SDMXDownloader:
         fresh_registry: bool = False,
         max_runtime: Optional[timedelta] = timedelta(hours=23),
         categorical_threshold: Optional[int] = None,
+        bucket: Optional[str] = None,
+        storage_options: Optional[Dict[str, Any]] = None,
     ):
         # Dépendances injectées
         self._client = client
@@ -260,6 +274,18 @@ class SDMXDownloader:
         self._max_runtime = max_runtime
         self._categorical_threshold = categorical_threshold
 
+        # Accès au stockage des registres JSON (local ou S3 selon ``bucket``).
+        # Instances réutilisables : la connexion S3 paresseuse est ainsi établie
+        # une seule fois et partagée par toutes les lectures/écritures.
+        self._bucket = bucket
+        self._loader = Loader()
+        self._saver = Saver()
+        # Connexion explicite uniquement si des options sont fournies ; sinon la
+        # connexion reste paresseuse (variables d'environnement AWS au 1er accès).
+        if bucket is not None and storage_options:
+            self._loader.connect(**storage_options)
+            self._saver.connect(**storage_options)
+
         # Alias du catalogue DuckLake (pour les requêtes d'introspection)
         self._catalog_alias = connector.catalog_alias
 
@@ -269,8 +295,10 @@ class SDMXDownloader:
 
         # Registre des structures, injecté dans le client pour mutualiser le cache
         self._structure_registry = DataflowStructureRegistry()
-        if not fresh_registry and self._structures_path.exists():
-            self._structure_registry.load_from_file(self._structures_path)
+        if not fresh_registry:
+            structures_data = self._read_json(self._structures_path)
+            if structures_data:
+                self._structure_registry.load_from_dict(structures_data)
         self._client.structure_registry = self._structure_registry
 
         # Instant de démarrage (renseigné dans run())
@@ -335,8 +363,11 @@ class SDMXDownloader:
         finally:
             # Export du registre des structures si une structure a été ajoutée
             if set(self._structure_registry.list_structures()) != initial_structure_keys:
-                # Export
-                self._structure_registry.save_to_file(self._structures_path)
+                # Export (routé vers le local ou S3 selon ``bucket``)
+                self._write_json(
+                    self._structures_path,
+                    self._structure_registry.to_dict(),
+                )
                 # Logging
                 logger.info(f"Structure registry exported to {self._structures_path}")
             # Persistance finale du registre des dates (déjà persisté par requête)
@@ -564,14 +595,9 @@ class SDMXDownloader:
 
     # Méthode de chargement du registre des dates de dernier téléchargement
     def _load_registry(self) -> None:
-        """Load the last-download registry from disk (empty if absent)."""
-        # Registre vide si le fichier n'existe pas encore
-        if not self._last_download_path.exists():
-            self._registry = {}
-            return
-        # Lecture du fichier JSON existant
-        with open(self._last_download_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        """Load the last-download registry from storage (empty if absent)."""
+        # Lecture du registre JSON existant (None si absent)
+        data = self._read_json(self._last_download_path) or {}
         self._registry = data.get(_REGISTRY_ROOT, {})
         # Logging
         logger.info(
@@ -579,27 +605,85 @@ class SDMXDownloader:
             f"{self._last_download_path}"
         )
 
-    # Méthode de sauvegarde atomique du registre des dates
+    # Méthode de sauvegarde du registre des dates
     def _save_registry(self) -> None:
-        """Persist the last-download registry atomically.
+        """Persist the last-download registry through the configured storage."""
+        self._write_json(
+            self._last_download_path,
+            {_REGISTRY_ROOT: self._registry},
+        )
 
-        Writes to a temporary file in the destination directory and renames it
-        over the target, so a crash never leaves a half-written registry.
+    # ──────────────────────────────────────────────────────────────────
+    # Accès au stockage des registres JSON (local ou S3)
+    # ──────────────────────────────────────────────────────────────────
+
+    # Méthode de lecture d'un registre JSON (local ou S3)
+    def _read_json(self, path: Path) -> Optional[Dict[str, Any]]:
+        """Read a JSON registry from local storage or S3.
+
+        Routing is driven by ``self._bucket``: when set, ``path`` is used as the
+        S3 object key (POSIX form); otherwise it is a local filesystem path. A
+        missing file/object is treated as "no registry yet" and returns
+        ``None`` rather than raising.
+
+        Args:
+            path: Registry path (local path or S3 key).
+
+        Returns:
+            The deserialised JSON mapping, or ``None`` when the registry does
+            not exist yet.
         """
-        path = self._last_download_path
+        # Cas S3 : l'absence d'objet se détecte via l'exception du client
+        if self._bucket is not None:
+            try:
+                return self._loader.load(path.as_posix(), bucket=self._bucket)
+            except ClientError:
+                # Objet inexistant (NoSuchKey/404) → registre vide
+                return None
+        # Cas local : court-circuit si le fichier n'existe pas encore
+        if not path.exists():
+            return None
+        return self._loader.load(str(path))
+
+    # Méthode d'écriture d'un registre JSON (local ou S3)
+    def _write_json(self, path: Path, obj: Any) -> None:
+        """Write a JSON registry to local storage or S3.
+
+        On S3 the object PUT is atomic, so the payload is written directly. On
+        the local filesystem the write is made atomic by writing to a temporary
+        file in the destination directory and renaming it over the target, so a
+        crash never leaves a half-written registry.
+
+        Args:
+            path: Registry path (local path or S3 key).
+            obj: JSON-serialisable object to persist.
+        """
+        # Cas S3 : écriture directe (PUT d'objet atomique)
+        if self._bucket is not None:
+            self._saver.save(
+                path.as_posix(),
+                obj,
+                bucket=self._bucket,
+                indent=2,
+                ensure_ascii=False,
+            )
+            return
+
+        # Cas local : écriture atomique via fichier temporaire + remplacement
         # Création du dossier parent si nécessaire
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Écriture dans un fichier temporaire puis remplacement atomique
-        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        # L'extension .json est nécessaire pour que Saver reconnaisse le format.
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".json")
+        # Fermeture immédiate du descripteur : Saver ouvre le fichier lui-même
+        os.close(fd)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(
-                    {_REGISTRY_ROOT: self._registry},
-                    f,
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            os.replace(tmp_name, path)
+            self._saver.save(
+                tmp_name,
+                obj,
+                indent=2,
+                ensure_ascii=False,
+            )
+            os.replace(tmp_name, str(path))
         except Exception:
             # Nettoyage du fichier temporaire en cas d'échec
             if os.path.exists(tmp_name):
@@ -623,6 +707,8 @@ def download_updates(
     fresh_registry: bool = False,
     max_runtime: Optional[timedelta] = timedelta(hours=23),
     categorical_threshold: Optional[int] = None,
+    bucket: Optional[str] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
 ) -> DownloadReport:
     """Run an incremental SDMX → DuckLake download.
 
@@ -642,6 +728,8 @@ def download_updates(
         fresh_registry=fresh_registry,
         max_runtime=max_runtime,
         categorical_threshold=categorical_threshold,
+        bucket=bucket,
+        storage_options=storage_options,
     )
     return downloader.run(queries)
 

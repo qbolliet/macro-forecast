@@ -307,6 +307,33 @@ class DataflowStructureRegistry:
         # Logging
         logger.info(f"Loaded {len(structures_data)} structures")
     
+    # Méthode de sérialisation du registre en dictionnaire
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialise the registry to a ``STRUCTURES``-keyed dictionary.
+
+        Symmetric counterpart of :meth:`load_from_dict`: the returned mapping
+        can be re-loaded as-is, which lets callers persist the registry through
+        any storage backend (local filesystem or S3) instead of the built-in
+        :meth:`save_to_file`.
+
+        Returns:
+            Dictionary with all registered structures under the ``STRUCTURES``
+            key.
+
+        Examples:
+            >>> registry = DataflowStructureRegistry()
+            >>> payload = registry.to_dict()
+            >>> sorted(payload)
+            ['STRUCTURES']
+        """
+        # Sérialisation de chaque structure enregistrée
+        return {
+            "STRUCTURES": [
+                structure.to_dict()
+                for structure in self._structures.values()
+            ]
+        }
+
     # Méthode de sauvegarde de structures sous la forme d'un fichier json
     def save_to_file(self, path: Union[str, Path]) -> None:
         """Save structures to JSON file.
