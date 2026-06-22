@@ -3,3 +3,5 @@
 from .datasets import *
 # Storage
 from .storage import *
+# Trade
+from .trade import *
