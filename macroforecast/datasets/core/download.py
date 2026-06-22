@@ -32,7 +32,7 @@ import duckdb
 import pandas as pd
 
 # Importation des modules de connexion
-from storage import Loader, Saver
+from macroforecast.storage import Loader, Saver
 
 from dt_ducklake_manager import (
     DatabaseUpdater,
