@@ -361,6 +361,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "boto3" },
     { name = "dt-ducklake-manager" },
+    { name = "narwhals" },
     { name = "pandas" },
     { name = "pyyaml" },
     { name = "requests" },
@@ -376,6 +377,7 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = ">=1.43.34" },
     { name = "dt-ducklake-manager", git = "https://github.com/qbolliet/dt-ducklake-manager?rev=v0.2.0" },
+    { name = "narwhals", specifier = ">=2.22.1" },
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "requests", specifier = ">=2.32.5" },
