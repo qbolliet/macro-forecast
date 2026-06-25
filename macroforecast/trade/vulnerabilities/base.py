@@ -2,7 +2,7 @@
 
 Defines the shared contract for trade-vulnerability metrics. Each metric scores
 the supply vulnerability of a good for a given
-``date × nomenclature × indicator × flow × reporter`` cell, looking at the link
+``date x nomenclature x indicator x flow x reporter`` cell, looking at the link
 between the reporter country and its trading partners.
 
 All metrics share a uniform, backend-agnostic API (narwhals) so that new metrics
@@ -12,14 +12,12 @@ metrics live in :mod:`macroforecast.trade.vulnerabilities.metrics`.
 """
 # Importation des modules
 from __future__ import annotations
-
+# Modules de base
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import ClassVar, Tuple
-
+# Module de manipulation de données
 import narwhals as nw
-
-__all__ = ["VulnerabilityConfig", "DEFAULT_CONFIG", "VulnerabilityMetric"]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -37,7 +35,7 @@ class VulnerabilityConfig:
 
     Attributes:
         key_columns: Columns identifying an output cell (the iteration grid),
-            i.e. ``date × nomenclature × indicator × flow × reporter`` plus
+            i.e. ``date x nomenclature x indicator x flow x reporter`` plus
             frequency. A metric returns exactly one value per distinct
             combination of these columns.
         partner_col: Column holding the partner country/aggregate code.

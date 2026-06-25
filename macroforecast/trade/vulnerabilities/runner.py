@@ -2,7 +2,7 @@
 
 Iterates the registered vulnerability metrics over an entire trade DuckLake
 catalog and writes the scores to a result DuckLake catalog — one column per
-metric, keyed by ``date × nomenclature × indicator × flow × reporter`` (plus
+metric, keyed by ``date x nomenclature x indicator x flow x reporter`` (plus
 frequency).
 
 The source fact table is read through a direct, read-only DuckDB ``ATTACH`` (the
@@ -12,22 +12,22 @@ upserted with the same ``DuckLakeTablesBuilder`` / ``DatabaseUpdater`` pattern a
 """
 # Importation des modules
 from __future__ import annotations
-
+# Modules de base
 from dataclasses import dataclass
 import logging
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
-
+# Modules de manipulation de données
 import duckdb
 import narwhals as nw
 import pandas as pd
-
+# Module de gestion de la connexion à la base de données
 from dt_ducklake_manager import (
     DatabaseUpdater,
     DuckLakeConnector,
     DuckLakeTablesBuilder,
 )
-
+# Modules du package
 from .base import DEFAULT_CONFIG, VulnerabilityConfig, VulnerabilityMetric
 from .metrics import default_metrics
 
@@ -36,8 +36,6 @@ logger = logging.getLogger(__name__)
 
 # Nom de la table de faits DuckLake (convention dt_ducklake_manager)
 _FACT_TABLE = "fact_table"
-
-__all__ = ["VulnerabilityReport", "compute_vulnerabilities", "run_vulnerabilities"]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -229,8 +227,12 @@ def _write_result(
                 use_transaction=True,
                 compact_after_update=True,
             )
+
+            # Vérification que l'opération s'est bien effectuée
             if not success:
                 raise ValueError("DatabaseUpdater reported failure for result table")
+            
+            # Logging
             logger.info(
                 f"Upserted {len(result_df)} rows into '{result_schema}'"
             )
@@ -244,6 +246,8 @@ def _write_result(
             schema=result_schema,
         )
         builder.build_schema()
+
+        # Logging
         logger.info(
             f"Created schema '{result_schema}' with {len(result_df)} rows "
             f"(primary keys: {list(primary_keys)})"

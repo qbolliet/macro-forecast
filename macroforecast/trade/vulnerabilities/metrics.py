@@ -1,7 +1,6 @@
-"""Concrete trade-vulnerability metrics.
+"""Trade-vulnerability metrics.
 
-Implements the three import-vulnerability measures defined in the project
-documentation (sections 1.1.1–1.1.3):
+Implements the three import-vulnerability measures :
 
 - :class:`HerfindahlHirschmanIndex` (HHI) — geographic concentration of sources.
 - :class:`ConcentrationDependencyIndex2` (CDI2) — extra-regional dependence.
@@ -12,20 +11,12 @@ API and are expressed in narwhals, so they run on any supported backend.
 """
 # Importation des modules
 from __future__ import annotations
-
+# Module de base
 from typing import ClassVar, List
-
+# Module de manipulation de données
 import narwhals as nw
-
+# Module du package
 from .base import DEFAULT_CONFIG, VulnerabilityConfig, VulnerabilityMetric
-
-__all__ = [
-    "HerfindahlHirschmanIndex",
-    "ConcentrationDependencyIndex2",
-    "ConcentrationDependencyIndex3",
-    "DEFAULT_METRIC_CLASSES",
-    "default_metrics",
-]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -34,7 +25,7 @@ __all__ = [
 
 # Indice de Herfindahl-Hirschman
 class HerfindahlHirschmanIndex(VulnerabilityMetric):
-    """Herfindahl-Hirschman index of geographic concentration (section 1.1.1).
+    """Herfindahl-Hirschman index of geographic concentration.
 
     Computes ``HHI = Σ sᵢ²`` where ``sᵢ`` is the share of partner *i* in the
     cell's total, taken as ``OBS_VALUE(partnerᵢ) / OBS_VALUE(WORLD)``. The sum
@@ -63,7 +54,9 @@ class HerfindahlHirschmanIndex(VulnerabilityMetric):
         Returns:
             Narwhals frame keyed by ``key_columns`` with an ``HHI`` column.
         """
+        # Extraction de la configuration
         cfg = self.config
+        # Extraction des colonnes de clés
         keys = list(cfg.key_columns)
 
         # Valeur totale (WORLD) par cellule, servant de dénominateur des parts
@@ -91,7 +84,7 @@ class HerfindahlHirschmanIndex(VulnerabilityMetric):
 
 # Indice de dépendance extra-régionale
 class ConcentrationDependencyIndex2(VulnerabilityMetric):
-    """Extra-regional import-dependence index CDI2 (section 1.1.2).
+    """Extra-regional import-dependence index CDI2.
 
     ``CDI2 = value(extra-EU imports) / value(total imports)`` per cell, using
     the extra-EU and WORLD partner aggregates. A value above 0.5 means more than
@@ -116,7 +109,9 @@ class ConcentrationDependencyIndex2(VulnerabilityMetric):
             Narwhals frame keyed by ``key_columns`` (import flow only) with a
             ``CDI2`` column.
         """
+        # Extration de la configuration
         cfg = self.config
+        # Extraction des colonnes de clés
         keys = list(cfg.key_columns)
 
         # Restriction au flux d'importation
@@ -139,7 +134,7 @@ class ConcentrationDependencyIndex2(VulnerabilityMetric):
 
 # Indice de substituabilité domestique
 class ConcentrationDependencyIndex3(VulnerabilityMetric):
-    """Domestic-substitutability index CDI3 (section 1.1.3).
+    """Domestic-substitutability index CDI3.
 
     ``CDI3 = value(extra-EU imports) / value(total exports)``. The numerator is
     the extra-EU partner aggregate on the import flow; the denominator is the
@@ -166,7 +161,9 @@ class ConcentrationDependencyIndex3(VulnerabilityMetric):
             Narwhals frame keyed by ``key_columns`` (import flow only) with a
             ``CDI3`` column.
         """
+        # Extraction de la configuration
         cfg = self.config
+        # Extraction des colonnes de clés
         keys = list(cfg.key_columns)
         # Clés de jointure cross-flux : toutes les clés sauf le flux
         join_keys = [k for k in keys if k != cfg.flow_col]
