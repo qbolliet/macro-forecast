@@ -80,9 +80,30 @@ def compute_vulnerabilities(
 
     Returns:
         Narwhals frame with ``config.key_columns`` plus one column per metric.
+
+    Raises:
+        ValueError: If the input frame is missing any column required by one of
+            the metrics (see :meth:`VulnerabilityMetric.required_columns`).
     """
     # Clés de la grille de sortie
     keys = list(config.key_columns)
+
+    # Validation de schéma (fail-fast) : union des colonnes exigées par les métriques,
+    # confrontée aux colonnes disponibles
+    available = set(data.columns)
+    required = set().union(*(metric.required_columns() for metric in metrics))
+    missing = required - available
+    if missing:
+        # Métriques concernées par au moins une colonne manquante
+        culprits = sorted(
+            metric.name
+            for metric in metrics
+            if metric.required_columns() & missing
+        )
+        raise ValueError(
+            f"Missing required column(s) {sorted(missing)} for metric(s) "
+            f"{culprits}. Available columns: {sorted(available)}."
+        )
 
     # Suppression des observations inexploitables (partenaire ou valeur nuls) :
     # un partenaire nul fausse les masques booléens du filtre des pays individuels.
@@ -127,6 +148,15 @@ def _read_source_fact_table(
 ) -> pd.DataFrame:
     """Read selected columns of a DuckLake fact table, read-only.
 
+    Deliberately uses a hand-rolled ``ATTACH`` rather than ``DuckLakeConnector``:
+    ``DuckLakeConnector.connect()`` fails to re-attach an existing catalog under
+    Windows/OneDrive (the catalog stores a normalised ``DATA_PATH`` — lowercase
+    drive, forward slashes — that the connector's raw ``str(Path)`` does not
+    match), and the connector exposes no ``OVERRIDE_DATA_PATH`` option. The
+    direct read-only ``ATTACH`` with ``OVERRIDE_DATA_PATH true`` is the assumed
+    workaround. (If a future ``dt-ducklake-manager`` release adds an
+    ``override_data_path`` option, switch this read to ``DuckLakeConnector``.)
+
     Args:
         source_catalog: Path to the source ``.ducklake`` catalog file.
         source_data_path: Directory of the source Parquet data files.
@@ -141,7 +171,8 @@ def _read_source_fact_table(
     try:
         conn.execute("INSTALL ducklake; LOAD ducklake;")
         # Attachement en lecture seule ; OVERRIDE_DATA_PATH tolère un chemin de
-        # données déplacé/normalisé différemment de celui stocké dans le catalogue.
+        # données déplacé/normalisé différemment de celui stocké dans le catalogue
+        # (contournement du mismatch DATA_PATH sous Windows/OneDrive).
         conn.execute(
             f"ATTACH 'ducklake:{_sql_path(source_catalog)}' AS src "
             f"(DATA_PATH '{_sql_path(source_data_path)}/', READ_ONLY, "
@@ -182,7 +213,7 @@ def _fact_table_exists(
 
 # Fonction d'écriture du résultat dans le catalogue DuckLake (création ou upsert)
 def _write_result(
-    result_df: pd.DataFrame,
+    result: nw.DataFrame,
     primary_keys: Sequence[str],
     result_catalog: Union[str, Path],
     result_data_path: Union[str, Path],
@@ -191,10 +222,12 @@ def _write_result(
     """Create or upsert the result table into the result DuckLake catalog.
 
     Mirrors :meth:`macroforecast.datasets.core.download.SDMXDownloader._write_dataframe`:
-    builds the schema on first encounter, upserts by primary key afterwards.
+    builds the schema on first encounter, upserts by primary key afterwards. The
+    narwhals frame is passed straight to ``DuckLakeTablesBuilder`` /
+    ``DatabaseUpdater``
 
     Args:
-        result_df: Result DataFrame (grid keys + one column per metric).
+        result: Result narwhals frame (grid keys + one column per metric).
         primary_keys: Primary-key columns (the grid keys).
         result_catalog: Path to the result ``.ducklake`` catalog file.
         result_data_path: Directory for the result Parquet data files.
@@ -223,7 +256,7 @@ def _write_result(
                 schema=result_schema,
             )
             success = updater.update_database(
-                result_df,
+                result,
                 use_transaction=True,
                 compact_after_update=True,
             )
@@ -231,15 +264,15 @@ def _write_result(
             # Vérification que l'opération s'est bien effectuée
             if not success:
                 raise ValueError("DatabaseUpdater reported failure for result table")
-            
+
             # Logging
             logger.info(
-                f"Upserted {len(result_df)} rows into '{result_schema}'"
+                f"Upserted {len(result)} rows into '{result_schema}'"
             )
             return False
         # Première construction : métadonnées + fact table
         builder = DuckLakeTablesBuilder(
-            result_df,
+            result,
             categorical_threshold=None,
             primary_keys=list(primary_keys),
             connection=conn,
@@ -249,7 +282,7 @@ def _write_result(
 
         # Logging
         logger.info(
-            f"Created schema '{result_schema}' with {len(result_df)} rows "
+            f"Created schema '{result_schema}' with {len(result)} rows "
             f"(primary keys: {list(primary_keys)})"
         )
         return True
@@ -327,14 +360,11 @@ def run_vulnerabilities(
     data = nw.from_native(native, eager_only=True)
     result = compute_vulnerabilities(data, metric_list, config)
 
-    # Retour en pandas pour l'écriture DuckLake
-    result_pdf = nw.to_native(result)
-    if not isinstance(result_pdf, pd.DataFrame):
-        result_pdf = result.to_pandas()
-
-    # Écriture dans le catalogue résultat
+    # Écriture dans le catalogue résultat : le frame narwhals est passé tel quel,
+    # builder/updater de dt_ducklake_manager acceptant IntoDataFrame (aucune
+    # reconversion pandas nécessaire).
     created = _write_result(
-        result_pdf,
+        result,
         config.key_columns,
         result_catalog,
         result_data_path,
@@ -342,7 +372,7 @@ def run_vulnerabilities(
     )
 
     return VulnerabilityReport(
-        cells=len(result_pdf),
+        cells=len(result),
         metrics=[m.name for m in metric_list],
         created=created,
     )

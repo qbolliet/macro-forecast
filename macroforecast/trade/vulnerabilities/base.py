@@ -15,7 +15,7 @@ from __future__ import annotations
 # Modules de base
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar, Tuple
+from typing import ClassVar, Set, Tuple
 # Module de manipulation de données
 import narwhals as nw
 
@@ -129,6 +129,26 @@ class VulnerabilityMetric(ABC):
             additional column named :attr:`name`, holding one value per cell.
         """
         raise NotImplementedError
+
+    # Méthode déclarant les colonnes d'entrée requises par la métrique
+    def required_columns(self) -> Set[str]:
+        """Return the input columns the metric needs to be computable.
+
+        Derived from :attr:`config`: the output-grid keys plus the partner,
+        value and flow columns. Overridable so that a custom metric requiring an
+        extra column can extend the set; the runner validates the union of every
+        metric's requirements against the source frame before computing, turning
+        a missing column into a clear error instead of a deep narwhals failure.
+
+        Returns:
+            Set of column names that must be present in the input frame.
+        """
+        # Colonnes dérivées des conventions de configuration
+        return set(self.config.key_columns) | {
+            self.config.partner_col,
+            self.config.value_col,
+            self.config.flow_col,
+        }
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers narwhals partagés
