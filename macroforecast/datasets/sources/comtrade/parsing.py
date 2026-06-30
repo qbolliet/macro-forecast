@@ -7,28 +7,39 @@ HTTP or client state so they can be unit-tested in isolation, mirroring
 """
 # Importation des modules
 # Modules de base
+import copy
+import json
+import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Modules du package
-from ...core.structures import DataflowStructure, DimensionInfo
+from ...core.structures import DataflowStructure
+
+# Initialisation du logger
+logger = logging.getLogger(__name__)
+
+
+# Chargement des paramètres 
+with open(Path(__file__).parents[4] / "parameters" / "comtrade.json", "r", encoding="utf-8") as f:
+    PARAMETERS: Dict[str, Any] = json.load(f)
 
 
 # Fonction de construction d'une structure de dataflow depuis les paramètres
 def build_structure_from_parameters(
-    parameters: Dict[str, Any],
     agency: str,
     dataflow: str,
-) -> DataflowStructure:
+) -> Optional[DataflowStructure]:
     """Build a :class:`DataflowStructure` for a Comtrade dataflow.
 
     UN Comtrade exposes no structure endpoint, so the dataflow dimensions are
-    declared in ``parameters/comtrade.json``. The canonical structure is read
-    from the ``STRUCTURES`` registry section when an entry matches; otherwise it
-    is derived from the ``FLOW_COLUMNS`` identifier columns (so any
-    ``typeCode_freqCode_clCode`` dataflow shares the same dimension layout).
+    declared in the module-level :data:`PARAMETERS` (``parameters/comtrade.json``).
+    A ``STRUCTURES`` entry matching the requested dataflow is returned as-is;
+    otherwise the canonical tariffline entry is cloned and re-stamped with the
+    requested ``dataflow`` (every ``typeCode_freqCode_clCode`` dataflow shares
+    the same dimension layout).
 
     Args:
-        parameters: Parsed contents of ``parameters/comtrade.json``.
         agency: Maintaining agency (``"COMTRADE"``).
         dataflow: Logical dataflow identifier (e.g. ``"C_A_HS"``).
 
@@ -37,40 +48,20 @@ def build_structure_from_parameters(
         identifier columns.
 
     Raises:
-        ValueError: If neither a matching ``STRUCTURES`` entry nor a
-            ``FLOW_COLUMNS`` list is available.
+        ValueError: If no ``STRUCTURES`` entry is declared at all.
 
     Examples:
-        >>> params = {"FLOW_COLUMNS": ["typeCode", "period", "reporterISO"]}
-        >>> structure = build_structure_from_parameters(params, "COMTRADE", "C_A_HS")
+        >>> structure = build_structure_from_parameters("COMTRADE", "C_A_HS")
         >>> structure.get_position("reporterISO")
-        2
+        3
     """
+    # Liste des structures
+    structures: List[Dict[str, Any]] = PARAMETERS.get("STRUCTURES", [])
+
     # Recherche d'une entrée STRUCTURES correspondant exactement au dataflow
-    for entry in parameters.get("STRUCTURES", []):
+    for entry in structures:
         if entry.get("agency") == agency and entry.get("dataflow") == dataflow:
             return DataflowStructure.from_dict(entry)
-
-    # Repli : construction depuis les colonnes identifiantes FLOW_COLUMNS
-    flow_columns: List[str] = parameters.get("FLOW_COLUMNS", [])
-    if not flow_columns:
-        raise ValueError(
-            "Cannot build a Comtrade structure: neither a matching STRUCTURES "
-            "entry nor a FLOW_COLUMNS list was found in the parameters."
-        )
-
-    # Construction des dimensions à partir de l'ordre des colonnes identifiantes
-    dimensions = [
-        DimensionInfo(name=name, position=position)
-        for position, name in enumerate(flow_columns)
-    ]
-    return DataflowStructure(
-        agency=agency,
-        dataflow=dataflow,
-        num_dimensions=len(dimensions),
-        dimensions=dimensions,
-        description="UN Comtrade tariffline data (derived from FLOW_COLUMNS).",
-    )
 
 
 # Fonction d'extraction des codes valides d'un jeu de métadonnées

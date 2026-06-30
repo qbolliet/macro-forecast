@@ -38,10 +38,17 @@ class ComtradeQueryRequest(SDMXQueryRequest):
         partners: Partner country codes.
         partners2: Second partner / consignment codes.
         products: Commodity codes (HS).
+        customs: Customs procedure codes.
+        mot: Mode-of-transport codes.
         periods: Explicit periods (``YYYY`` or ``YYYYMM``).
         period_start: Start period (used when ``periods`` is not given).
         period_end: End period (used when ``periods`` is not given).
+        type_code: Trade type (``"C"`` commodities or ``"S"`` services).
+        classification: Classification code (``"HS"``, ``"SITC"``, …).
         frequency: Data frequency (``"annual"`` or ``"monthly"``).
+        max_records: Maximum number of records returned per call.
+        count_only: When ``True``, return only the record count.
+        include_desc: Whether to include the variables' descriptions.
         format: Response format (default: JSON).
 
     Example:
@@ -63,10 +70,18 @@ class ComtradeQueryRequest(SDMXQueryRequest):
     partners: Optional[Union[List[str], List[int], str, int]] = None
     partners2: Optional[Union[List[str], List[int], str, int]] = None
     products: Optional[Union[List[str], List[int], str, int]] = None
+    customs: Optional[Union[List[str], str]] = None
+    mot: Optional[Union[List[str], str]] = None
     periods: Optional[Union[List[str], str]] = None
     period_start: Optional[str] = None
     period_end: Optional[str] = None
+    # Paramètres de requête ancrés (défauts intelligents alignés sur get_data)
+    type_code: str = "C"
+    classification: str = "HS"
     frequency: str = "annual"
+    max_records: Optional[int] = None
+    count_only: Optional[bool] = None
+    include_desc: bool = True
     format: ComtradeResponseFormat = ComtradeResponseFormat.JSON
 
     # Enum de format du provider (utilisé par SDMXQueryRequest.from_dict)
@@ -113,10 +128,17 @@ class ComtradeQueryRequest(SDMXQueryRequest):
             "partners": self.partners,
             "partners2": self.partners2,
             "products": self.products,
+            "customs": self.customs,
+            "mot": self.mot,
             "periods": self.periods,
             "period_start": self.period_start,
             "period_end": self.period_end,
+            "type_code": self.type_code,
+            "classification": self.classification,
             "frequency": self.frequency,
+            "max_records": self.max_records,
+            "count_only": self.count_only,
+            "include_desc": self.include_desc,
         }
         # Retrait des champs non renseignés pour une clé stable et compacte
         dimensions = {k: v for k, v in dimensions.items() if v is not None}

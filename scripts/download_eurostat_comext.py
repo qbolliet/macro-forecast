@@ -113,10 +113,18 @@ def build_split_queries(
         True
     """
     from macroforecast.datasets import EurostatQueryRequestV30
-    from macroforecast.datasets.utils import filter_codes, load_split_filters
+    from macroforecast.datasets.utils import (
+        filter_codes,
+        load_dataflow_parameters,
+        load_split_filters,
+    )
 
     if fixed_dims is None:
-        fixed_dims = {
+        # Dimensions ancrées lues depuis le YAML (source unique) ; repli sur les
+        # dimensions standard DS-045409 si la section est absente
+        fixed_dims = load_dataflow_parameters(
+            config_path, dataflow, section="fixed_dims"
+        ) or {
             "freq": "A",
             "partner": "*",
             "flow": ["1", "2"],                                     # Les flux (import, export)

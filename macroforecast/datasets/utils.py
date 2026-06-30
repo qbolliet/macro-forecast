@@ -193,3 +193,39 @@ def load_split_filters(config_path: str, dataflow: str) -> Dict[str, Dict[str, A
             f"No split_filters entry for dataflow '{dataflow}' in {config_path}"
         )
     return split_filters[dataflow]
+
+
+# Fonction de chargement des paramètres ancrés d'un dataflow
+def load_dataflow_parameters(
+    config_path: str, dataflow: str, section: str = "parameters"
+) -> Dict[str, Any]:
+    """Load the anchored (hard-coded) parameters of a dataflow from a YAML config.
+
+    Reads a configuration file shaped like ``config/datasets/comtrade.yaml`` (or
+    ``eurostat.yaml``) and returns the per-dataflow block of a given section
+    (e.g. ``parameters`` for Comtrade, ``fixed_dims`` for Eurostat) holding the
+    request parameters that used to be hard-coded in the download scripts
+    (frequency, flows, fixed dimensions…).
+
+    Args:
+        config_path: Path to the YAML configuration file.
+        dataflow: Dataflow identifier (e.g. ``"C_A_HS"`` or ``"DS-045409"``).
+        section: Top-level section to read (default ``"parameters"``).
+
+    Returns:
+        Mapping of parameter name to value for the dataflow, or ``{}`` when the
+        section or the dataflow entry is absent.
+
+    Examples:
+        >>> params = load_dataflow_parameters(
+        ...     "config/datasets/comtrade.yaml", "C_A_HS"
+        ... )  # doctest: +SKIP
+        >>> params["frequency"]  # doctest: +SKIP
+        'annual'
+    """
+    # Lecture du fichier YAML (motif identique à load_split_filters)
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    # Extraction du bloc de la section pour le dataflow demandé
+    return config.get(section, {}).get(dataflow, {})

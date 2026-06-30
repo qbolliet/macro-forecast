@@ -34,6 +34,20 @@ code_groups:
     - ES
     - SE
 
+# Dimensions ancrées en dur par dataflow (partagées par toutes les requêtes
+# scindées). Source unique consommée par scripts/download_eurostat_comext.py.
+fixed_dims:
+  # Commerce international Comext
+  DS-045409:
+    freq: "A"
+    partner: "*"
+    flow:                       # Les flux (import, export)
+      - "1"
+      - "2"
+    indicators:                 # Masse et valeur
+      - QUANTITY_IN_100KG
+      - VALUE_IN_EUROS
+
 # Filtres de codes par dataflow et par dimension scindée
 split_filters:
   # Commerce international Comext

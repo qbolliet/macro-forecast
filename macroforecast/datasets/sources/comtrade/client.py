@@ -22,7 +22,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, TYPE_CHECKING, Union
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 # Module de l'API UN Comtrade
 import comtradeapicall
@@ -36,13 +36,11 @@ from ...core.structures import DataflowStructure, DataflowStructureRegistry
 from . import parsing
 from .formats import (
     AGENCY_ID,
-    EXPORT_FLOW_CODES,
-    EXPORT_TO_IMPORT_CODE,
-    EXPORT_TO_IMPORT_DESC,
-    IMPORT_FLOW_CODES,
-    IMPORT_TO_EXPORT_CODE,
-    IMPORT_TO_EXPORT_DESC,
+    DIMENSIONS,
+    SUBDIVISION_ORDER,
     VALID_FREQUENCIES,
+    api_arg_for,
+    category_for,
 )
 
 if TYPE_CHECKING:
@@ -50,6 +48,11 @@ if TYPE_CHECKING:
 
 # Initialisation du logger
 logger = logging.getLogger(__name__)
+
+
+# Chargement des paramètres 
+with open(Path(__file__).parents[4] / "parameters" / "comtrade.json", "r", encoding="utf-8") as f:
+    PARAMETERS: Dict[str, Any] = json.load(f)
 
 
 # Classe de récupération des données de commerce international du UN Comtrade
@@ -66,6 +69,7 @@ class ComtradeClient(APIClient):
         timeout: Request timeout in seconds.
         subscription_key: Comtrade subscription key. Falls back to the
             ``COMTRADE_SUBSCRIPTION_KEY`` environment variable when ``None``.
+        proxy: Proxy to use through the comtradeapicall API.
         structure_registry: Optional registry for dataflow structures. When
             ``None`` a new registry is created and populated from the
             ``STRUCTURES`` section of ``parameters/comtrade.json``.
@@ -101,6 +105,7 @@ class ComtradeClient(APIClient):
         base_url: str = DEFAULT_BASE_URL,
         timeout: int = 120,
         subscription_key: Optional[str] = None,
+        proxy: Optional[str] = None,
         structure_registry: Optional[DataflowStructureRegistry] = None,
         rate_limiter: Optional[Union[RateLimiter, CompositeRateLimiter]] = None,
         auto_load_rate_limit: bool = True,
@@ -115,15 +120,15 @@ class ComtradeClient(APIClient):
             backoff_factor=backoff_factor,
         )
 
-        # Chargement des paramètres consolidés (rate limit, limites, structures)
-        self._parameters = self._load_parameters()
-
         # Clé de souscription (argument ou variable d'environnement)
         self.subscription_key = (
             subscription_key
             if subscription_key is not None
             else os.getenv("COMTRADE_SUBSCRIPTION_KEY")
         )
+
+        # Proxy optionnel (hôte:port) propagé à comtradeapicall
+        self.proxy = proxy
 
         # Rate limiter (argument ou chargement automatique depuis la configuration)
         if auto_load_rate_limit and rate_limiter is None:
@@ -132,13 +137,13 @@ class ComtradeClient(APIClient):
             rate_limiter
         )
 
-        # Registre des structures (argument ou construction + chargement des paramètres)
+        # Registre des structures (argument ou construction depuis les paramètres)
         if structure_registry is not None:
             self.structure_registry = structure_registry
         else:
             self.structure_registry = DataflowStructureRegistry()
             # Chargement des structures déclarées (pas d'endpoint de structure côté API)
-            self.structure_registry.load_from_dict(self._parameters)
+            self.structure_registry.load_from_dict(PARAMETERS)
 
         # Compteur d'appels API (à des fins de logging uniquement ; le quota est
         # garanti par le rate limiter)
@@ -147,29 +152,6 @@ class ComtradeClient(APIClient):
     # ──────────────────────────────────────────────────────────────────
     # Chargement de la configuration
     # ──────────────────────────────────────────────────────────────────
-
-    # Méthode de chargement du fichier de paramètres consolidé
-    def _load_parameters(self) -> dict:
-        """Load ``parameters/comtrade.json`` (rate limit, limits, structures).
-
-        Returns:
-            Parsed configuration dictionary (empty dict when the file is
-            missing or unreadable).
-        """
-        # Construction du chemin vers parameters/comtrade.json (racine du repo)
-        params_path = (
-            Path(__file__).parents[4]
-            / "parameters"
-            / f"{self.PROVIDER_CONFIG_NAME}.json"
-        )
-        try:
-            # Lecture et parsing du fichier de configuration
-            with open(params_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            # Échec non bloquant : configuration vide par défaut
-            logger.warning(f"Could not load {params_path}: {e}")
-            return {}
 
     # Méthode de chargement du rate limiter depuis la configuration
     def _load_rate_limiter(
@@ -185,7 +167,7 @@ class ComtradeClient(APIClient):
             A rate limiter, or ``None`` when no configuration is found.
         """
         # Extraction de la section RATE_LIMIT
-        config = self._parameters.get("RATE_LIMIT")
+        config = PARAMETERS.get("RATE_LIMIT")
         if config is None:
             logger.debug("No RATE_LIMIT configuration found")
             return None
@@ -299,35 +281,52 @@ class ComtradeClient(APIClient):
     # Récupération des données tariffline
     # ──────────────────────────────────────────────────────────────────
 
+    # Méthode auxiliaire indiquant si une dimension peut être subdivisée
+    def _can_subdivide(self, name: str, value: Union[str, None]) -> bool:
+        """Tell whether a flow dimension can be split into smaller requests.
+
+        A dimension is divisible when it carries several explicit values, or
+        when it is unset (``None``) but its valid codes can be enumerated (its
+        :data:`DIMENSIONS` ``category`` is not ``None``). Dimensions that are
+        unset and cannot be enumerated (e.g. ``periods``, ``customs``, ``mot``)
+        are not candidates.
+
+        Args:
+            name: Friendly dimension name (a key of :data:`DIMENSIONS`).
+            value: Current value of the dimension (comma-separated or ``None``).
+
+        Returns:
+            ``True`` if the dimension can be subdivided, ``False`` otherwise.
+        """
+        # Valeur non divisible (un seul item)
+        if not self._validate_subdivision(subdivision=value):
+            return False
+        # Valeur absente non énumérable (pas de catégorie de métadonnées)
+        if value is None and category_for(name) is None:
+            return False
+        return True
+
     # Méthode auxiliaire de subdivision récursive d'une requête
     def _divide_request(
         self,
         subdivision: str,
-        flows: Optional[Union[List[str], str, None]] = ["M", "X"],
-        products: Optional[Union[List[int], List[str], int, str, None]] = None,
-        reporters: Optional[Union[List[int], List[str], int, str, None]] = None,
-        partners: Optional[Union[List[int], List[str], int, str, None]] = None,
-        partners2: Optional[Union[List[int], List[str], int, str, None]] = None,
-        periods: Optional[Union[List[str], str, None]] = None,
-        frequency: Optional[str] = None,
-    ) -> pd.DataFrame:
+        selection: Dict[str, Union[str, None]],
+        fixed: Dict[str, object],
+    ) -> Tuple[pd.DataFrame, dict]:
         """Divide a request that exceeds the per-call record limit.
 
         Splits the requested values of ``subdivision`` into two halves and
         re-issues two recursive :meth:`get_data` calls, concatenating the
-        results.
+        results. Generic over every flow-defining dimension declared in
+        :data:`DIMENSIONS`.
 
         Args:
-            subdivision: Dimension to split (``'flows'``, ``'products'``,
-                ``'reporters'``, ``'partners'``, ``'partners2'`` or
-                ``'periods'``).
-            flows: Trade flow codes.
-            products: Product codes.
-            reporters: Reporter codes.
-            partners: Partner codes.
-            partners2: Secondary partner codes.
-            periods: Time periods.
-            frequency: Data frequency (``'monthly'`` or ``'annual'``).
+            subdivision: Friendly dimension to split (a key of
+                :data:`DIMENSIONS`).
+            selection: Current values of the flow dimensions (friendly name →
+                comma-separated value or ``None``).
+            fixed: Non-dimensional parameters shared by both halves
+                (``type_code``, ``classification``, ``frequency``, …).
 
         Returns:
             Tuple ``(DataFrame, request_metadata)`` combining both halves.
@@ -337,74 +336,56 @@ class ComtradeClient(APIClient):
                 further.
         """
         # Vérification de la validité de la subdivision
-        if subdivision not in [
-            "flows",
-            "products",
-            "reporters",
-            "partners",
-            "partners2",
-            "periods",
-        ]:
+        if subdivision not in DIMENSIONS:
             raise ValueError(
-                f"Invalid subdivision : {subdivision}. Should be in ['flows', "
-                "'products', 'reporters', 'partners', 'partners2', 'periods']"
+                f"Invalid subdivision : {subdivision}. "
+                f"Should be one of {list(DIMENSIONS)}"
             )
 
         # Extraction des items sur lesquels effectuer la subdivision
-        items = locals()[subdivision]
-
-        # Validation de la subdivision
-        if self._validate_subdivision(subdivision=items):
-            # Si None, requête des valeurs valides (sauf pour les périodes)
-            if (items is None) & (subdivision == "periods"):
-                raise ValueError("Unable to request the valid values for 'periods'")
-            elif items is None:
-                # Requête des options valides
-                list_items = self._extract_codes(
-                    category=self._parameters["SUBDIVISION_METADATA"][subdivision]
-                )
-            else:
-                list_items = items.split(",")
-            # Construction des deux sous-listes
-            list_items1, list_items2 = (
-                list_items[: (len(list_items) // 2)],
-                list_items[(len(list_items) // 2):],
-            )
-            # Requête récursive sur la première sous-liste
-            df1, request_metadata1 = self.get_data(
-                flows=list_items1 if subdivision == "flows" else flows,
-                products=list_items1 if subdivision == "products" else products,
-                reporters=list_items1 if subdivision == "reporters" else reporters,
-                partners=list_items1 if subdivision == "partners" else partners,
-                partners2=list_items1 if subdivision == "partners2" else partners2,
-                periods=list_items1 if subdivision == "periods" else periods,
-                frequency=frequency,
-            )
-            # Requête récursive sur la seconde sous-liste
-            df2, request_metadata2 = self.get_data(
-                flows=list_items2 if subdivision == "flows" else flows,
-                products=list_items2 if subdivision == "products" else products,
-                reporters=list_items2 if subdivision == "reporters" else reporters,
-                partners=list_items2 if subdivision == "partners" else partners,
-                partners2=list_items2 if subdivision == "partners2" else partners2,
-                periods=list_items2 if subdivision == "periods" else periods,
-                frequency=frequency,
-            )
-            # Concaténation des jeux de données
-            df = pd.concat([df1, df2], axis=0, ignore_index=True)
-            # Concaténation des métadonnées (mêmes clés dans les deux dictionnaires)
-            request_metadata = {
-                k: f"{request_metadata1[k]},{request_metadata2[k]}"
-                for k in request_metadata1.keys()
-            }
-            return df, request_metadata
-        else:
+        items = selection.get(subdivision)
+        if not self._validate_subdivision(subdivision=items):
             raise ValueError(
-                "Unable to further truncate the request with parameters : "
-                f"'flows' : {flows}, 'products' : {products}, "
-                f"'reporters' : {reporters}, 'partners' : {partners}, "
-                f"'partners2' : {partners2}, 'periods' : {periods}"
+                f"Unable to further truncate the request with selection : {selection}"
             )
+
+        # Si None, requête des valeurs valides via la catégorie de métadonnées
+        if items is None:
+            category = category_for(subdivision)
+            if category is None:
+                raise ValueError(
+                    f"Unable to request the valid values for '{subdivision}'"
+                )
+            list_items = self._extract_codes(category=category)
+        else:
+            list_items = items.split(",")
+
+        # Construction des deux sous-listes
+        mid = len(list_items) // 2
+        list_items1, list_items2 = list_items[:mid], list_items[mid:]
+
+        # Requêtes récursives sur chaque sous-liste (la dimension scindée est
+        # surchargée, les autres paramètres sont propagés tels quels)
+        df1, request_metadata1 = self.get_data(
+            **{**fixed, **selection, subdivision: list_items1}
+        )
+        df2, request_metadata2 = self.get_data(
+            **{**fixed, **selection, subdivision: list_items2}
+        )
+
+        # Concaténation des jeux de données
+        df = pd.concat([df1, df2], axis=0, ignore_index=True)
+        # Concaténation des métadonnées : seules les dimensions scindées sont
+        # accolées, les paramètres fixes restent identiques
+        request_metadata = {
+            k: (
+                f"{request_metadata1[k]},{request_metadata2[k]}"
+                if k in DIMENSIONS
+                else request_metadata1[k]
+            )
+            for k in request_metadata1.keys()
+        }
+        return df, request_metadata
 
     # Méthode principale de récupération des données tariffline
     def get_data(
@@ -414,17 +395,27 @@ class ComtradeClient(APIClient):
         reporters: Optional[Union[List[int], List[str], int, str, None]] = None,
         partners: Optional[Union[List[int], List[str], int, str, None]] = None,
         partners2: Optional[Union[List[int], List[str], int, str, None]] = None,
+        customs: Optional[Union[List[str], str, None]] = None,
+        mot: Optional[Union[List[str], str, None]] = None,
         periods: Optional[Union[List[str], str, None]] = None,
         period_start: Optional[Union[str, None]] = None,
         period_end: Optional[Union[str, None]] = None,
-        frequency: Optional[str] = "monthly",
-    ) -> pd.DataFrame:
+        type_code: str = "C",
+        classification: str = "HS",
+        frequency: str = "annual",
+        max_records: Optional[int] = None,
+        format_output: str = "JSON",
+        count_only: Optional[bool] = None,
+        include_desc: bool = True,
+    ) -> Tuple[pd.DataFrame, dict]:
         """Fetch tariffline data from UN Comtrade.
 
-        Issues a single ``comtradeapicall`` request and, when the response hits
-        the per-call record limit (``LIMIT``), recursively subdivides it (by
-        flow, product, reporter, partner, partner2 or period) until each chunk
-        fits.
+        Issues a single ``comtradeapicall._getTarifflineData`` request and, when
+        the response hits the per-call record limit (``LIMIT``), recursively
+        subdivides it over any flow-defining dimension declared in
+        :data:`DIMENSIONS` until each chunk fits. All ``_getTarifflineData``
+        arguments are exposed (with sensible defaults) so callers are not boxed
+        into a narrow set of requests.
 
         Args:
             flows: Trade flow codes (e.g. ``["M", "X"]``).
@@ -432,10 +423,18 @@ class ComtradeClient(APIClient):
             reporters: Reporter country codes.
             partners: Partner country codes.
             partners2: Secondary partner codes.
+            customs: Customs procedure codes.
+            mot: Mode-of-transport codes.
             periods: Explicit periods (``YYYY`` or ``YYYYMM``).
             period_start: Start period (used when ``periods`` is omitted).
             period_end: End period (used when ``periods`` is omitted).
+            type_code: Trade type (``"C"`` commodities or ``"S"`` services).
+            classification: Classification code (``"HS"``, ``"SITC"``, …).
             frequency: Data frequency (``'monthly'`` or ``'annual'``).
+            max_records: Maximum number of records returned per call.
+            format_output: Response format (``"JSON"`` or ``"CSV"``).
+            count_only: When ``True``, return only the record count.
+            include_desc: Whether to include the variables' descriptions.
 
         Returns:
             Tuple ``(DataFrame, request_metadata)`` where ``request_metadata``
@@ -443,6 +442,9 @@ class ComtradeClient(APIClient):
 
         Raises:
             ValueError: If ``frequency`` is invalid.
+            RateLimitExceeded: Propagated from the rate limiter when the daily
+                quota is exhausted (a partially subdivided request is therefore
+                never recorded).
 
         Examples:
             >>> df, meta = client.get_data(
@@ -483,108 +485,85 @@ class ComtradeClient(APIClient):
                 .tolist()
             )
 
-        # Preprocessing des flux et des codes (pays, produits)
-        flows = self._preprocess_codes(codes=flows)
-        reporters = self._preprocess_codes(codes=reporters)
-        partners = self._preprocess_codes(codes=partners)
-        partners2 = self._preprocess_codes(codes=partners2)
-        products = self._preprocess_codes(codes=products)
+        # Preprocessing des flux et des codes (pays, produits, douane, transport)
+        selection: Dict[str, Union[str, None]] = {
+            "flows": self._preprocess_codes(codes=flows),
+            "products": self._preprocess_codes(codes=products),
+            "reporters": self._preprocess_codes(codes=reporters),
+            "partners": self._preprocess_codes(codes=partners),
+            "partners2": self._preprocess_codes(codes=partners2),
+            "customs": self._preprocess_codes(codes=customs),
+            "mot": self._preprocess_codes(codes=mot),
+            "periods": periods,
+        }
+
+        # Paramètres non dimensionnels propagés aux sous-requêtes (périodes déjà
+        # résolues : period_start/period_end neutralisés pour éviter la ré-expansion)
+        fixed: Dict[str, object] = {
+            "type_code": type_code,
+            "classification": classification,
+            "frequency": frequency,
+            "period_start": None,
+            "period_end": None,
+            "max_records": max_records,
+            "format_output": format_output,
+            "count_only": count_only,
+            "include_desc": include_desc,
+        }
 
         # Application du rate limiter avant l'appel API
         self._acquire()
 
+        # Traduction des noms conviviaux vers les arguments de _getTarifflineData
+        api_kwargs = {api_arg_for(name): value for name, value in selection.items()}
+
         # Requête des données tariffline via la lib officielle
         df = comtradeapicall._getTarifflineData(
             self.subscription_key,
-            typeCode="C",  # Type de commerce : 'C' (commodities) ou 'S' (services)
+            typeCode=type_code,
             freqCode="A" if frequency == "annual" else "M",
-            clCode="HS",  # Nomenclature : 'HS', 'SITC', 'BEC' ou 'EBOPS'
-            period=periods,
-            reporterCode=reporters,
-            cmdCode=products,
-            flowCode=flows,
-            partnerCode=partners,
-            partner2Code=partners2,
-            customsCode=None,
-            motCode=None,
-            maxRecords=None,
-            format_output="JSON",
-            countOnly=None,
-            includeDesc=True,  # Inclusion des descriptions des variables
+            clCode=classification,
+            maxRecords=max_records,
+            format_output=format_output,
+            countOnly=count_only,
+            includeDesc=include_desc,
             proxy_url=self._proxy_url,
+            **api_kwargs,
         )
         # Incrément du compteur d'appels API
         self.api_calls += 1
 
         # Si la limite du nombre d'observations est atteinte, subdivision de la requête
-        if len(df) >= self._parameters["LIMIT"]:
-            # Test des subdivisions valides, dans l'ordre de préférence
-            if self._validate_subdivision(subdivision=flows):
+        if len(df) >= PARAMETERS["LIMIT"]:
+            # Première dimension divisible dans l'ordre de préférence
+            subdivision = next(
+                (
+                    name
+                    for name in SUBDIVISION_ORDER
+                    if self._can_subdivide(name, selection.get(name))
+                ),
+                None,
+            )
+            if subdivision is not None:
                 df, request_metadata = self._divide_request(
-                    subdivision="flows",
-                    flows=flows, products=products, reporters=reporters,
-                    partners=partners, partners2=partners2, periods=periods,
-                    frequency=frequency,
-                )
-            elif self._validate_subdivision(subdivision=products):
-                df, request_metadata = self._divide_request(
-                    subdivision="products",
-                    flows=flows, products=products, reporters=reporters,
-                    partners=partners, partners2=partners2, periods=periods,
-                    frequency=frequency,
-                )
-            elif self._validate_subdivision(subdivision=reporters):
-                df, request_metadata = self._divide_request(
-                    subdivision="reporters",
-                    flows=flows, products=products, reporters=reporters,
-                    partners=partners, partners2=partners2, periods=periods,
-                    frequency=frequency,
-                )
-            elif self._validate_subdivision(subdivision=partners):
-                df, request_metadata = self._divide_request(
-                    subdivision="partners",
-                    flows=flows, products=products, reporters=reporters,
-                    partners=partners, partners2=partners2, periods=periods,
-                    frequency=frequency,
-                )
-            elif self._validate_subdivision(subdivision=partners2):
-                df, request_metadata = self._divide_request(
-                    subdivision="partners2",
-                    flows=flows, products=products, reporters=reporters,
-                    partners=partners, partners2=partners2, periods=periods,
-                    frequency=frequency,
-                )
-            elif self._validate_subdivision(subdivision=periods):
-                df, request_metadata = self._divide_request(
-                    subdivision="periods",
-                    flows=flows, products=products, reporters=reporters,
-                    partners=partners, partners2=partners2, periods=periods,
-                    frequency=frequency,
+                    subdivision, selection, fixed
                 )
             else:
                 # Subdivision impossible : la requête est conservée telle quelle
                 logger.warning(
-                    "Unable to further truncate the request with parameters : "
-                    f"'flows' : {flows}, 'products' : {products}, "
-                    f"'reporters' : {reporters}, 'partners' : {partners}, "
-                    f"'partners2' : {partners2}, 'periods' : {periods}"
+                    "Unable to further truncate the request with selection : %s",
+                    selection,
                 )
-                request_metadata = self._build_request_metadata(
-                    flows, products, reporters, partners, partners2, periods, frequency
-                )
+                request_metadata = self._build_request_metadata(selection, fixed)
         else:
             # Pas de subdivision : construction des métadonnées de la requête
-            request_metadata = self._build_request_metadata(
-                flows, products, reporters, partners, partners2, periods, frequency
-            )
+            request_metadata = self._build_request_metadata(selection, fixed)
 
         # Logging du nombre d'appels nécessaires pour finaliser la requête
         logger.info(
-            f"{self.api_calls - initial_api_calls} api calls needed to fetch "
-            f"tarifline data with parameters : 'flows' : {flows}, "
-            f"'products' : {products}, 'reporters' : {reporters}, "
-            f"'partners' : {partners}, 'partners2' : {partners2}, "
-            f"'periods' : {periods}"
+            "%d api calls needed to fetch tarifline data with selection : %s",
+            self.api_calls - initial_api_calls,
+            selection,
         )
 
         return df, request_metadata
@@ -592,23 +571,21 @@ class ComtradeClient(APIClient):
     # Méthode auxiliaire de construction des métadonnées d'une requête
     @staticmethod
     def _build_request_metadata(
-        flows, products, reporters, partners, partners2, periods, frequency
+        selection: Dict[str, Union[str, None]], fixed: Dict[str, object]
     ) -> dict:
         """Build the metadata dictionary describing a resolved request.
+
+        Args:
+            selection: Resolved flow dimensions (friendly name → value).
+            fixed: Resolved non-dimensional parameters.
 
         Returns:
             Dictionary of stringified request parameters.
         """
-        # Sérialisation des paramètres de la requête
-        return {
-            "flows": str(flows),
-            "products": str(products),
-            "reporters": str(reporters),
-            "partners": str(partners),
-            "partners2": str(partners2),
-            "periods": str(periods),
-            "frequency": str(frequency),
-        }
+        # Sérialisation des dimensions puis des paramètres fixes
+        metadata = {name: str(value) for name, value in selection.items()}
+        metadata.update({name: str(value) for name, value in fixed.items()})
+        return metadata
 
     # ──────────────────────────────────────────────────────────────────
     # Métadonnées et périodes
@@ -843,10 +820,18 @@ class ComtradeClient(APIClient):
             reporters=query.reporters,
             partners=query.partners,
             partners2=query.partners2,
+            customs=query.customs,
+            mot=query.mot,
             periods=query.periods,
             period_start=query.period_start,
             period_end=query.period_end,
+            type_code=query.type_code,
+            classification=query.classification,
             frequency=query.frequency,
+            max_records=query.max_records,
+            format_output=query.format.value.upper(),
+            count_only=query.count_only,
+            include_desc=query.include_desc,
         )
         return df
 
@@ -888,9 +873,7 @@ class ComtradeClient(APIClient):
             return cached
 
         # Construction depuis les paramètres déclarés et mise en cache
-        structure = parsing.build_structure_from_parameters(
-            self._parameters, agency, dataflow
-        )
+        structure = parsing.build_structure_from_parameters(agency, dataflow)
         self.structure_registry.register(structure)
         return structure
 

@@ -487,18 +487,25 @@ def main() -> None:
     )
     parser.add_argument(
         "--frequency",
-        default="annual",
+        default=None,
         choices=["annual", "monthly"],
-        help="Data frequency (default: annual)",
+        help="Data frequency (overrides the YAML; default from YAML)",
     )
-    parser.add_argument("--type-code", default="C", help="Trade type (default: C)")
     parser.add_argument(
-        "--classification", default="HS", help="Classification code (default: HS)"
+        "--type-code", default=None, help="Trade type (overrides the YAML)"
+    )
+    parser.add_argument(
+        "--classification",
+        default=None,
+        help="Classification code (overrides the YAML)",
     )
     parser.add_argument("--period-start", default=None, help="Start period (YYYY[-MM])")
     parser.add_argument("--period-end", default=None, help="End period (YYYY[-MM])")
     parser.add_argument(
-        "--products-step", type=int, default=10, help="Products per query (default: 10)"
+        "--products-step",
+        type=int,
+        default=None,
+        help="Products per query (overrides the YAML)",
     )
     parser.add_argument(
         "--config",
@@ -523,6 +530,17 @@ def main() -> None:
     args = parser.parse_args()
 
     from macroforecast.datasets import ComtradeClient
+    from macroforecast.datasets.utils import load_dataflow_parameters
+
+    # Paramètres ancrés du YAML (source unique) ; les flags CLI fournis priment
+    params = load_dataflow_parameters(args.config, args.dataflow)
+    frequency = args.frequency or params.get("frequency", "annual")
+    type_code = args.type_code or params.get("type_code", "C")
+    classification = args.classification or params.get("classification", "HS")
+    products_step = args.products_step or params.get("products_step", 10)
+    period_start = args.period_start or params.get("period_start")
+    period_end = args.period_end or params.get("period_end")
+    flows = params.get("flows")
 
     client = ComtradeClient()
     try:
@@ -532,10 +550,11 @@ def main() -> None:
             reporter_codes=reporter_codes,
             product_codes=product_codes,
             config_path=args.config,
-            frequency=args.frequency,
-            products_step=args.products_step,
-            period_start=args.period_start,
-            period_end=args.period_end,
+            frequency=frequency,
+            flows=flows,
+            products_step=products_step,
+            period_start=period_start,
+            period_end=period_end,
             client=client,
         )
         run_comtrade_download(
@@ -543,9 +562,9 @@ def main() -> None:
             catalog_path=args.catalog,
             data_path=args.data_dir,
             last_download_path=args.last_download,
-            frequency=args.frequency,
-            type_code=args.type_code,
-            classification=args.classification,
+            frequency=frequency,
+            type_code=type_code,
+            classification=classification,
             client=client,
         )
     finally:
