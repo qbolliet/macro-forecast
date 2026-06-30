@@ -18,6 +18,12 @@ from .eurostat import (
     EurostatQueryRequestV21,
     EurostatClient,
 )
+# Comtrade
+from .comtrade import (
+    ComtradeResponseFormat,
+    ComtradeQueryRequest,
+    ComtradeClient,
+)
 
 # Réexport des éléments d'intérêt du module
 __all__ = [
@@ -36,4 +42,8 @@ __all__ = [
     'EurostatQueryRequestV30',
     'EurostatQueryRequestV21',
     'EurostatClient',
+    # Comtrade
+    'ComtradeResponseFormat',
+    'ComtradeQueryRequest',
+    'ComtradeClient',
 ]

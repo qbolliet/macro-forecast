@@ -4,6 +4,8 @@ from .core import (
     APIClient,
     AbstractSDMXClient,
     RateLimiter,
+    CompositeRateLimiter,
+    build_rate_limiter,
     SDMXVersion,
     DimensionAtObservation,
     StructureResourceType,
@@ -30,6 +32,9 @@ from .sources import (
     EurostatQueryRequestV30,
     EurostatQueryRequestV21,
     EurostatClient,
+    ComtradeResponseFormat,
+    ComtradeQueryRequest,
+    ComtradeClient,
 )
 
 # Réexport des éléments d'intérêt du module
@@ -38,6 +43,8 @@ __all__ = [
     'APIClient',
     'AbstractSDMXClient',
     'RateLimiter',
+    'CompositeRateLimiter',
+    'build_rate_limiter',
     'SDMXVersion',
     'DimensionAtObservation',
     'StructureResourceType',
@@ -63,4 +70,8 @@ __all__ = [
     'EurostatQueryRequestV30',
     'EurostatQueryRequestV21',
     'EurostatClient',
+    # Comtrade
+    'ComtradeResponseFormat',
+    'ComtradeQueryRequest',
+    'ComtradeClient',
 ]

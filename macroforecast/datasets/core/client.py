@@ -27,7 +27,7 @@ from urllib3.util.retry import Retry
 
 # Import runtime du rate limiter (rate_limiter.py n'a pas de dépendance interne
 # au package, aucun risque de circularité)
-from .rate_limiter import RateLimiter
+from .rate_limiter import CompositeRateLimiter, RateLimiter, build_rate_limiter
 
 # Imports internes — éviter les imports circulaires en utilisant TYPE_CHECKING
 from typing import TYPE_CHECKING
@@ -263,7 +263,9 @@ class AbstractSDMXClient(ABC):
         # Chargement automatique du rate limiter si demandé
         if auto_load_rate_limit and rate_limiter is None:
             rate_limiter = self._load_rate_limiter()
-        self.rate_limiter: Optional["RateLimiter"] = rate_limiter
+        self.rate_limiter: Optional[Union[RateLimiter, CompositeRateLimiter]] = (
+            rate_limiter
+        )
 
     # Méthodes abstraites
     # Méthode abstraite de requête des données
@@ -285,17 +287,21 @@ class AbstractSDMXClient(ABC):
         """Release provider-specific resources (HTTP sessions, etc.)."""
 
     # Méthode de chargement du rate-limiter depuis le fichier de configuration
-    def _load_rate_limiter(self) -> Optional[RateLimiter]:
+    def _load_rate_limiter(
+        self,
+    ) -> Optional[Union[RateLimiter, CompositeRateLimiter]]:
         """Load the rate limiter from ``parameters/{PROVIDER_CONFIG_NAME}.json``.
 
-        Reads the ``RATE_LIMIT`` section of the provider configuration file
-        and builds a :class:`RateLimiter`. Subclasses only need to set
-        :attr:`PROVIDER_CONFIG_NAME`; the lookup is skipped (and ``None``
-        returned) when it is left unset.
+        Reads the ``RATE_LIMIT`` section of the provider configuration file and
+        builds a limiter via :func:`build_rate_limiter`. The section may be a
+        single ``{requests, unit, count}`` dict (→ :class:`RateLimiter`) or a
+        list of such dicts (→ :class:`CompositeRateLimiter`). Subclasses only
+        need to set :attr:`PROVIDER_CONFIG_NAME`; the lookup is skipped (and
+        ``None`` returned) when it is left unset.
 
         Returns:
-            ``RateLimiter`` instance, or ``None`` if no configuration is found
-            or loading fails.
+            ``RateLimiter`` / ``CompositeRateLimiter`` instance, or ``None`` if
+            no configuration is found or loading fails.
         """
         # Aucun fichier de configuration déclaré → pas de rate limiting
         if not self.PROVIDER_CONFIG_NAME:
@@ -318,7 +324,7 @@ class AbstractSDMXClient(ABC):
                         f"Loading rate limiter from "
                         f"parameters/{self.PROVIDER_CONFIG_NAME}.json"
                     )
-                    return RateLimiter.from_dict(config["RATE_LIMIT"])
+                    return build_rate_limiter(config["RATE_LIMIT"])
             # Logging si aucune configuration de rate limit trouvée
             logger.debug("No RATE_LIMIT configuration found")
             return None

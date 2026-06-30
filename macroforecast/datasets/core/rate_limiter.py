@@ -4,7 +4,7 @@ This module provides a rate limiter that enforces request rate limits
 for API clients, supporting various time units.
 """
 # Importation des modules
-from typing import Literal, Dict, Any
+from typing import Any, Dict, List, Literal, Union
 from datetime import datetime, timedelta
 from collections import deque
 import time
@@ -241,3 +241,140 @@ class RateLimiter:
             f"RateLimiter(max_requests={self.max_requests}, "
             f"time_unit='{self.time_unit}', time_count={self.time_count})"
         )
+
+
+# Classe de composition de plusieurs limites de débit simultanées
+class CompositeRateLimiter:
+    """Enforce several rate limits simultaneously.
+
+    Wraps a list of :class:`RateLimiter` instances and blocks until *every*
+    limit allows the next request. Useful for APIs imposing more than one
+    constraint at once, e.g. UN Comtrade (1 request per second **and** 500
+    requests per day).
+
+    Exposes the same ``acquire`` / ``reset`` / ``get_remaining_requests``
+    surface as :class:`RateLimiter` so the two are interchangeable wherever a
+    limiter is used (e.g. ``AbstractSDMXClient`` or ``ComtradeClient``).
+
+    Args:
+        limiters: Rate limiters to enforce together. Must be non-empty.
+
+    Raises:
+        ValueError: If ``limiters`` is empty.
+
+    Example:
+        >>> per_second = RateLimiter(max_requests=1, time_unit="seconds")
+        >>> per_day = RateLimiter(max_requests=500, time_unit="days")
+        >>> limiter = CompositeRateLimiter([per_second, per_day])
+        >>> limiter.acquire()  # Attends que les deux limites soient respectées
+    """
+
+    # Initialisation
+    def __init__(self, limiters: List[RateLimiter]):
+        """Initialize the composite rate limiter.
+
+        Args:
+            limiters: Non-empty list of :class:`RateLimiter` to enforce.
+
+        Raises:
+            ValueError: If ``limiters`` is empty.
+        """
+        # Validation : au moins une limite
+        if not limiters:
+            raise ValueError("CompositeRateLimiter requires at least one limiter")
+
+        # Initialisation des attributs
+        self.limiters = list(limiters)
+
+        # Logging
+        logger.info(
+            f"CompositeRateLimiter initialized with {len(self.limiters)} limiters"
+        )
+
+    # Méthode d'acquisition respectant l'ensemble des limites
+    def acquire(self) -> None:
+        """Wait until every wrapped limiter allows the request, then record it.
+
+        Each limiter is acquired in turn; the most constraining one drives the
+        wait. Acquiring sequentially is sufficient because each
+        :meth:`RateLimiter.acquire` only records the request once its own
+        window allows it.
+        """
+        # Acquisition séquentielle : la limite la plus contraignante bloque
+        for limiter in self.limiters:
+            limiter.acquire()
+
+    # Méthode de réinitialisation de l'ensemble des limites
+    def reset(self) -> None:
+        """Reset the state of every wrapped limiter."""
+        # Réinitialisation de chaque limite
+        for limiter in self.limiters:
+            limiter.reset()
+
+    # Méthode d'extraction du nombre de requêtes restantes (le plus contraignant)
+    def get_remaining_requests(self) -> int:
+        """Return the remaining requests allowed by the most constraining limit.
+
+        Returns:
+            Minimum of the remaining requests across all wrapped limiters.
+        """
+        # Minimum des disponibilités sur l'ensemble des limites
+        return min(limiter.get_remaining_requests() for limiter in self.limiters)
+
+    # Représentation sous forme de chaîne de caractères
+    def __repr__(self) -> str:
+        """String representation of the CompositeRateLimiter."""
+        return f"CompositeRateLimiter(limiters={self.limiters!r})"
+
+
+# Fabrique de limiteur de débit à partir d'une configuration (dict ou liste)
+def build_rate_limiter(
+    config: Union[Dict[str, Any], List[Dict[str, Any]]],
+) -> Union[RateLimiter, CompositeRateLimiter]:
+    """Build a rate limiter from a configuration entry.
+
+    Accepts either a single limit specification (a dict, returning a
+    :class:`RateLimiter`) or several specifications (a list, returning a
+    :class:`CompositeRateLimiter`). This keeps the ``RATE_LIMIT`` section of the
+    provider configuration files backward compatible: Eurostat/OECD keep a
+    single dict, while Comtrade declares a list of limits.
+
+    Args:
+        config: A single ``{requests, unit, count}`` dict, or a non-empty list
+            of such dicts.
+
+    Returns:
+        A :class:`RateLimiter` for a single limit, or a
+        :class:`CompositeRateLimiter` for several.
+
+    Raises:
+        ValueError: If ``config`` is an empty list or an unsupported type.
+
+    Example:
+        >>> build_rate_limiter({"requests": 30, "unit": "minutes"})
+        RateLimiter(max_requests=30, time_unit='minutes', time_count=1)
+        >>> build_rate_limiter([
+        ...     {"requests": 1, "unit": "seconds"},
+        ...     {"requests": 500, "unit": "days"},
+        ... ])  # doctest: +ELLIPSIS
+        CompositeRateLimiter(...)
+    """
+    # Cas d'une liste de spécifications → limiteur composite
+    if isinstance(config, list):
+        # Validation : liste non vide
+        if not config:
+            raise ValueError("RATE_LIMIT list must contain at least one entry")
+        # Un seul élément : un RateLimiter simple suffit
+        limiters = [RateLimiter.from_dict(entry) for entry in config]
+        if len(limiters) == 1:
+            return limiters[0]
+        return CompositeRateLimiter(limiters)
+
+    # Cas d'un dictionnaire unique → limiteur simple
+    if isinstance(config, dict):
+        return RateLimiter.from_dict(config)
+
+    # Type non supporté
+    raise ValueError(
+        f"Unsupported RATE_LIMIT configuration type: {type(config).__name__}"
+    )

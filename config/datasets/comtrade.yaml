@@ -1,0 +1,40 @@
+# Configuration des dimensions scindées UN Comtrade
+# Filtres de codes appliqués aux codelists des dimensions itérées pour
+# construire le produit cartésien des requêtes.
+#
+# Remarque : les codes reporters/partenaires sont les codes M49 numériques
+# renvoyés par l'API Comtrade (colonne `reporterCode`), pas les codes ISO.
+# Les codes produits sont les nomenclatures HS (colonne `id`).
+
+# Groupes de codes réutilisables
+code_groups:
+  # Exemple de sélection de reporters par code M49 (à compléter selon le besoin).
+  # France=251, Allemagne=276, Italie=380, Espagne=724, Pays-Bas=528.
+  majors_m49: &majors_m49
+    - "251"
+    - "276"
+    - "380"
+    - "724"
+    - "528"
+
+# Filtres de codes par dataflow et par dimension scindée
+split_filters:
+  # Données annuelles, commodities, nomenclature HS
+  C_A_HS: &c_hs
+    reporter:
+      include: null            # null → tous les reporters (reporters=None à l'appel)
+      include_regex: null
+      exclude: null
+      exclude_regex: null
+    product:
+      include: null            # partir de tous les codes disponibles
+      include_regex: '^(\d{2}|\d{4}|\d{6})$' # SH2/SH4/SH6 valides
+      exclude:                 # agrégats confidentiels / totaux
+        - "00"
+        - "0090"
+        - "009000"
+        - "999999"
+      exclude_regex: null
+
+  # Données mensuelles, commodities, nomenclature HS (mêmes filtres)
+  C_M_HS: *c_hs

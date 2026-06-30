@@ -1,226 +1,306 @@
+"""UN Comtrade data client.
+
+High-level client for querying UN Comtrade international-trade data and
+converting responses to pandas DataFrames. Unlike Eurostat and OECD, UN
+Comtrade does not follow the SDMX conventions, so this client wraps the
+official ``comtradeapicall`` library rather than building SDMX endpoints.
+
+It inherits from :class:`~macroforecast.datasets.core.client.APIClient` for the
+shared HTTP plumbing (retry session, ``close``) and mirrors the SDMX clients'
+shape: configuration (rate limiter, structures) is loaded from
+``parameters/comtrade.json``, and the automated bulk download lives in a
+dedicated script (``scripts/download_comtrade.py``) rather than in the client.
+
+The methodology is available at:
+https://comtradeapi.un.org/files/v1/app/wiki/MethodologyGuideforComtradePlus.pdf
+"""
 # Importation des modules
 # Modules de base
 import json
+import logging
 import os
 import re
-from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Union
-from uuid import uuid4
+from typing import List, Optional, TYPE_CHECKING, Union
 
-# Module de l'API
+# Module de l'API UN Comtrade
 import comtradeapicall
-# from dotenv import load_dotenv
 import numpy as np
 import pandas as pd
 
-# Modules ad hoc
-from ..storage.loader import Loader
-from ..storage.saver import Saver
-from ..utils.logger import _init_logger
-from ..utils.scrapers import Scraper
+# Modules du package
+from ...core.client import APIClient
+from ...core.rate_limiter import CompositeRateLimiter, RateLimiter, build_rate_limiter
+from ...core.structures import DataflowStructure, DataflowStructureRegistry
+from . import parsing
+from .formats import (
+    AGENCY_ID,
+    EXPORT_FLOW_CODES,
+    EXPORT_TO_IMPORT_CODE,
+    EXPORT_TO_IMPORT_DESC,
+    IMPORT_FLOW_CODES,
+    IMPORT_TO_EXPORT_CODE,
+    IMPORT_TO_EXPORT_DESC,
+    VALID_FREQUENCIES,
+)
 
-# Emplacement du fichier
-FILE_PATH = Path(os.path.abspath(__file__))
+if TYPE_CHECKING:
+    from .queries import ComtradeQueryRequest
 
-# Chargement des variables d'environnement
-# load_dotenv('../../.env')
-
-# Importation des paramètres de l'API
-with open(
-    os.path.join(FILE_PATH.parents[2], "parameters/un_comtrade.json")
-) as json_file:
-    parameters = json.load(json_file)
-
-# Importation des paramètres de l'API
-with open(
-    os.path.join(FILE_PATH.parents[2], "parameters/miscellanous.json")
-) as json_file:
-    miscellanous = json.load(json_file)
+# Initialisation du logger
+logger = logging.getLogger(__name__)
 
 
-# Classe de récupération des données de commerce international du UNComtrade
-# La méthodologie est accessible ici : https://comtradeapi.un.org/files/v1/app/wiki/MethodologyGuideforComtradePlus.pdf
-class UNComtradeScraper(Scraper):
-    """A class for retrieving international trade data from UN Comtrade.
+# Classe de récupération des données de commerce international du UN Comtrade
+class ComtradeClient(APIClient):
+    """High-level client for UN Comtrade international-trade data.
 
-    This class provides functionality to fetch, process and save trade data from the
-    UN Comtrade database. It inherits from Scraper for web scraping capabilities.
+    Fetches, subdivides (to respect the per-call record limit) and aggregates
+    tariffline trade data from UN Comtrade, exposing an API homogeneous with the
+    SDMX clients (:class:`EurostatClient`, :class:`OECDClient`).
 
     Args:
-        log_filename (os.PathLike, optional): Path to the log file. Defaults to
-            "logs/comtrade_builder.log".
-
-    Attributes:
-        loader: Loader for loal and S3 loading capabilities
-        saver: Saver for loal and S3 saving capabilities
-        logger: Logger object for tracking operations
-        api_calls (int): Counter for number of API calls made
-
-    Note:
-        The methodology for UN Comtrade data is available at:
-        https://comtradeapi.un.org/files/v1/app/wiki/MethodologyGuideforComtradePlus.pdf
+        base_url: UN Comtrade API base URL (used for the inherited HTTP
+            session; ``comtradeapicall`` builds its own request URLs).
+        timeout: Request timeout in seconds.
+        subscription_key: Comtrade subscription key. Falls back to the
+            ``COMTRADE_SUBSCRIPTION_KEY`` environment variable when ``None``.
+        structure_registry: Optional registry for dataflow structures. When
+            ``None`` a new registry is created and populated from the
+            ``STRUCTURES`` section of ``parameters/comtrade.json``.
+        rate_limiter: Optional rate limiter. When ``None`` and
+            ``auto_load_rate_limit`` is ``True``, it is built from the
+            ``RATE_LIMIT`` section of ``parameters/comtrade.json`` (a list of
+            limits → :class:`CompositeRateLimiter` enforcing 1 req/s and
+            500 req/day).
+        auto_load_rate_limit: Whether to load the rate limiter automatically.
+        max_retries: Maximum number of HTTP retry attempts (inherited).
+        backoff_factor: Backoff factor between retries (inherited).
 
     Examples:
-        >>> scraper = UNComtradeScraper()
-        >>> # Get metadata for a specific category
-        >>> reporters = scraper.get_metadata(category='reporter')
-        >>> # Get trade data
-        >>> data = scraper.get_tarifline_data(
-        ...     flows=['M', 'X'],
-        ...     reporters='FRA',
-        ...     period_start='2023-01',
-        ...     period_end='2023-12'
-        ... )
+        >>> client = ComtradeClient()
+        >>> # Métadonnées d'une catégorie de référence
+        >>> reporters = client.get_metadata(category="reporter")  # doctest: +SKIP
+        >>> # Données tariffline
+        >>> df, meta = client.get_data(
+        ...     reporters="FRA", products=["010121"],
+        ...     periods="2023", frequency="annual",
+        ... )  # doctest: +SKIP
     """
+
+    # Nom du fichier de configuration (parité avec PROVIDER_CONFIG_NAME des clients SDMX)
+    PROVIDER_CONFIG_NAME = "comtrade"
+
+    # URL de base par défaut de l'API UN Comtrade
+    DEFAULT_BASE_URL = "https://comtradeapi.un.org"
 
     # Initialisation
     def __init__(
         self,
-        loader: Optional[Loader] = None,
-        saver: Optional[Saver] = None,
-        api_calls: int = 0,
-        log_filename: Optional[os.PathLike] = os.path.join(
-            FILE_PATH.parents[2], "logs/comtrade_builder.log"
-        ),
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: int = 120,
+        subscription_key: Optional[str] = None,
+        structure_registry: Optional[DataflowStructureRegistry] = None,
+        rate_limiter: Optional[Union[RateLimiter, CompositeRateLimiter]] = None,
+        auto_load_rate_limit: bool = True,
+        max_retries: int = 3,
+        backoff_factor: float = 0.5,
     ) -> None:
-        """
-        Initializes the UNComtradeScraper class with a log file.
+        # Initialisation de la couche HTTP partagée (session, retry, close)
+        super().__init__(
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            backoff_factor=backoff_factor,
+        )
 
-        Args:
-            log_filename (os.PathLike, optional): Path to the log file. Defaults to
-                "logs/comtrade_builder.log".
+        # Chargement des paramètres consolidés (rate limit, limites, structures)
+        self._parameters = self._load_parameters()
+
+        # Clé de souscription (argument ou variable d'environnement)
+        self.subscription_key = (
+            subscription_key
+            if subscription_key is not None
+            else os.getenv("COMTRADE_SUBSCRIPTION_KEY")
+        )
+
+        # Rate limiter (argument ou chargement automatique depuis la configuration)
+        if auto_load_rate_limit and rate_limiter is None:
+            rate_limiter = self._load_rate_limiter()
+        self.rate_limiter: Optional[Union[RateLimiter, CompositeRateLimiter]] = (
+            rate_limiter
+        )
+
+        # Registre des structures (argument ou construction + chargement des paramètres)
+        if structure_registry is not None:
+            self.structure_registry = structure_registry
+        else:
+            self.structure_registry = DataflowStructureRegistry()
+            # Chargement des structures déclarées (pas d'endpoint de structure côté API)
+            self.structure_registry.load_from_dict(self._parameters)
+
+        # Compteur d'appels API (à des fins de logging uniquement ; le quota est
+        # garanti par le rate limiter)
+        self.api_calls = 0
+
+    # ──────────────────────────────────────────────────────────────────
+    # Chargement de la configuration
+    # ──────────────────────────────────────────────────────────────────
+
+    # Méthode de chargement du fichier de paramètres consolidé
+    def _load_parameters(self) -> dict:
+        """Load ``parameters/comtrade.json`` (rate limit, limits, structures).
 
         Returns:
-            None
+            Parsed configuration dictionary (empty dict when the file is
+            missing or unreadable).
         """
-        # Initialisation du parent
-        super().__init__()
-        # Initialisation des loaders et savers
-        # Initialisation du loader (à l'argument où à une instance par défaut)
-        if loader is not None:
-            self.loader = loader
-        else:
-            self.loader = Loader()
-        # Initialisation du saver (à l'argument ou à une instance par défaut)
-        if saver is not None:
-            self.saver = saver
-        else:
-            self.saver = Saver()
+        # Construction du chemin vers parameters/comtrade.json (racine du repo)
+        params_path = (
+            Path(__file__).parents[4]
+            / "parameters"
+            / f"{self.PROVIDER_CONFIG_NAME}.json"
+        )
+        try:
+            # Lecture et parsing du fichier de configuration
+            with open(params_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            # Échec non bloquant : configuration vide par défaut
+            logger.warning(f"Could not load {params_path}: {e}")
+            return {}
 
-        # Initialisation du logger
-        self.logger = _init_logger(filename=log_filename)
-        # Initilisation du nombre d'appels à l'API
-        self.api_calls = api_calls
+    # Méthode de chargement du rate limiter depuis la configuration
+    def _load_rate_limiter(
+        self,
+    ) -> Optional[Union[RateLimiter, CompositeRateLimiter]]:
+        """Build the rate limiter from the ``RATE_LIMIT`` configuration section.
 
-    # Méthode auxiliaire de preprocessing des pays
+        The section is a list of ``{requests, unit, count}`` limits, so a
+        :class:`CompositeRateLimiter` enforcing every limit simultaneously is
+        returned (cf. :func:`build_rate_limiter`).
+
+        Returns:
+            A rate limiter, or ``None`` when no configuration is found.
+        """
+        # Extraction de la section RATE_LIMIT
+        config = self._parameters.get("RATE_LIMIT")
+        if config is None:
+            logger.debug("No RATE_LIMIT configuration found")
+            return None
+        try:
+            logger.info(
+                f"Loading rate limiter from "
+                f"parameters/{self.PROVIDER_CONFIG_NAME}.json"
+            )
+            return build_rate_limiter(config)
+        except Exception as e:
+            # Échec non bloquant de chargement
+            logger.warning(f"Could not load rate limiter: {e}")
+            return None
+
+    # Propriété d'URL de proxy formatée pour comtradeapicall
+    @property
+    def _proxy_url(self) -> Optional[str]:
+        """Proxy URL passed to ``comtradeapicall`` (``None`` when unset)."""
+        # Aucun proxy → None ; sinon préfixe http://
+        if self.proxy is None:
+            return None
+        return f"http://{self.proxy}"
+
+    # Méthode auxiliaire d'application du rate limiter avant un appel API
+    def _acquire(self) -> None:
+        """Block until the rate limiter allows the next API call (if any)."""
+        # Application du rate limiter si configuré
+        if self.rate_limiter is not None:
+            self.rate_limiter.acquire()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Méthodes auxiliaires de preprocessing
+    # ──────────────────────────────────────────────────────────────────
+
+    # Méthode auxiliaire de preprocessing des codes
     def _preprocess_codes(
         self, codes: Union[List[int], List[str], int, str, None]
-    ) -> str:
-        """Preprocess country or product codes into API format.
+    ) -> Optional[str]:
+        """Preprocess country or product codes into the Comtrade CSV format.
 
         Args:
-            codes: Single code or list of codes to preprocess. Can be:
-                - List[int]: List of numeric codes
-                - List[str]: List of string codes
-                - int: Single numeric code
-                - str: Single string code
-                - None: Returns None as is
+            codes: Single code or list of codes. Lists are joined with commas,
+                integers are stringified, strings and ``None`` are returned
+                unchanged.
 
         Returns:
-            str: Comma-separated string of codes
+            Comma-separated string of codes, or ``None``.
 
         Examples:
-            >>> scraper._preprocess_codes([1, 2, 3])
+            >>> ComtradeClient._preprocess_codes(None, [1, 2, 3])
             '1,2,3'
-            >>> scraper._preprocess_codes('FRA')
+            >>> ComtradeClient._preprocess_codes(None, "FRA")
             'FRA'
-            >>> scraper._preprocess_codes(['USA', 'CAN'])
-            'USA,CAN'
         """
-        # Disjonction de cas suivant le type des pays
-        # S'il s'agit d'une liste de strings ou d'une liste d'entiers, ces-dernières sont concaténées
+        # Liste de codes → concaténation par des virgules
         if isinstance(codes, list):
             codes = ",".join([str(e) for e in codes])
-        # Si c'est un entier, ce-dernier est converti en entier
+        # Entier → conversion en chaîne
         elif isinstance(codes, int):
             codes = str(codes)
-        # S'il s'agit d'une string ou de None, il est renvoyé tel quel
-
+        # Chaîne ou None → renvoyé tel quel
         return codes
 
-    # Méthode auxiliaire de définition d'une subdivision valide
+    # Méthode auxiliaire de validation d'une subdivision
     def _validate_subdivision(self, subdivision: Union[str, None]) -> bool:
-        """Validate if a subdivision parameter is valid.
+        """Validate whether a parameter can be split into smaller requests.
 
         Args:
-            subdivision: The subdivision parameter to validate. Must be a comma-separated
-                string with more than one value, or None.
+            subdivision: Comma-separated string with more than one value, or
+                ``None``.
 
         Returns:
-            bool: True if subdivision is valid (None or contains multiple values),
-                False otherwise.
+            ``True`` if ``None`` or containing multiple values, ``False``
+            otherwise.
 
         Examples:
-            >>> scraper._validate_subdivision('USA,CAN,MEX')
+            >>> ComtradeClient._validate_subdivision(None, "USA,CAN,MEX")
             True
-            >>> scraper._validate_subdivision('USA')
+            >>> ComtradeClient._validate_subdivision(None, "USA")
             False
-            >>> scraper._validate_subdivision(None)
-            True
         """
-        # Test si est None ou une liste du plus d'un élément
+        # None ou liste de plus d'un élément → divisible
         if subdivision is None:
             return True
         elif isinstance(subdivision, str):
             # Identification des différents items de la subdivision
             list_items = subdivision.split(",")
-            if len(list_items) > 1:
-                return True
-            else:
-                return False
+            return len(list_items) > 1
         else:
             return False
 
-    # Méthode auxiliaire d'extraction des codes
+    # Méthode auxiliaire d'extraction des codes valides d'une catégorie
     def _extract_codes(self, category: str) -> list:
-        """Extract valid codes for a given category from metadata.
+        """Extract valid codes for a reference category.
 
         Args:
-            category (str): Category to extract codes for. One of:
-                - 'flow': Trade flow codes
-                - 'reporter': Reporter country codes
-                - 'partner': Partner country codes
-                - 'cmd:HS': HS commodity codes
+            category: One of ``"flow"``, ``"reporter"``, ``"partner"`` or
+                ``"cmd:HS"``.
 
         Returns:
-            list: List of valid codes for the category
+            List of valid codes for the category.
 
         Raises:
-            ValueError: If category is not valid
-
-        Examples:
-            >>> reporter_codes = scraper._extract_codes('reporter')
-            >>> flow_codes = scraper._extract_codes('flow')
+            ValueError: If ``category`` is not supported.
         """
-        # Extraction des méta-données
+        # Extraction des métadonnées puis des codes (logique pure déléguée à parsing)
         df = self.get_metadata(category=category)
-        # Extraction des codes
-        if category == "flow":
-            return df["id"].tolist()
-        elif category == "reporter":
-            # On extrait les codes des pays existants
-            return df.loc[df["entryExpiredDate"].isna(), "reporterCode"].tolist()
-        elif category == "partner":
-            # On extrait les codes des pays existants
-            return df.loc[df["entryExpiredDate"].isna(), "PartnerCode"].tolist()
-        elif category == "cmd:HS":
-            # return df.loc[df['aggrLevel']==6, 'PartnerCode'].tolist()
-            return df["id"].tolist()
+        return parsing.extract_codes(df, category)
 
-    # Méthodes auxiliaire de subdivision de la requête
-    def _divide_tarifline_request(
+    # ──────────────────────────────────────────────────────────────────
+    # Récupération des données tariffline
+    # ──────────────────────────────────────────────────────────────────
+
+    # Méthode auxiliaire de subdivision récursive d'une requête
+    def _divide_request(
         self,
         subdivision: str,
         flows: Optional[Union[List[str], str, None]] = ["M", "X"],
@@ -229,39 +309,34 @@ class UNComtradeScraper(Scraper):
         partners: Optional[Union[List[int], List[str], int, str, None]] = None,
         partners2: Optional[Union[List[int], List[str], int, str, None]] = None,
         periods: Optional[Union[List[str], str, None]] = None,
-        frequency: Optional[str] = "monthly",
+        frequency: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Divide a large tariff line request into smaller chunks.
+        """Divide a request that exceeds the per-call record limit.
 
-        Handles requests that exceed API limits by breaking them down based on the
-        specified subdivision parameter.
+        Splits the requested values of ``subdivision`` into two halves and
+        re-issues two recursive :meth:`get_data` calls, concatenating the
+        results.
 
         Args:
-            subdivision (str): Type of subdivision ('flows', 'products', 'reporters', etc.)
-            flows (List[str], optional): Trade flow codes
-            products (List[str], optional): Product codes
-            reporters (List[str], optional): Reporter country codes
-            partners (List[str], optional): Partner country codes
-            partners2 (List[str], optional): Secondary partner codes
-            periods (List[str], optional): Time periods
-            frequency (str, optional): Data frequency ('monthly' or 'annual')
+            subdivision: Dimension to split (``'flows'``, ``'products'``,
+                ``'reporters'``, ``'partners'``, ``'partners2'`` or
+                ``'periods'``).
+            flows: Trade flow codes.
+            products: Product codes.
+            reporters: Reporter codes.
+            partners: Partner codes.
+            partners2: Secondary partner codes.
+            periods: Time periods.
+            frequency: Data frequency (``'monthly'`` or ``'annual'``).
 
         Returns:
-            pd.DataFrame: Combined results from subdivided requests
+            Tuple ``(DataFrame, request_metadata)`` combining both halves.
 
         Raises:
-            ValueError: If subdivision is invalid or request cannot be divided further
-
-        Examples:
-            >>> data = scraper._divide_tarifline_request(
-            ...     subdivision='reporters',
-            ...     reporters='USA,CAN,MEX',
-            ...     period_start='2023-01',
-            ...     period_end='2023-12'
-
-            ... )
+            ValueError: If ``subdivision`` is invalid or cannot be divided
+                further.
         """
-        # Vérification que la valeur de la subdivision est valide
+        # Vérification de la validité de la subdivision
         if subdivision not in [
             "flows",
             "products",
@@ -271,7 +346,8 @@ class UNComtradeScraper(Scraper):
             "periods",
         ]:
             raise ValueError(
-                f"Invalid subdivision : {subdivision}. Should be in ['flows', 'products', 'reporters', 'partners', 'partners2', 'periods']"
+                f"Invalid subdivision : {subdivision}. Should be in ['flows', "
+                "'products', 'reporters', 'partners', 'partners2', 'periods']"
             )
 
         # Extraction des items sur lesquels effectuer la subdivision
@@ -279,13 +355,13 @@ class UNComtradeScraper(Scraper):
 
         # Validation de la subdivision
         if self._validate_subdivision(subdivision=items):
-            # Si est None, on requête l'ensemble des pays valides et on concatène deux sous-listes
+            # Si None, requête des valeurs valides (sauf pour les périodes)
             if (items is None) & (subdivision == "periods"):
-                raise ValueError("Unnable to request the valid values for 'periods'")
+                raise ValueError("Unable to request the valid values for 'periods'")
             elif items is None:
                 # Requête des options valides
                 list_items = self._extract_codes(
-                    category=parameters["SUBDIVISION_METADATA"][subdivision]
+                    category=self._parameters["SUBDIVISION_METADATA"][subdivision]
                 )
             else:
                 list_items = items.split(",")
@@ -294,50 +370,44 @@ class UNComtradeScraper(Scraper):
                 list_items[: (len(list_items) // 2)],
                 list_items[(len(list_items) // 2):],
             )
-            # Requête récursive sur deux sous-listes de partenaires
-            df1, request_metadata1 = self.get_tarifline_data(
+            # Requête récursive sur la première sous-liste
+            df1, request_metadata1 = self.get_data(
                 flows=list_items1 if subdivision == "flows" else flows,
                 products=list_items1 if subdivision == "products" else products,
-                reporters=(
-                    list_items1 if subdivision == "reporters" else reporters
-                ),
+                reporters=list_items1 if subdivision == "reporters" else reporters,
                 partners=list_items1 if subdivision == "partners" else partners,
-                partners2=(
-                    list_items1 if subdivision == "partners2" else partners2
-                ),
+                partners2=list_items1 if subdivision == "partners2" else partners2,
                 periods=list_items1 if subdivision == "periods" else periods,
                 frequency=frequency,
             )
-            df2, request_metadata2 = self.get_tarifline_data(
+            # Requête récursive sur la seconde sous-liste
+            df2, request_metadata2 = self.get_data(
                 flows=list_items2 if subdivision == "flows" else flows,
                 products=list_items2 if subdivision == "products" else products,
-                reporters=(
-                    list_items2 if subdivision == "reporters" else reporters
-                ),
+                reporters=list_items2 if subdivision == "reporters" else reporters,
                 partners=list_items2 if subdivision == "partners" else partners,
-                partners2=(
-                    list_items2 if subdivision == "partners2" else partners2
-                ),
+                partners2=list_items2 if subdivision == "partners2" else partners2,
                 periods=list_items2 if subdivision == "periods" else periods,
                 frequency=frequency,
             )
             # Concaténation des jeux de données
             df = pd.concat([df1, df2], axis=0, ignore_index=True)
-            # Concaténation des métadonnées
+            # Concaténation des métadonnées (mêmes clés dans les deux dictionnaires)
             request_metadata = {
                 k: f"{request_metadata1[k]},{request_metadata2[k]}"
-                for k in request_metadata1.keys()  # Les deux dictionnaires ont les mêmes clés
+                for k in request_metadata1.keys()
             }
-
             return df, request_metadata
-
         else:
             raise ValueError(
-                f"Unnable to further truncate the request with parameters : 'flows' : {flows}, 'products' : {products}, 'reporters' : {reporters}, 'partners' : {partners}, 'partners2' : {partners2}, 'periods' : {periods}"
+                "Unable to further truncate the request with parameters : "
+                f"'flows' : {flows}, 'products' : {products}, "
+                f"'reporters' : {reporters}, 'partners' : {partners}, "
+                f"'partners2' : {partners2}, 'periods' : {periods}"
             )
 
-    # Méthode de téléchargement des données
-    def get_tarifline_data(
+    # Méthode principale de récupération des données tariffline
+    def get_data(
         self,
         flows: Optional[Union[List[str], str, None]] = ["M", "X"],
         products: Optional[Union[List[int], List[str], int, str, None]] = None,
@@ -348,349 +418,290 @@ class UNComtradeScraper(Scraper):
         period_start: Optional[Union[str, None]] = None,
         period_end: Optional[Union[str, None]] = None,
         frequency: Optional[str] = "monthly",
-        filepath: Optional[Union[os.PathLike, None]] = None,
-        bucket: Optional[Union[str, None]] = None,
     ) -> pd.DataFrame:
-        """Fetch tariff line data from UN Comtrade API.
+        """Fetch tariffline data from UN Comtrade.
+
+        Issues a single ``comtradeapicall`` request and, when the response hits
+        the per-call record limit (``LIMIT``), recursively subdivides it (by
+        flow, product, reporter, partner, partner2 or period) until each chunk
+        fits.
 
         Args:
-            flows (List[str], optional): Trade flow codes (e.g., ['M', 'X'])
-            products (List[str], optional): Product codes
-            reporters (List[str], optional): Reporter country codes
-            partners (List[str], optional): Partner country codes
-            partners2 (List[str], optional): Secondary partner codes
-            periods (List[str], optional): Specific time periods
-            period_start (str, optional): Start period (YYYY-MM)
-            period_end (str, optional): End period (YYYY-MM)
-            frequency (str, optional): Data frequency ('monthly' or 'annual')
-            filepath (str, optional): Path to save the data
-            bucket (str, optional): S3 bucket name if saving to S3
+            flows: Trade flow codes (e.g. ``["M", "X"]``).
+            products: Product codes.
+            reporters: Reporter country codes.
+            partners: Partner country codes.
+            partners2: Secondary partner codes.
+            periods: Explicit periods (``YYYY`` or ``YYYYMM``).
+            period_start: Start period (used when ``periods`` is omitted).
+            period_end: End period (used when ``periods`` is omitted).
+            frequency: Data frequency (``'monthly'`` or ``'annual'``).
 
         Returns:
-            pd.DataFrame: Fetched trade data
+            Tuple ``(DataFrame, request_metadata)`` where ``request_metadata``
+            records the resolved request parameters.
+
+        Raises:
+            ValueError: If ``frequency`` is invalid.
 
         Examples:
-            >>> data = scraper.get_tarifline_data(
-            ...     flows=['M', 'X'],
-            ...     reporters='FRA',
-            ...     period_start='2023-01',
-            ...     period_end='2023-12',
-            ...     frequency='monthly'
-            ... )
+            >>> df, meta = client.get_data(
+            ...     reporters="FRA", periods="2023", frequency="annual",
+            ... )  # doctest: +SKIP
         """
         # Vérification de la cohérence des paramètres
-        if frequency not in ["annual", "monthly"]:
+        if frequency not in VALID_FREQUENCIES:
             raise ValueError(
-                f"Invalid value for frequency : {frequency}. Should be in ['annual', 'monthly']"
+                f"Invalid value for frequency : {frequency}. "
+                f"Should be in {VALID_FREQUENCIES}"
             )
 
-        # Initialisation du nombre de requête API
-        initial_api_calls = deepcopy(self.api_calls)
+        # Mémorisation du nombre d'appels initial (pour le logging)
+        initial_api_calls = self.api_calls
 
         # Preprocessing des périodes
         if isinstance(periods, list):
             periods = ",".join(periods)
         elif (period_start is not None) & (period_end is not None):
             periods = ",".join(
-                list(
-                    map(
-                        pd.date_range(
-                            start=period_start,
-                            end=period_end,
-                            freq="YS" if frequency == "annual" else "MS",
-                        )
-                        .strftime("%Y" if frequency == "annual" else "%Y%m")
-                        .tolist(),
-                        str,
-                    )
+                pd.date_range(
+                    start=period_start,
+                    end=period_end,
+                    freq="YS" if frequency == "annual" else "MS",
                 )
+                .strftime("%Y" if frequency == "annual" else "%Y%m")
+                .tolist()
             )
         elif period_start is not None:
             periods = ",".join(
-                list(
-                    map(
-                        pd.date_range(
-                            start=period_start,
-                            end=datetime.today(),
-                            freq="YS" if frequency == "annual" else "MS",
-                        )
-                        .strftime("%Y" if frequency == "annual" else "%Y%m")
-                        .tolist(),
-                        str,
-                    )
+                pd.date_range(
+                    start=period_start,
+                    end=datetime.today(),
+                    freq="YS" if frequency == "annual" else "MS",
                 )
+                .strftime("%Y" if frequency == "annual" else "%Y%m")
+                .tolist()
             )
-        # Preprocessing des flux
+
+        # Preprocessing des flux et des codes (pays, produits)
         flows = self._preprocess_codes(codes=flows)
-        # Preprocessing des codes M49 des pays
         reporters = self._preprocess_codes(codes=reporters)
         partners = self._preprocess_codes(codes=partners)
         partners2 = self._preprocess_codes(codes=partners2)
-        # Preprocessing des codes de produits
         products = self._preprocess_codes(codes=products)
 
-        # Requête des données
+        # Application du rate limiter avant l'appel API
+        self._acquire()
+
+        # Requête des données tariffline via la lib officielle
         df = comtradeapicall._getTarifflineData(
-            os.getenv("COMTRADE_SUBSCRIPTION_KEY"),
-            typeCode="C",  # Type of trade. 'C' for commodities and 'S' for service.
-            freqCode=(
-                "A" if frequency == "annual" else "M"
-            ),  # Trade frequency: 'A' for annual and 'M' for monthly
-            clCode="HS",  # Trade (IMTS) classifications: 'HS', 'SITC', 'BEC' or 'EBOPS'.
-            period=periods,  # Year or month. Year should be 4 digit year. Month should be six digit integer with the values of the form YYYYMM.
-            reporterCode=reporters,  # Reporter code (Possible values are M49 code of the countries separated by comma (,))
-            cmdCode=products,  # Commodity code. Multi value input should be in the form of csv (Codes separated by comma (,))
-            flowCode=flows,  # Trade flow code. Multi value input should be in the form of csv (Codes separated by comma (,)). Possible values at : https://comtradeapi.un.org/files/v1/app/reference/tradeRegimes.json
-            partnerCode=partners,  # Partner code (Possible values are M49 code of the countries separated by comma (,))
-            partner2Code=partners2,  # Second partner/consignment code (Possible values are M49 code of the countries separated by comma (,))
-            customsCode=None,  # Customs code. Multi value input should be in the form of csv (Codes separated by comma (,)). Possible values at : https://comtradeapi.un.org/files/v1/app/reference/CustomsCodes.json
-            motCode=None,  # Mode of transport code. Multi value input should be in the form of csv (Codes separated by comma (,))
+            self.subscription_key,
+            typeCode="C",  # Type de commerce : 'C' (commodities) ou 'S' (services)
+            freqCode="A" if frequency == "annual" else "M",
+            clCode="HS",  # Nomenclature : 'HS', 'SITC', 'BEC' ou 'EBOPS'
+            period=periods,
+            reporterCode=reporters,
+            cmdCode=products,
+            flowCode=flows,
+            partnerCode=partners,
+            partner2Code=partners2,
+            customsCode=None,
+            motCode=None,
             maxRecords=None,
             format_output="JSON",
             countOnly=None,
-            includeDesc=True,  # Include descriptions of data variables
-            proxy_url=(
-                miscellanous["PROXY"]
-                if miscellanous["PROXY"] is None
-                else f"http://{miscellanous['PROXY']}"
-            ),
+            includeDesc=True,  # Inclusion des descriptions des variables
+            proxy_url=self._proxy_url,
         )
-        # Incrément du nombre d'appels à l'API
+        # Incrément du compteur d'appels API
         self.api_calls += 1
 
-        # Si on atteint la limite du nombre d'observations requêtable, la requête est subdivisée
-        if len(df) >= parameters["LIMIT"]:
-            # Test des subdivisions valides
-            # Sur les flux
+        # Si la limite du nombre d'observations est atteinte, subdivision de la requête
+        if len(df) >= self._parameters["LIMIT"]:
+            # Test des subdivisions valides, dans l'ordre de préférence
             if self._validate_subdivision(subdivision=flows):
-                df, request_metadata = self._divide_tarifline_request(
+                df, request_metadata = self._divide_request(
                     subdivision="flows",
-                    flows=flows,
-                    products=products,
-                    reporters=reporters,
-                    partners=partners,
-                    partners2=partners2,
-                    periods=periods,
+                    flows=flows, products=products, reporters=reporters,
+                    partners=partners, partners2=partners2, periods=periods,
                     frequency=frequency,
                 )
-            # Sur les produits
             elif self._validate_subdivision(subdivision=products):
-                df, request_metadata = self._divide_tarifline_request(
+                df, request_metadata = self._divide_request(
                     subdivision="products",
-                    flows=flows,
-                    products=products,
-                    reporters=reporters,
-                    partners=partners,
-                    partners2=partners2,
-                    periods=periods,
+                    flows=flows, products=products, reporters=reporters,
+                    partners=partners, partners2=partners2, periods=periods,
                     frequency=frequency,
                 )
-            # Sur les pays
             elif self._validate_subdivision(subdivision=reporters):
-                df, request_metadata = self._divide_tarifline_request(
+                df, request_metadata = self._divide_request(
                     subdivision="reporters",
-                    flows=flows,
-                    products=products,
-                    reporters=reporters,
-                    partners=partners,
-                    partners2=partners2,
-                    periods=periods,
+                    flows=flows, products=products, reporters=reporters,
+                    partners=partners, partners2=partners2, periods=periods,
                     frequency=frequency,
                 )
             elif self._validate_subdivision(subdivision=partners):
-                df, request_metadata = self._divide_tarifline_request(
+                df, request_metadata = self._divide_request(
                     subdivision="partners",
-                    flows=flows,
-                    products=products,
-                    reporters=reporters,
-                    partners=partners,
-                    partners2=partners2,
-                    periods=periods,
+                    flows=flows, products=products, reporters=reporters,
+                    partners=partners, partners2=partners2, periods=periods,
                     frequency=frequency,
                 )
             elif self._validate_subdivision(subdivision=partners2):
-                df, request_metadata = self._divide_tarifline_request(
+                df, request_metadata = self._divide_request(
                     subdivision="partners2",
-                    flows=flows,
-                    products=products,
-                    reporters=reporters,
-                    partners=partners,
-                    partners2=partners2,
-                    periods=periods,
+                    flows=flows, products=products, reporters=reporters,
+                    partners=partners, partners2=partners2, periods=periods,
                     frequency=frequency,
                 )
-            # Sur les périodes
             elif self._validate_subdivision(subdivision=periods):
-                df, request_metadata = self._divide_tarifline_request(
+                df, request_metadata = self._divide_request(
                     subdivision="periods",
-                    flows=flows,
-                    products=products,
-                    reporters=reporters,
-                    partners=partners,
-                    partners2=partners2,
-                    periods=periods,
+                    flows=flows, products=products, reporters=reporters,
+                    partners=partners, partners2=partners2, periods=periods,
                     frequency=frequency,
                 )
             else:
-                # Logging
-                self.logger.warning(
-                    f"Unnable to further truncate the request with parameters : 'flows' : {flows}, 'products' : {products}, 'reporters' : {reporters}, 'partners' : {partners}, 'partners2' : {partners2}, 'periods' : {periods}"
+                # Subdivision impossible : la requête est conservée telle quelle
+                logger.warning(
+                    "Unable to further truncate the request with parameters : "
+                    f"'flows' : {flows}, 'products' : {products}, "
+                    f"'reporters' : {reporters}, 'partners' : {partners}, "
+                    f"'partners2' : {partners2}, 'periods' : {periods}"
                 )
-        # Il y a un appel récursif de "get_tarifline_data" dans "_divide_tarifline_request", pour ne pas exporter plusieurs fois les mêmes données
+                request_metadata = self._build_request_metadata(
+                    flows, products, reporters, partners, partners2, periods, frequency
+                )
         else:
-            # Création des méta-données
-            request_metadata = {
-                "flows": str(flows),
-                "products": str(products),
-                "reporters": str(reporters),
-                "partners": str(partners),
-                "partners2": str(partners2),
-                "periods": str(periods),
-                "frequency": str(frequency)
-            }
-            # Export des données
-            if (not df.empty) & (filepath is not None):
-                # Nom du fichier à exporter
-                list_filename = []
-                for e in [flows, products, reporters, partners, partners2, periods, frequency]:
-                    if isinstance(e, list):
-                        if len(e) == 1:
-                            list_filename.append(e[0])
-                        else:
-                            list_filename.append(f"{e[0]}-{e[-1]}")
-                    elif isinstance(e, str):
-                        # Séparation des éléments
-                        list_e = e.split(',')
-                        if len(list_e) == 1:
-                            list_filename.append(list_e[0])
-                        else:
-                            list_filename.append(f"{list_e[0]}-{list_e[-1]}")
-                    elif e is not None:
-                        list_filename.append(e)
-                # Ajout d'un code uuid pour garantir l'unicité
-                filename = "_".join(list_filename) + f"_{uuid4()}.csv"
-                # Export des données
-                self.saver.save(filepath=os.path.join(filepath, filename), obj=df, bucket=bucket, index=False)
-                # Logging
-                self.logger.info(
-                    f"Succesfully exported tarifline data with parameters : 'flows' : {flows}, 'products' : {products}, 'reporters' : {reporters}, 'partners' : {partners}, 'partners2' : {partners2}, 'periods' : {periods} to {os.path.join(filepath, filename)}."
-                )
-            else:
-                # Logging
-                if df.empty:
-                    self.logger.warning(
-                        f"Did not export tarifline data with parameters : 'flows' : {flows}, 'products' : {products}, 'reporters' : {reporters}, 'partners' : {partners}, 'partners2' : {partners2}, 'periods' : {periods}. Empty DataFrame"
-                    )
-                else:
-                    self.logger.warning(
-                        f"Did not export tarifline data with parameters : 'flows' : {flows}, 'products' : {products}, 'reporters' : {reporters}, 'partners' : {partners}, 'partners2' : {partners2}, 'periods' : {periods}. No export path specified"
-                    )
+            # Pas de subdivision : construction des métadonnées de la requête
+            request_metadata = self._build_request_metadata(
+                flows, products, reporters, partners, partners2, periods, frequency
+            )
 
         # Logging du nombre d'appels nécessaires pour finaliser la requête
-        self.logger.info(
-            f"{self.api_calls - initial_api_calls} api calls needed to fetch tarifline data with parameters : 'flows' : {flows}, 'products' : {products}, 'reporters' : {reporters}, 'partners' : {partners}, 'partners2' : {partners2}, 'periods' : {periods}"
+        logger.info(
+            f"{self.api_calls - initial_api_calls} api calls needed to fetch "
+            f"tarifline data with parameters : 'flows' : {flows}, "
+            f"'products' : {products}, 'reporters' : {reporters}, "
+            f"'partners' : {partners}, 'partners2' : {partners2}, "
+            f"'periods' : {periods}"
         )
 
         return df, request_metadata
 
-    # Méthode de chargement des méta-données
-    def get_metadata(self, category: Optional[Union[str, None]] = None) -> pd.DataFrame:
-        """Fetch metadata for a specific category from UN Comtrade.
-
-        Args:
-            category (str, optional): Category to fetch metadata for. If None,
-                returns list of all available categories.
+    # Méthode auxiliaire de construction des métadonnées d'une requête
+    @staticmethod
+    def _build_request_metadata(
+        flows, products, reporters, partners, partners2, periods, frequency
+    ) -> dict:
+        """Build the metadata dictionary describing a resolved request.
 
         Returns:
-            pd.DataFrame: Metadata for the specified category
+            Dictionary of stringified request parameters.
+        """
+        # Sérialisation des paramètres de la requête
+        return {
+            "flows": str(flows),
+            "products": str(products),
+            "reporters": str(reporters),
+            "partners": str(partners),
+            "partners2": str(partners2),
+            "periods": str(periods),
+            "frequency": str(frequency),
+        }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Métadonnées et périodes
+    # ──────────────────────────────────────────────────────────────────
+
+    # Méthode de chargement des métadonnées d'une catégorie de référence
+    def get_metadata(self, category: Optional[Union[str, None]] = None) -> pd.DataFrame:
+        """Fetch metadata for a reference category from UN Comtrade.
+
+        Args:
+            category: Reference category. When ``None``, returns the registry
+                of available categories.
+
+        Returns:
+            DataFrame with the metadata for the requested category.
+
+        Raises:
+            ValueError: If ``category`` is invalid or the data cannot be
+                retrieved.
 
         Examples:
-            >>> # Get all categories
-            >>> categories = scraper.get_metadata()
-            >>> # Get reporter countries
-            >>> reporters = scraper.get_metadata(category='reporter')
+            >>> categories = client.get_metadata()  # doctest: +SKIP
+            >>> reporters = client.get_metadata(category="reporter")  # doctest: +SKIP
         """
-        # Chargement des références
+        # Application du rate limiter avant l'appel API
+        self._acquire()
+
+        # Chargement du registre des références
         metadata_index = comtradeapicall.listReference(
             category=category,
-            proxy_url=(
-                miscellanous["PROXY"]
-                if miscellanous["PROXY"] is None
-                else f"http://{miscellanous['PROXY']}"
-            ),
+            proxy_url=self._proxy_url,
         )
 
-        # Si le jeu de données est vide, renvoi une erreur avec les modalités valides
+        # Jeu de données vide → erreur avec les modalités valides
         if metadata_index.empty:
             # Requête de l'ensemble des possibilités
             metadata_options = comtradeapicall.listReference(
                 category=None,
-                proxy_url=(
-                    miscellanous["PROXY"]
-                    if miscellanous["PROXY"] is None
-                    else f"http://{miscellanous['PROXY']}"
-                ),
+                proxy_url=self._proxy_url,
             )
-            # Erreur
             raise ValueError(
-                f"Invalid 'category' : {category}. To get further information, run with category=None. 'category' should be in {metadata_options['category'].tolist()}."
+                f"Invalid 'category' : {category}. To get further information, "
+                f"run with category=None. 'category' should be in "
+                f"{metadata_options['category'].tolist()}."
             )
 
-        # Si la catégorie n'est pas spécifiée, renvoi le registre des méta-données
+        # Catégorie non spécifiée → registre des méta-données
         if category is None:
             return metadata_index
+
+        # Requête du fichier de la catégorie (session HTTP héritée d'APIClient)
+        response = self.session.get(metadata_index["fileuri"].iloc[0])
+
+        # Disjonction de cas suivant le statut de la requête
+        if response.status_code == 200:
+            # Extraction et normalisation des données
+            data = response.json()
+            return pd.json_normalize(data["results"])
         else:
-            # Initialisation du session s'il n'en existe pas déjà une
-            if not hasattr(self, "session"):
-                self._init_session()
-            # Requête
-            response = self.session.get(metadata_index["fileuri"].iloc[0])
+            raise ValueError(
+                f"Failed to retrieve data for category : {category}. "
+                f"Status code: {response.status_code}"
+            )
 
-            # Disjonction de cas suivant le statut de la requête
-            if response.status_code == 200:
-                # Extraction des données
-                data = response.json()
-
-                # Conversion des données en DataFrame
-                df = pd.json_normalize(data["results"])
-
-                return df
-            else:
-                raise ValueError(
-                    f"Failed to retrieve data for category : {category}. Status code: {response.status_code}"
-                )
-
-    # Méthode auxiliaire de validation du format de la période
+    # Méthode auxiliaire de validation du format d'une période
     def _validate_date(self, period: Union[str, int]) -> str:
         """Validate and format a date period string.
 
         Args:
-            period (Union[str, int]): Period to validate (YYYY, YYYY-MM, or YYYY-MM-DD)
+            period: Period to validate (``YYYY``, ``YYYY-MM`` or
+                ``YYYY-MM-DD``).
 
         Returns:
-            str: Validated and formatted date string (YYYY-MM-DD)
+            Validated date string (``YYYY-MM-DD``).
 
         Raises:
-            ValueError: If period format is invalid
+            ValueError: If the period format is invalid.
 
         Examples:
-            >>> scraper._validate_date('2023')
+            >>> ComtradeClient._validate_date(None, "2023")
             '2023-01-01'
-            >>> scraper._validate_date('2023-06')
+            >>> ComtradeClient._validate_date(None, "2023-06")
             '2023-06-01'
-            >>> scraper._validate_date('2023-06-15')
-            '2023-06-15'
         """
-        # Conversion en string
+        # Conversion en chaîne et remplacement des caractères non numériques par '-'
         period = str(period)
-        # Stripping de la chaine de caractère et remplacement de tous les caractères non numériques par '-'
         period = re.sub(r"\D", "-", period.strip())
 
-        # La période doit avoir au minimum quatre chiffres (correspondants à une année)
+        # La période doit avoir au minimum quatre chiffres (année)
         if len(period) < 4:
             raise ValueError("Period must be at least 4 digits long")
 
-        # Complétion de la chaine de caractères de sorte qu'elle soit de longueur 10 avec "-01"
+        # Complétion de la chaîne jusqu'à une longueur de 10 (YYYY-MM-DD)
         if len(period) == 4:
             period += "-01-01"
         elif len(period) == 7:
@@ -699,10 +710,9 @@ class UNComtradeScraper(Scraper):
             raise ValueError(
                 "Period must be in the format YYYY or YYYY-MM or YYYY-MM-DD"
             )
-
         return period
 
-    # Méthode de construction des périodes valides pour requêter des données de commerce international
+    # Méthode de construction des périodes valides
     def get_valid_periods(
         self,
         periods: Optional[Union[List[str], str, None]] = None,
@@ -710,742 +720,187 @@ class UNComtradeScraper(Scraper):
         period_end: Optional[Union[str, None]] = None,
         frequency: Optional[str] = "monthly",
     ) -> List[str]:
-        """Generate list of valid periods for trade data requests.
+        """Generate the list of valid periods for trade-data requests.
 
         Args:
-            periods (List[str], optional): List of specific periods to validate
-            period_start (str, optional): Start period (YYYY, YYYY-MM, or YYYY-MM-DD)
-            period_end (str, optional): End period (YYYY, YYYY-MM, or YYYY-MM-DD)
-            frequency (str, optional): Data frequency ('monthly' or 'annual')
+            periods: Explicit periods to intersect with the valid range.
+            period_start: Start period (``YYYY``, ``YYYY-MM`` or
+                ``YYYY-MM-DD``).
+            period_end: End period.
+            frequency: Data frequency (``'monthly'`` or ``'annual'``).
 
         Returns:
-            List[str]: List of valid periods in the specified format
+            List of valid periods in the API format (``YYYY`` or ``YYYYMM``).
 
-        Examples:
-            >>> # Get monthly periods for 2023
-            >>> periods = scraper.get_valid_periods(
-            ...     period_start='2023-01',
-            ...     period_end='2023-12',
-            ...     frequency='monthly'
-            ... )
-            >>> # Get specific annual periods
-            >>> periods = scraper.get_valid_periods(
-            ...     periods=['2020', '2021', '2022'],
-            ...     frequency='annual'
-            ... )
+        Raises:
+            ValueError: If ``frequency`` is invalid.
         """
         # Vérification de la cohérence des paramètres
-        if frequency not in ["annual", "monthly"]:
+        if frequency not in VALID_FREQUENCIES:
             raise ValueError(
-                f"Invalid value for frequency : {frequency}. Should be in ['annual', 'monthly']"
+                f"Invalid value for frequency : {frequency}. "
+                f"Should be in {VALID_FREQUENCIES}"
             )
 
-        # Construction du champ des possibles
-        # Si aucune date de début ou de fin n'est donnée, les données sont requêtées entre 1962 et aujourd'hui
-        if (period_start is None) & (period_end is None):
-            valid_periods = (
-                pd.date_range(
-                    start=self._validate_date(period=1962),
-                    end=datetime.today(),
-                    freq="YS" if frequency == "annual" else "MS",
-                )
-                .strftime("%Y" if frequency == "annual" else "%Y%m")
-                .tolist()
+        # Résolution des bornes de la plage (1962 → aujourd'hui par défaut)
+        start = (
+            self._validate_date(period=1962)
+            if period_start is None
+            else self._validate_date(period=period_start)
+        )
+        end = (
+            datetime.today()
+            if period_end is None
+            else self._validate_date(period=period_end)
+        )
+
+        # Construction du champ des périodes valides
+        valid_periods = (
+            pd.date_range(
+                start=start,
+                end=end,
+                freq="YS" if frequency == "annual" else "MS",
             )
-        elif period_start is None:
-            valid_periods = (
-                pd.date_range(
-                    start=self._validate_date(period=1962),
-                    end=self._validate_date(period=period_end),
-                    freq="YS" if frequency == "annual" else "MS",
-                )
-                .strftime("%Y" if frequency == "annual" else "%Y%m")
-                .tolist()
-            )
-        elif period_end is None:
-            valid_periods = (
-                pd.date_range(
-                    start=self._validate_date(period=period_start),
-                    end=datetime.today(),
-                    freq="YS" if frequency == "annual" else "MS",
-                )
-                .strftime("%Y" if frequency == "annual" else "%Y%m")
-                .tolist()
-            )
-        else:
-            valid_periods = (
-                pd.date_range(
-                    start=self._validate_date(period=period_start),
-                    end=self._validate_date(period=period_end),
-                    freq="YS" if frequency == "annual" else "MS",
-                )
-                .strftime("%Y" if frequency == "annual" else "%Y%m")
-                .tolist()
-            )
-        # La période en cours n'est jamais comprise dans les données, aussi on peut supprimer le dernier élément de la liste des périodes valides
+            .strftime("%Y" if frequency == "annual" else "%Y%m")
+            .tolist()
+        )
+
+        # La période en cours n'est jamais complète : retrait du dernier élément
         valid_periods = valid_periods[:-1]
-        # Intersection des périodes valides avec les périodes en argument si ces-dernières sont renseignées
+
+        # Intersection avec les périodes en argument si renseignées
         if periods is not None:
             valid_periods = np.intersect1d(valid_periods, periods).tolist()
 
         return valid_periods
 
-    # Méthode de construction des données
-    def build_tarifline_data(
+    # ──────────────────────────────────────────────────────────────────
+    # Seam de téléchargement incrémental 
+    # ──────────────────────────────────────────────────────────────────
+
+    # Méthode de récupération de la disponibilité finale des données
+    def get_final_data_availability(
         self,
-        flows: Optional[Union[List[str], str, None]] = ["M", "X"],
-        products: Optional[Union[List[int], List[str], int, str, None]] = None,
         reporters: Optional[Union[List[int], List[str], int, str, None]] = None,
-        partners: Optional[Union[List[int], List[str], int, str, None]] = None,
-        partners2: Optional[Union[List[int], List[str], int, str, None]] = None,
         periods: Optional[Union[List[str], str, None]] = None,
-        period_start: Optional[Union[str, None]] = None,
-        period_end: Optional[Union[str, None]] = None,
-        frequency: Optional[str] = "monthly",
-        usecols: Optional[Union[List[str], None]] = None,
-        id_cols: Optional[Union[List[str], None]] = None,
-        aggregation_cols: Optional[Union[List[str], None]] = None,
-        raw_filepath: Optional[Union[os.PathLike, None]] = None,
-        bucket: Optional[Union[str, None]] = None,
+        frequency: str = "annual",
+        type_code: str = "C",
+        classification: str = "HS",
     ) -> pd.DataFrame:
-        """Build comprehensive trade data with optional aggregation.
+        """Fetch the final-data availability for reporters and periods.
+
+        Wraps ``comtradeapicall.getFinalDataAvailability``. Used by the download
+        script to compare each release's ``lastReleased`` date with the last
+        recorded download and decide whether a (reporter, period) couple must be
+        refreshed.
 
         Args:
-            flows (List[str], optional): Trade flow codes
-            products (List[str], optional): Product codes
-            reporters (List[str], optional): Reporter country codes
-            partners (List[str], optional): Partner country codes
-            partners2 (List[str], optional): Secondary partner codes
-            periods (List[str], optional): Time periods
-            period_start (str, optional): Start period
-            period_end (str, optional): End period
-            frequency (str, optional): Data frequency ('monthly' or 'annual')
-            usecols (List[str], optional): Columns to keep in output
-            id_cols (List[str], optional): Columns to use as identifiers
-            aggregation_cols (List[str], optional): Columns to aggregate
-            raw_filepath (str, optional): Path to save raw data
-            bucket (str, optional): S3 bucket name
+            reporters: Reporter codes (``None`` for all reporters).
+            periods: Periods to check (``YYYY`` or ``YYYYMM``).
+            frequency: Data frequency (``'annual'`` or ``'monthly'``).
+            type_code: Trade type (``'C'`` or ``'S'``).
+            classification: Classification code (``'HS'``, ...).
 
         Returns:
-            pd.DataFrame: Processed trade data
-
-        Examples:
-            >>> data = scraper.build_tarifline_data(
-            ...     flows=['M', 'X'],
-            ...     reporters='FRA',
-            ...     period_start='2023-01',
-            ...     period_end='2023-12',
-            ...     id_cols=['period', 'reporter', 'partner'],
-            ...     aggregation_cols=['value', 'quantity']
-            ... )
+            DataFrame returned by ``getFinalDataAvailability``.
         """
-        # Requête des données
-        df, request_metadata = self.get_tarifline_data(
-            flows=flows,
-            products=products,
-            reporters=reporters,
-            partners=partners,
-            partners2=partners2,
-            periods=periods,
-            period_start=period_start,
-            period_end=period_end,
-            frequency=frequency,
-            filepath=raw_filepath,
-            bucket=bucket,
+        # Preprocessing des codes
+        reporters = self._preprocess_codes(codes=reporters)
+        if isinstance(periods, list):
+            periods = ",".join([str(p) for p in periods])
+
+        # Application du rate limiter avant l'appel API
+        self._acquire()
+
+        # Requête de la disponibilité finale des données
+        return comtradeapicall.getFinalDataAvailability(
+            subscription_key=self.subscription_key,
+            typeCode=type_code,
+            freqCode="A" if frequency == "annual" else "M",
+            clCode=classification,
+            reporterCode=reporters,
+            period=periods,
         )
 
-        # Si le jeu de données n'est pas vide
-        if not df.empty:
-            # Restriction aux colonnes d'intérêt
-            if usecols is not None:
-                df = df[np.unique(usecols + parameters["FLOW_COLUMNS"]).tolist()]
-            elif (id_cols is not None) & (aggregation_cols is not None):
-                df = df[
-                    np.unique(
-                        id_cols + aggregation_cols + parameters["FLOW_COLUMNS"]
-                    ).tolist()
-                ]
-            elif aggregation_cols is not None:
-                df = df[
-                    np.unique(aggregation_cols + parameters["FLOW_COLUMNS"]).tolist()
-                ]
-            elif id_cols is not None:
-                df = df[np.unique(id_cols + parameters["FLOW_COLUMNS"]).tolist()]
+    # Méthode d'exécution d'un objet requête
+    def execute_query(self, query: "ComtradeQueryRequest") -> pd.DataFrame:
+        """Execute a :class:`ComtradeQueryRequest` and return its DataFrame.
 
-            # Agrégation par flux
-            df = self.agg_by_flow(
-                df=df, id_cols=id_cols, aggregation_cols=aggregation_cols
-            )
-
-        return df, request_metadata
-
-    # Construction de données symétriques
-    def build_symetric_tarifline_data(
-        self,
-        flows: Optional[Union[List[str], str, None]] = ["M", "X"],
-        products: Optional[Union[List[int], List[str], int, str, None]] = None,
-        reporters: Optional[Union[List[int], List[str], int, str, None]] = None,
-        partners: Optional[Union[List[int], List[str], int, str, None]] = None,
-        partners2: Optional[Union[List[int], List[str], int, str, None]] = None,
-        periods: Optional[Union[List[str], str, None]] = None,
-        period_start: Optional[Union[str, None]] = None,
-        period_end: Optional[Union[str, None]] = None,
-        frequency: Optional[str] = "monthly",
-        usecols: Optional[Union[List[str], None]] = None,
-        id_cols: Optional[Union[List[str], None]] = None,
-        aggregation_cols: Optional[Union[List[str], None]] = None,
-        symetric_flow: Optional[str] = "import",
-        raw_filepath: Optional[Union[os.PathLike, None]] = None,
-        bucket: Optional[Union[str, None]] = None,
-    ) -> pd.DataFrame:
-        """Build symmetrized trade data by comparing reporter and partner declarations.
+        Maps the query selection fields onto :meth:`get_data` and discards the
+        request metadata, returning only the DataFrame for symmetry with the
+        SDMX clients' ``execute_query``.
 
         Args:
-            flows (List[str], optional): Trade flow codes
-            products (List[str], optional): Product codes
-            reporters (List[str], optional): Reporter country codes
-            partners (List[str], optional): Partner country codes
-            partners2 (List[str], optional): Secondary partner codes
-            periods (List[str], optional): Time periods
-            period_start (str, optional): Start period
-            period_end (str, optional): End period
-            frequency (str, optional): Data frequency ('monthly' or 'annual')
-            usecols (List[str], optional): Columns to keep in output
-            id_cols (List[str], optional): Columns to use as identifiers
-            aggregation_cols (List[str], optional): Columns to aggregate
-            symetric_flow (str, optional): Flow to symmetrize ('import' or 'export')
-            raw_filepath (str, optional): Path to save raw data
-            bucket (str, optional): S3 bucket name
+            query: Comtrade query request.
 
         Returns:
-            pd.DataFrame: Symmetrized trade data
-
-        Examples:
-            >>> data = scraper.build_symetric_tarifline_data(
-            ...     flows=['M', 'X'],
-            ...     reporters=['FRA', 'DEU'],
-            ...     period='2023',
-            ...     symetric_flow='import'
-            ... )
+            DataFrame with the retrieved data.
         """
-        # Construction des données
-        df, request_metadata = self.build_tarifline_data(
-            flows=flows,
-            products=products,
-            reporters=reporters,
-            partners=partners,
-            partners2=partners2,
-            periods=periods,
-            period_start=period_start,
-            period_end=period_end,
-            frequency=frequency,
-            usecols=usecols,
-            id_cols=np.unique(id_cols + ["flowCode"]).tolist(),
-            aggregation_cols=aggregation_cols,
-            raw_filepath=raw_filepath,
-            bucket=bucket,
+        # Délégation à get_data avec les champs de sélection de la requête
+        df, _ = self.get_data(
+            flows=query.flows,
+            products=query.products,
+            reporters=query.reporters,
+            partners=query.partners,
+            partners2=query.partners2,
+            periods=query.periods,
+            period_start=query.period_start,
+            period_end=query.period_end,
+            frequency=query.frequency,
         )
+        return df
 
-        # Si le jeu de données n'est pas vide
-        if not df.empty:
-            # Agrégation des flux symétriques
-            df = self.agg_symetric_flows(
-                df=df, id_cols=id_cols, symetric_flow=symetric_flow
-            )
-            # Suppression de la colonne 'flowCode' si elle ne fait pas partie des colonnes d'identifiants
-            if "flowCode" not in id_cols:
-                df.drop("flowCode", axis=1, inplace=True)
-
-        return df, request_metadata
-
-    # Agrégation par flux X pays1 X pays2 x période X nomenclature
-    # /!\ On a toujours des duplicats par 'typeCode', 'freqCode', 'period', 'reporterISO', 'flowDesc', 'partnerISO', 'cmdCode', 'classificationCode', 'partner2ISO', 'mosCode', 'motCode', 'qtyUnitCode' que l'on ne sait pas expliquer et que l'on somme par défaut
-    def agg_by_flow(
-        self,
-        df: pd.DataFrame,
-        id_cols: Optional[Union[List[str], None]] = None,
-        aggregation_cols: Optional[Union[List[str], None]] = None,
-    ) -> pd.DataFrame:
-        """Aggregate trade data by flow and other dimensions.
+    # Méthode de résolution de la structure d'une requête
+    def resolve_query_structure(
+        self, query: "ComtradeQueryRequest"
+    ) -> DataflowStructure:
+        """Resolve the dataflow structure backing a query (for primary keys).
 
         Args:
-            df (pd.DataFrame): Input trade data
-            id_cols (List[str], optional): Columns to use as identifiers
-            aggregation_cols (List[str], optional): Columns to aggregate
+            query: Comtrade query request.
 
         Returns:
-            pd.DataFrame: Aggregated trade data
-
-        Examples:
-            >>> aggregated = scraper.agg_by_flow(
-            ...     df=raw_data,
-            ...     id_cols=['period', 'reporter'],
-            ...     aggregation_cols=['value']
-            ... )
+            The :class:`DataflowStructure` of the query's dataflow.
         """
-        # Extraction des colonnes de variables catégorielles du jeu de données
-        id_cols = (
-            np.unique(id_cols + parameters["FLOW_COLUMNS"]).tolist()
-            if id_cols is not None
-            else np.unique(
-                df.select_dtypes(include=["object", "category"]).columns.tolist()
-                + parameters["FLOW_COLUMNS"]
-            ).tolist()
-        )
-        # Extraction des valeurs numériques du jeu de données
-        aggregation_cols = (
-            np.unique(aggregation_cols + parameters["FLOW_COLUMNS"]).tolist()
-            if aggregation_cols is not None
-            else np.unique(
-                df.select_dtypes(include=["number"]).columns.tolist()
-                + parameters["FLOW_COLUMNS"]
-            ).tolist()
-        )
+        # Délégation à get_structure avec les identifiants de la requête
+        return self.get_structure(dataflow=query.dataflow, agency=query.agency)
 
-        # Déduplication des variables catégorielles
-        df_category = df[id_cols].drop_duplicates(
-            subset=parameters["FLOW_COLUMNS"], keep="first"
-        )
+    # Méthode d'extraction de la structure d'un dataflow
+    def get_structure(
+        self, dataflow: str, agency: str = AGENCY_ID
+    ) -> DataflowStructure:
+        """Return the structure of a Comtrade dataflow.
 
-        # Somme des variables continues
-        df_number = (
-            df[aggregation_cols]
-            .groupby(parameters["FLOW_COLUMNS"], as_index=False)[
-                np.setdiff1d(aggregation_cols, parameters["FLOW_COLUMNS"]).tolist()
-            ]
-            .sum()
-        )
-
-        # Appariement des deux jeux de données
-        df_res = pd.merge(
-            left=df_category,
-            right=df_number,
-            how="left",
-            on=parameters["FLOW_COLUMNS"],
-            validate="one_to_one",
-        )
-
-        return df_res
-
-    # Agrégation des flux d'imports exports symétriques
-    def agg_symetric_flows(
-        self,
-        df: pd.DataFrame,
-        id_cols: Optional[Union[List[str], None]] = None,
-        symetric_flow: Optional[str] = "import",
-    ) -> pd.DataFrame:
-        """Aggregate symmetric import/export flows.
+        UN Comtrade has no structure endpoint, so the structure is read from the
+        registry (populated from ``parameters/comtrade.json``) or derived from
+        the declared identifier columns and cached.
 
         Args:
-            df (pd.DataFrame): Input trade data
-            id_cols (List[str], optional): Columns to use as identifiers
-            symetric_flow (str): Flow type to symmetrize ('import' or 'export')
+            dataflow: Logical dataflow identifier (e.g. ``"C_A_HS"``).
+            agency: Maintaining agency (default: ``"COMTRADE"``).
 
         Returns:
-            pd.DataFrame: Aggregated symmetric flows
-
-        Examples:
-            >>> symmetric = scraper.agg_symetric_flows(
-            ...     df=raw_data,
-            ...     id_cols=['period', 'reporter'],
-            ...     symetric_flow='import'
-            ... )
+            The resolved :class:`DataflowStructure`.
         """
-        # Vérification de la valeur du paramètre
-        if symetric_flow not in ["import", "export"]:
-            raise ValueError(
-                "Invalid value for 'symetric_flow'. Should be in ['import', 'export']"
-            )
+        # Recherche dans le registre avant toute construction
+        cached = self.structure_registry.get(agency, dataflow)
+        if cached is not None:
+            return cached
 
-        # Séparation des flux d'imports / export
-        df_imp = df.loc[df["flowCode"].isin(["M", "FM", "MIP", "MOP", "RM"])]
-        df_exp = df.loc[df["flowCode"].isin(["X", "DX", "RX", "XIP", "XOP"])]
-
-        # Identification des colonnes relatives aux pays d'origine et de destination
-        reporter_columns = [col for col in df.columns if col.startswith("reporter")]
-        partner_columns = [
-            col
-            for col in df.columns
-            if col.startswith("partner") and not col.startswith("partner2")
-        ]
-
-        # Inversion des pays d'imports et d'exports
-        inverse_reporter_columns = {
-            col: col.replace("reporter", "partner") for col in reporter_columns
-        }
-        inverse_partner_columns = {
-            col: col.replace("partner", "reporter") for col in partner_columns
-        }
-
-        # Identification des variables catégorielles sur lesquelles moyenner
-        id_cols = (
-            np.unique(id_cols + parameters["FLOW_COLUMNS"]).tolist()
-            if id_cols is not None
-            else np.unique(
-                df.select_dtypes(include=["object", "category"]).columns.tolist()
-                + parameters["FLOW_COLUMNS"]
-            ).tolist()
+        # Construction depuis les paramètres déclarés et mise en cache
+        structure = parsing.build_structure_from_parameters(
+            self._parameters, agency, dataflow
         )
-        # Identification des colonnes sur lesquelles agréger les données
-        groupby_cols = np.unique(
-            id_cols
-            + ["flowCode"]
-            + reporter_columns
-            + partner_columns
-            + list(inverse_reporter_columns.values())
-            + list(inverse_partner_columns.values())
-        ).tolist()
+        self.structure_registry.register(structure)
+        return structure
 
-        # Création des jeux de données
-        if symetric_flow == "import":
-            # Jeu de données d'imports
-            df_reversed_imp = df_exp.rename(
-                inverse_partner_columns | inverse_reporter_columns, axis=1
-            )
-            df_reversed_imp["flowCode"] = df_reversed_imp["flowCode"].replace(
-                {"X": "M", "DX": "FM", "RX": "RM", "XIP": "MIP", "XOP": "MOP"}
-            )
-            # Si la description des flux est également dans les colonnes, on change les libellés correspondants
-            if "flowDesc" in df.columns:
-                df_reversed_imp["flowDesc"] = df_reversed_imp["flowDesc"].replace(
-                    {
-                        "Export": "Import",
-                        "Domestic Export": "Foreign Import",
-                        "Re-export": "Re-import",
-                        "Export of goods after inward processing": "Import of goods for inward processing",
-                        "Export of goods for outward processing": "Import of goods after outward processing",
-                    }
-                )
-            df_res = pd.concat([df_imp, df_reversed_imp], axis=0, join="inner")
-        elif symetric_flow == "export":
-            # Jeu de données d'exports
-            df_reversed_exp = df_imp.rename(
-                inverse_partner_columns | inverse_reporter_columns, axis=1
-            )
-            df_reversed_exp["flowCode"] = df_reversed_exp["flowCode"].replace(
-                {"M": "X", "FM": "DX", "MIP": "XIP", "MOP": "XOP", "RM": "RX"}
-            )
-            # Si la description des flux est également dans les colonnes, on change les libellés correspondants
-            if "flowDesc" in df.columns:
-                df_reversed_exp["flowDesc"] = df_reversed_exp["flowDesc"].replace(
-                    {
-                        "Import": "Export",
-                        "Foreign Import": "Domestic Export",
-                        "Re-import": "Re-export",
-                        "Import of goods for inward processing": "Export of goods after inward processing",
-                        "Import of goods after outward processing": "Export of goods for outward processing",
-                    }
-                )
-            df_res = pd.concat([df_exp, df_reversed_exp], axis=0, join="inner")
+    # ──────────────────────────────────────────────────────────────────
+    # Fermeture des ressources
+    # ──────────────────────────────────────────────────────────────────
 
-        # Moyenne des deux flux déclarés
-        df_res = df_res.groupby(
-            np.intersect1d(groupby_cols, df_res.columns.tolist()).tolist(),
-            as_index=False,
-        )[np.setdiff1d(df_res.columns.tolist(), groupby_cols)].mean()
-
-        return df_res
-
-    # Méthode de construction des données en définissant une partition par produits et période
-    def build_tarifline_by_period_product(
-        self,
-        name: str,
-        export_path: os.PathLike,
-        executed_requests_filepath: os.PathLike,
-        empty_requests_filepath: os.PathLike,
-        bucket: Optional[Union[str, None]] = None,
-        raw_export_path: Optional[Union[os.PathLike, None]] = None,
-        flows: Optional[Union[List[str], str, None]] = ["M", "X"],
-        products: Optional[Union[List[int], List[str], int, str, None]] = None,
-        products_step: Optional[int] = 10,
-        periods: Optional[Union[List[str], str, None]] = None,
-        period_start: Optional[Union[str, None]] = None,
-        period_end: Optional[Union[str, None]] = None,
-        frequency: Optional[str] = "monthly",
-        id_cols: Optional[Union[List[str], None]] = None,
-        aggregation_cols: Optional[Union[List[str], None]] = None,
-        symetric_flow: Optional[Union[str, None]] = "import",
-    ) -> None:
-        """Build trade data by period and product with automatic pagination.
-
-        Iterates over periods and product batches, skipping already-executed
-        requests. Empty responses are tracked separately: they are skipped as
-        long as fresh (unexecuted, non-empty) batches remain, and retried only
-        once the period is otherwise complete.
-
-        Args:
-            name (str): Name identifier for the build.
-            export_path (os.PathLike): Path to export processed data.
-            executed_requests_filepath (os.PathLike): Path to the JSON file
-                tracking successfully completed requests.
-            empty_requests_filepath (os.PathLike): Path to the JSON file
-                tracking requests that returned an empty DataFrame.
-            bucket (str, optional): S3 bucket name.
-            raw_export_path (os.PathLike, optional): Path to save raw data.
-            flows (List[str], optional): Trade flow codes.
-            products (List[str], optional): Product codes.
-            products_step (int, optional): Number of products per request.
-            periods (List[str], optional): Time periods.
-            period_start (str, optional): Start period.
-            period_end (str, optional): End period.
-            frequency (str, optional): Data frequency ('monthly' or 'annual').
-            id_cols (List[str], optional): Columns to use as identifiers.
-            aggregation_cols (List[str], optional): Columns to aggregate.
-            symetric_flow (str, optional): Flow to symmetrize.
-
-        Examples:
-            >>> scraper.build_tarifline_by_period_product(
-            ...     name='EU_trade_2023',
-            ...     export_path='data/processed',
-            ...     executed_requests_filepath='logs/executed_requests.json',
-            ...     empty_requests_filepath='logs/empty_requests.json',
-            ...     products_step=10,
-            ...     period_start='2023-01',
-            ...     period_end='2023-12'
-            ... )
-        """
-        # Initialisation des produits
-        if products is None:
-            # La nomenclature 'cmd:HS' contient toutes les nomenclatures (présentes et passées)
-            products = self.get_metadata(category="cmd:HS")["id"].tolist()
-            # Filtre sur les SH6 uniquement (une requête SH agrégé couvre ses sous-nomenclatures)
-            products = [product for product in products if len(product) == 6]
-
-        # Initialisation des périodes
-        if periods is None:
-            # Extraction des périodes valides
-            periods = self.get_valid_periods(
-                period_start=period_start, period_end=period_end, frequency=frequency
-            )
-
-        # Parcours des périodes
-        for period in reversed(periods):
-            # Vérification du plafond d'appels API
-            if self.api_calls > parameters["MAX_API_CALLS"]:
-                self.logger.warning(
-                    f"Process terminated prematurely because the number of API calls needed to complete the request exceeds the maximum parameter : {parameters['MAX_API_CALLS']}"
-                )
-                break
-
-            # Chargement initial des requêtes pour déterminer les lots frais
-            try:
-                executed_requests_init = self.loader.load(
-                    filepath=executed_requests_filepath, bucket=bucket
-                )
-            except Exception:
-                executed_requests_init = {}
-
-            try:
-                empty_requests_init = self.loader.load(
-                    filepath=empty_requests_filepath, bucket=bucket
-                )
-            except Exception:
-                empty_requests_init = {}
-
-            executed_products_init = set(
-                executed_requests_init.get(name, {}).get(period, [])
-            )
-            empty_products_init = set(
-                empty_requests_init.get(name, {}).get(period, [])
-            )
-
-            # Détermination de l'existence de lots frais pour cette période
-            # (ni exécutés avec succès, ni vides lors des précédentes exécutions)
-            has_fresh_batches = any(
-                len(
-                    np.setdiff1d(
-                        products[i: min(i + products_step, len(products))],
-                        list(executed_products_init) + list(empty_products_init),
-                    )
-                ) > 0
-                for i in range(0, len(products), products_step)
-            )
-
-            # Parcours des nomenclatures par lot
-            for i in range(0, len(products), products_step):
-                # Vérification du plafond d'appels API
-                if self.api_calls > parameters["MAX_API_CALLS"]:
-                    self.logger.warning(
-                        f"Process terminated prematurely because the number of API calls needed to complete the request exceeds the maximum parameter : {parameters['MAX_API_CALLS']}"
-                    )
-                    break
-
-                list_nomenclature = products[i: min(i + products_step, len(products))]
-
-                # Rechargement des requêtes depuis le stockage (état le plus récent)
-                try:
-                    executed_requests = self.loader.load(
-                        filepath=executed_requests_filepath, bucket=bucket
-                    )
-                except Exception as e:
-                    self.logger.warning(
-                        f"Could not load executed requests : {str(e)}. Initialized it to a new one"
-                    )
-                    executed_requests = {}
-
-                try:
-                    empty_requests = self.loader.load(
-                        filepath=empty_requests_filepath, bucket=bucket
-                    )
-                except Exception as e:
-                    self.logger.warning(
-                        f"Could not load empty requests : {str(e)}. Initialized it to a new one"
-                    )
-                    empty_requests = {}
-
-                # Filtrage des produits déjà exécutés avec succès
-                if name not in executed_requests or period not in executed_requests.get(name, {}):
-                    list_nomenclature_not_executed = list_nomenclature
-                else:
-                    list_nomenclature_not_executed = np.setdiff1d(
-                        list_nomenclature, executed_requests[name][period]
-                    ).tolist()
-
-                if len(list_nomenclature_not_executed) == 0:
-                    self.logger.info(
-                        f"Already retrieved tarifline data with parameters : 'period' : {period}, 'products' : {list_nomenclature}"
-                    )
-                    continue
-
-                # Filtrage des produits ayant retourné un DataFrame vide
-                # (ignorés tant que des lots frais existent pour la période)
-                empty_products = set(empty_requests.get(name, {}).get(period, []))
-
-                if has_fresh_batches:
-                    list_nomenclature_request = [
-                        p for p in list_nomenclature_not_executed
-                        if p not in empty_products
-                    ]
-                else:
-                    # Mode rattrapage : réexécution des lots précédemment vides
-                    list_nomenclature_request = list_nomenclature_not_executed
-
-                if len(list_nomenclature_request) == 0:
-                    continue
-
-                # Requête
-                if symetric_flow is None:
-                    df, request_metadata = self.build_tarifline_data(
-                        flows=flows,
-                        products=list_nomenclature_request,
-                        reporters=None,
-                        partners=None,
-                        partners2=None,
-                        periods=period,
-                        period_start=None,
-                        period_end=None,
-                        frequency=frequency,
-                        usecols=None,
-                        id_cols=id_cols,
-                        aggregation_cols=aggregation_cols,
-                        raw_filepath=raw_export_path,
-                        bucket=bucket,
-                    )
-                else:
-                    df, request_metadata = self.build_symetric_tarifline_data(
-                        flows=flows,
-                        products=list_nomenclature_request,
-                        reporters=None,
-                        partners=None,
-                        partners2=None,
-                        periods=period,
-                        period_start=None,
-                        period_end=None,
-                        frequency=frequency,
-                        usecols=None,
-                        id_cols=id_cols,
-                        aggregation_cols=aggregation_cols,
-                        symetric_flow=symetric_flow,
-                        raw_filepath=raw_export_path,
-                        bucket=bucket,
-                    )
-
-                # Traitement du résultat
-                if isinstance(df, pd.DataFrame):
-                    if not df.empty:
-                        # Extraction des nomenclatures effectivement retournées
-                        list_nomenclature_completed_request = sorted(
-                            request_metadata["products"].split(",")
-                        )
-
-                        # Construction du nom du fichier retourné
-                        if len(list_nomenclature_completed_request) == 1:
-                            filename = list_nomenclature_completed_request[0]
-                        else:
-                            filename = f"{list_nomenclature_completed_request[0]}-{list_nomenclature_completed_request[-1]}"
-
-                        # Export du jeu de données
-                        self.saver.save(
-                            filepath=os.path.join(
-                                export_path,
-                                f"{period}/{filename}.csv",
-                            ),
-                            bucket=bucket,
-                            obj=df,
-                            index=False,
-                        )
-
-                        # Mise à jour de executed_requests
-                        if name not in executed_requests:
-                            executed_requests[name] = {
-                                period: list_nomenclature_completed_request
-                            }
-                        elif period not in executed_requests[name]:
-                            executed_requests[name][period] = list_nomenclature_completed_request
-                        else:
-                            executed_requests[name][period] = (
-                                executed_requests[name][period]
-                                + list_nomenclature_completed_request
-                            )
-                        self.saver.save(
-                            filepath=executed_requests_filepath,
-                            bucket=bucket,
-                            obj=executed_requests,
-                        )
-
-                        # Retrait éventuel de empty_requests si le lot était précédemment vide
-                        if (
-                            name in empty_requests
-                            and period in empty_requests.get(name, {})
-                        ):
-                            updated_empty = [
-                                p for p in empty_requests[name][period]
-                                if p not in list_nomenclature_completed_request
-                            ]
-                            empty_requests[name][period] = updated_empty
-                            self.saver.save(
-                                filepath=empty_requests_filepath,
-                                bucket=bucket,
-                                obj=empty_requests,
-                            )
-
-                        # Logging
-                        self.logger.info(
-                            f"Successfully retrieved and exported tarifline data with parameters : 'period' : {period}, 'products' : {list_nomenclature_request}"
-                        )
-
-                    else:
-                        # Enregistrement du lot vide dans empty_requests
-                        if name not in empty_requests:
-                            empty_requests[name] = {period: list_nomenclature_request}
-                        elif period not in empty_requests[name]:
-                            empty_requests[name][period] = list_nomenclature_request
-                        else:
-                            empty_requests[name][period] = list(
-                                set(empty_requests[name][period])
-                                | set(list_nomenclature_request)
-                            )
-                        self.saver.save(
-                            filepath=empty_requests_filepath,
-                            bucket=bucket,
-                            obj=empty_requests,
-                        )
-
-                        # Logging
-                        self.logger.warning(
-                            f"Failed to retrieve tarifline data with parameters : 'period' : {period}, 'products' : {list_nomenclature_request}. Empty DataFrame returned"
-                        )
-                else:
-                    self.logger.warning(
-                        f"Failed to retrieve tarifline data with parameters : 'period' : {period}, 'products' : {list_nomenclature_request}. No DataFrame returned"
-                    )
+    # Méthode de fermeture de la connexion HTTP
+    def close(self) -> None:
+        """Close the HTTP session and release resources."""
+        # Fermeture de la session héritée d'APIClient
+        super().close()
+        logger.info("Comtrade client closed")

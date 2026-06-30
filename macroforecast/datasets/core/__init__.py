@@ -2,7 +2,7 @@
 # Client
 from .client import APIClient, AbstractSDMXClient
 # Rate limiter
-from .rate_limiter import RateLimiter
+from .rate_limiter import CompositeRateLimiter, RateLimiter, build_rate_limiter
 # SDMX
 from .sdmx import (
     SDMXVersion,
@@ -22,6 +22,8 @@ __all__ = [
     'APIClient',
     'AbstractSDMXClient',
     'RateLimiter',
+    'CompositeRateLimiter',
+    'build_rate_limiter',
     'SDMXVersion',
     'DimensionAtObservation',
     'StructureResourceType',
