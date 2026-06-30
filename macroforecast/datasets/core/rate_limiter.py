@@ -5,7 +5,6 @@ for API clients, supporting various time units.
 """
 # Importation des modules
 from typing import Any, Dict, List, Literal, Union
-from datetime import datetime, timedelta
 from collections import deque
 import time
 import threading
