@@ -13,6 +13,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "requests>=2.32.5",
     "s3fs>=0.4.2",
+    "xlrd>=2.0.2",
 ]
 
 [dependency-groups]
