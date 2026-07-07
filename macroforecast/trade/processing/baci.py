@@ -29,7 +29,7 @@ Notes:
 # Importation des modules
 from __future__ import annotations
 # Modules de base
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import logging
 import math
 from pathlib import Path
@@ -223,49 +223,23 @@ def read_comtrade_fact_table(
         conn.close()
 
 
-# Fonction de lecture d'un fichier Excel, local ou S3 selon ``bucket``
-def _read_excel(path: str, bucket: Optional[str], **kwargs) -> pd.DataFrame:
-    """Read an Excel file from the local filesystem or S3.
-
-    Routing mirrors :class:`macroforecast.datasets.core.download.SDMXDownloader`:
-    a ``None`` bucket reads the local path; a set bucket reads
-    ``s3://{bucket}/{path}`` through ``s3fs`` (``storage_options``).
-
-    Args:
-        path: File path (local path or S3 object key when ``bucket`` is set).
-        bucket: Optional S3 bucket name.
-        **kwargs: Forwarded to ``pandas.read_excel`` (e.g. ``engine``).
-
-    Returns:
-        The parsed DataFrame.
-    """
-    # Cas local : chemin tel quel
-    if bucket is None:
-        return pd.read_excel(path, **kwargs)
-    # Cas S3 : URI s3:// résolue par fsspec/s3fs
-    return pd.read_excel(f"s3://{bucket}/{path}", **kwargs)
-
-
 # Fonction de chargement des variables de gravité CEPII
 def load_gravity_data(
-    dist_path: Union[str, Path],
-    geo_path: Union[str, Path],
+    dist: pd.DataFrame,
+    geo: pd.DataFrame,
     config: BaciConfig = DEFAULT_CONFIG,
-    bucket: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Load and assemble the bilateral CEPII gravity variables.
+    """Assemble the bilateral CEPII gravity variables.
 
     Joins the ``dist_cepii`` bilateral table (distance, contiguity) with the
     per-country ``geo_cepii`` landlocked indicator (merged twice, for the origin
     and the destination).
 
     Args:
-        dist_path: Path (or S3 key) to ``dist_cepii.xls``.
-        geo_path: Path (or S3 key) to ``geo_cepii.xls``.
+        dist: Raw ``dist_cepii`` table, already loaded (e.g. via
+            :class:`macroforecast.storage2.Loader`).
+        geo: Raw ``geo_cepii`` table, already loaded.
         config: Column conventions.
-        bucket: Optional S3 bucket name (``None`` reads local files). Pass
-            ``config['BUCKET']`` from the YAML configuration to prepare an S3
-            migration.
 
     Returns:
         A bilateral gravity frame with columns ``iso_o``, ``iso_d``, ``distw``,
@@ -274,10 +248,6 @@ def load_gravity_data(
     Raises:
         KeyError: If an expected CEPII column is absent.
     """
-    # Lecture des tables CEPII (moteur xlrd pour les .xls)
-    dist = _read_excel(str(dist_path), bucket, engine="xlrd")
-    geo = _read_excel(str(geo_path), bucket, engine="xlrd")
-
     # Distance bilatérale + contiguïté
     dist_cols = [
         config.dist_iso_o_col,
@@ -320,82 +290,6 @@ def load_gravity_data(
     for col in ("distw", "contig", "landlocked_o", "landlocked_d"):
         merged[col] = pd.to_numeric(merged[col], errors="coerce")
     return merged
-
-
-# Fonction de chargement de la configuration YAML BACI
-def load_baci_config(config_path: Union[str, Path]) -> Dict:
-    """Load the BACI YAML configuration file.
-
-    Args:
-        config_path: Path to ``config/baci.yaml``.
-
-    Returns:
-        The parsed configuration mapping (keys ``BUCKET``, ``paths``,
-        ``parameters``).
-
-    Examples:
-        >>> cfg = load_baci_config("config/baci.yaml")  # doctest: +SKIP
-        >>> cfg["BUCKET"]  # doctest: +SKIP
-    """
-    # Importation paresseuse (yaml n'est utile qu'ici)
-    import yaml
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-# Fonction de construction d'une BaciConfig depuis la section ``parameters`` du YAML
-def baci_config_from_params(params: Optional[Dict]) -> BaciConfig:
-    """Build a :class:`BaciConfig` from the YAML ``parameters`` section.
-
-    Only the keys present in the mapping override the dataclass defaults; every
-    other field keeps its :class:`BaciConfig` default. Country lists and pairs are
-    coerced to the tuple types expected by the frozen dataclass.
-
-    Args:
-        params: The ``parameters`` mapping of ``config/baci.yaml`` (or ``None``).
-
-    Returns:
-        A :class:`BaciConfig` reflecting the configured overrides.
-    """
-    # Aucune surcharge : configuration par défaut
-    if not params:
-        return DEFAULT_CONFIG
-
-    overrides: Dict[str, object] = {}
-    # Variable de distance
-    if params.get("distance_column"):
-        overrides["distance_column"] = params["distance_column"]
-    # Seuils de conversion en tonnes
-    tonnage = params.get("tonnage") or {}
-    if "min_mirror_flows" in tonnage:
-        overrides["min_mirror_flows"] = int(tonnage["min_mirror_flows"])
-    if "max_std" in tonnage:
-        overrides["max_conversion_std"] = float(tonnage["max_std"])
-    # Robustesse de la gravité
-    gravity = params.get("gravity") or {}
-    if "cook_factor" in gravity:
-        overrides["cook_factor"] = float(gravity["cook_factor"])
-    # Listes de pays
-    countries = params.get("countries") or {}
-    if "non_cif" in countries:
-        overrides["non_cif_countries"] = tuple(countries["non_cif"])
-    if "fas" in countries:
-        overrides["fas_countries"] = tuple(countries["fas"])
-    # Exclusions géographiques
-    exclusions = params.get("exclusions") or {}
-    if "reexport_reporters" in exclusions:
-        overrides["reexport_reporters"] = tuple(exclusions["reexport_reporters"])
-    if "excluded_pairs" in exclusions:
-        overrides["excluded_pairs"] = tuple(tuple(p) for p in exclusions["excluded_pairs"])
-    # Zones non spécifiées
-    nes = params.get("nes") or {}
-    if "partner_codes" in nes:
-        overrides["nes_partner_codes"] = tuple(int(c) for c in nes["partner_codes"])
-    if "skip_codes" in nes:
-        overrides["nes_skip_codes"] = tuple(int(c) for c in nes["skip_codes"])
-
-    return replace(DEFAULT_CONFIG, **overrides)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1474,33 +1368,30 @@ def run_baci(
     source_data_path: Union[str, Path],
     result_catalog: Union[str, Path],
     result_data_path: Union[str, Path],
-    dist_path: Union[str, Path],
-    geo_path: Union[str, Path],
+    dist: pd.DataFrame,
+    geo: pd.DataFrame,
     *,
     source_schema: str,
     result_schema: str = "baci",
-    bucket: Optional[str] = None,
     config: BaciConfig = DEFAULT_CONFIG,
     apply_nes: bool = True,
 ) -> BaciReport:
     """Run the BACI reconstruction end to end and write the reconciled flows.
 
-    Reads the COMTRADE fact table, loads the CEPII gravity variables, builds the
-    mirror-flow table, applies the six methodological steps in order, and persists
-    the reconciled value and quantity per ``(exporter, importer, product, year)``
-    into the result DuckLake catalog.
+    Reads the COMTRADE fact table, assembles the CEPII gravity variables, builds
+    the mirror-flow table, applies the six methodological steps in order, and
+    persists the reconciled value and quantity per
+    ``(exporter, importer, product, year)`` into the result DuckLake catalog.
 
     Args:
         source_catalog: Path to the source COMTRADE ``.ducklake`` catalog file.
         source_data_path: Directory of the source Parquet data files.
         result_catalog: Path to the result ``.ducklake`` catalog file.
         result_data_path: Directory for the result Parquet data files.
-        dist_path: Path (or S3 key) to ``dist_cepii.xls``.
-        geo_path: Path (or S3 key) to ``geo_cepii.xls``.
+        dist: Raw ``dist_cepii`` table, already loaded.
+        geo: Raw ``geo_cepii`` table, already loaded.
         source_schema: Schema of the source COMTRADE ``fact_table``.
         result_schema: Target schema in the result catalog.
-        bucket: Optional S3 bucket name for the CEPII files (pass
-            ``config['BUCKET']``); ``None`` reads local files.
         config: Column and methodological conventions.
         apply_nes: Whether to apply the "Areas NES" reallocation step.
 
@@ -1510,8 +1401,8 @@ def run_baci(
     Raises:
         ValueError: If the reconciliation produces no flow.
     """
-    # Chargement de la gravité CEPII (loader bucket-aware)
-    gravity = load_gravity_data(dist_path, geo_path, config, bucket=bucket)
+    # Assemblage de la gravité CEPII
+    gravity = load_gravity_data(dist, geo, config)
     valid_iso = sorted(set(gravity["iso_o"]) | set(gravity["iso_d"]))
 
     # Lecture de la table de faits COMTRADE

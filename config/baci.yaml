@@ -1,9 +1,9 @@
 # Configuration du redressement BACI des flux de commerce international.
 #
 # Tous les chemins sont externalisés ici (jamais écrits en dur dans le module).
-# BUCKET est explicitement à null : il est passé tel quel via bucket=config['BUCKET']
-# au loader des fichiers CEPII (load_gravity_data), pour préparer une future
-# migration S3 (bucket None → lecture locale ; bucket défini → s3://bucket/... ).
+# BUCKET est explicitement à null : il est passé tel quel au storage2.Loader qui
+# lit les fichiers CEPII dans scripts/process_baci.py, pour préparer une future
+# migration S3 (bucket None → lecture locale ; bucket défini → lecture S3).
 
 # Bucket S3 des fichiers CEPII (null → lecture locale via le loader)
 BUCKET: null

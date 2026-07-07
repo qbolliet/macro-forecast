@@ -7,15 +7,22 @@ pondérée des flux miroirs, réallocation des zones non spécifiées) et écrit
 réconciliés dans une nouvelle base DuckLake résultat.
 
 Tous les chemins proviennent de ``config/baci.yaml`` (jamais écrits en dur) ;
-``BUCKET`` y est explicitement à ``null`` et passé via ``bucket=config['BUCKET']``
-au loader des fichiers CEPII, pour préparer une future migration S3. Peut être
+``BUCKET`` y est explicitement à ``null`` et passé au loader Excel des fichiers
+CEPII, pour préparer une future migration S3. Le chargement de la configuration
+YAML, la construction de la ``BaciConfig`` et la lecture des fichiers Excel CEPII
+sont réalisés ici : ``macroforecast.trade.processing.baci`` ne reçoit que des
+jeux de données déjà chargés et des paramètres déjà résolus. Peut être
 ordonnancé (Argo, cron) ou intégré comme nœud Kedro via la fonction exportée.
 """
 
 import argparse
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
+from typing import Dict, Optional
+
+import yaml
 
 # Racine du dépôt (résolution relative à ce fichier)
 ROOT = Path(__file__).resolve().parent.parent
@@ -43,6 +50,79 @@ def _resolve(path: str) -> str:
     return str(p if p.is_absolute() else ROOT / p)
 
 
+def load_baci_config(config_path: str) -> Dict:
+    """Load the BACI YAML configuration file.
+
+    Args:
+        config_path: Path to ``config/baci.yaml``.
+
+    Returns:
+        The parsed configuration mapping (keys ``BUCKET``, ``paths``,
+        ``parameters``).
+
+    Examples:
+        >>> cfg = load_baci_config("config/baci.yaml")  # doctest: +SKIP
+        >>> cfg["BUCKET"]  # doctest: +SKIP
+    """
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def baci_config_from_params(params: Optional[Dict]):
+    """Build a ``BaciConfig`` from the YAML ``parameters`` section.
+
+    Only the keys present in the mapping override the dataclass defaults; every
+    other field keeps its ``BaciConfig`` default. Country lists and pairs are
+    coerced to the tuple types expected by the frozen dataclass.
+
+    Args:
+        params: The ``parameters`` mapping of ``config/baci.yaml`` (or ``None``).
+
+    Returns:
+        A ``BaciConfig`` reflecting the configured overrides.
+    """
+    from macroforecast.trade.processing import DEFAULT_CONFIG
+
+    # Aucune surcharge : configuration par défaut
+    if not params:
+        return DEFAULT_CONFIG
+
+    overrides: Dict[str, object] = {}
+    # Variable de distance
+    if params.get("distance_column"):
+        overrides["distance_column"] = params["distance_column"]
+    # Seuils de conversion en tonnes
+    tonnage = params.get("tonnage") or {}
+    if "min_mirror_flows" in tonnage:
+        overrides["min_mirror_flows"] = int(tonnage["min_mirror_flows"])
+    if "max_std" in tonnage:
+        overrides["max_conversion_std"] = float(tonnage["max_std"])
+    # Robustesse de la gravité
+    gravity = params.get("gravity") or {}
+    if "cook_factor" in gravity:
+        overrides["cook_factor"] = float(gravity["cook_factor"])
+    # Listes de pays
+    countries = params.get("countries") or {}
+    if "non_cif" in countries:
+        overrides["non_cif_countries"] = tuple(countries["non_cif"])
+    if "fas" in countries:
+        overrides["fas_countries"] = tuple(countries["fas"])
+    # Exclusions géographiques
+    exclusions = params.get("exclusions") or {}
+    if "reexport_reporters" in exclusions:
+        overrides["reexport_reporters"] = tuple(exclusions["reexport_reporters"])
+    if "excluded_pairs" in exclusions:
+        overrides["excluded_pairs"] = tuple(tuple(p) for p in exclusions["excluded_pairs"])
+    # Zones non spécifiées
+    nes = params.get("nes") or {}
+    if "partner_codes" in nes:
+        overrides["nes_partner_codes"] = tuple(int(c) for c in nes["partner_codes"])
+    if "skip_codes" in nes:
+        overrides["nes_skip_codes"] = tuple(int(c) for c in nes["skip_codes"])
+
+    return replace(DEFAULT_CONFIG, **overrides)
+
+
 def run(config_path: str, apply_nes: bool = True):
     """Run the BACI reconstruction from a YAML configuration file.
 
@@ -53,28 +133,30 @@ def run(config_path: str, apply_nes: bool = True):
     Returns:
         The :class:`~macroforecast.trade.processing.BaciReport` of the run.
     """
-    from macroforecast.trade.processing import (
-        baci_config_from_params,
-        load_baci_config,
-        run_baci,
-    )
+    from macroforecast.storage2 import Loader
+    from macroforecast.trade.processing import run_baci
 
     # Chargement de la configuration (chemins + paramètres méthodologiques)
     config = load_baci_config(config_path)
     paths = config["paths"]
+    bucket = config["BUCKET"]
     baci_config = baci_config_from_params(config.get("parameters"))
 
-    # Exécution du redressement (BUCKET passé tel quel au loader CEPII)
+    # Lecture des fichiers Excel CEPII (loader local/S3 selon BUCKET)
+    excel_loader = Loader()
+    dist = excel_loader.load(_resolve(paths["dist_cepii"]), bucket=bucket)
+    geo = excel_loader.load(_resolve(paths["geo_cepii"]), bucket=bucket)
+
+    # Exécution du redressement sur les jeux de données déjà chargés
     report = run_baci(
         source_catalog=_resolve(paths["comtrade_catalog"]),
         source_data_path=_resolve(paths["comtrade_data"]),
         result_catalog=_resolve(paths["result_catalog"]),
         result_data_path=_resolve(paths["result_data"]),
-        dist_path=_resolve(paths["dist_cepii"]),
-        geo_path=_resolve(paths["geo_cepii"]),
+        dist=dist,
+        geo=geo,
         source_schema=paths["comtrade_schema"],
         result_schema=paths["result_schema"],
-        bucket=config["BUCKET"],
         config=baci_config,
         apply_nes=apply_nes,
     )

@@ -6,8 +6,6 @@ from .baci import (
 )
 # Chargement des données
 from .baci import (
-    load_baci_config,
-    baci_config_from_params,
     load_gravity_data,
     read_comtrade_fact_table,
     build_mirror_flows,
@@ -35,8 +33,6 @@ __all__ = [
     "BaciConfig",
     "DEFAULT_CONFIG",
     # Chargement des données
-    "load_baci_config",
-    "baci_config_from_params",
     "load_gravity_data",
     "read_comtrade_fact_table",
     "build_mirror_flows",
