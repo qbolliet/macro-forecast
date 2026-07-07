@@ -15,10 +15,11 @@ The chain follows the note's synthesis order:
 5. :class:`MirrorReconciler` — weighted average of the two mirror declarations.
 6. :class:`AreaNesReallocator` — reallocate "Areas NES" flows (optional).
 
-The public entry point :func:`run_baci` reads the COMTRADE fact table from a source
-DuckLake catalog, applies the whole pipeline, and writes the reconciled flows to a
-new result DuckLake catalog — reusing the read/write patterns of
-:mod:`macroforecast.trade.vulnerabilities.runner`.
+The public entry point :func:`run_baci` applies the whole pipeline to an
+already-loaded COMTRADE fact table and returns the reconciled flows. Every
+function and class here consumes eager dataframes, column names and parameter
+values only — all I/O (DuckLake catalogs, CEPII files, YAML configuration)
+belongs to the caller (see ``scripts/process_baci.py``).
 
 Notes:
     Unlike the ``vulnerabilities`` module (backend-agnostic via narwhals), this
@@ -32,26 +33,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import math
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple
 # Modules de manipulation de données
-import duckdb
 import numpy as np
 import pandas as pd
 # Modules économétriques
 import statsmodels.api as sm
-# Module de gestion de la connexion à la base de données
-from dt_ducklake_manager import (
-    DatabaseUpdater,
-    DuckLakeConnector,
-    DuckLakeTablesBuilder,
-)
 
 # Initialisation du logger
 logger = logging.getLogger(__name__)
-
-# Nom de la table de faits DuckLake (convention dt_ducklake_manager)
-_FACT_TABLE = "fact_table"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -82,9 +72,10 @@ class BaciConfig:
         qty_unit_col: Column with the quantity-unit code.
         netwgt_col: Column with the net weight (kilograms).
         weight_unit_codes: Quantity-unit codes already expressed as a weight in
-            kilograms (converted to tonnes by ``kg_to_tonne``).
+            kilograms (converted to tonnes by ``kg_to_tonne``). Quantities in
+            any other unit without a validated conversion rate are abandoned
+            (tonnage ``NaN``) while their value is kept.
         kg_to_tonne: Multiplicative factor from kilograms to tonnes.
-        dropped_unit_codes: Quantity-unit codes to discard (unknown units, kWh).
         min_mirror_flows: Minimum mirror observations to validate a conversion
             rate (``n >= 10``).
         max_conversion_std: Maximum std of the ratios to validate a rate
@@ -98,13 +89,13 @@ class BaciConfig:
             never stripped).
         fas_countries: Importer ISO-3 codes declaring FAS (freight stripped only
             when it reduces the mirror gap).
-        reexport_reporters: Reporters whose re-exports are dropped (kept for
-            documentation; only ``import_code``/``export_code`` flows are used).
         excluded_pairs: Country pairs whose internal flows are dropped.
-        world_partner_code: Numeric partner code of the *World* aggregate.
+        world_partner_code: Numeric partner code of the *World* aggregate
+            (rows dropped upfront).
         nes_partner_codes: Numeric partner codes of the "Areas NES" aggregates
             eligible for reallocation.
-        nes_skip_codes: Numeric partner codes left untouched (e.g. "Asia NES").
+        nes_skip_codes: Numeric partner codes of aggregates left untouched and
+            excluded from the data (e.g. "Other Asia, nes").
         dist_iso_o_col: CEPII distance column with the origin ISO-3 code.
         dist_iso_d_col: CEPII distance column with the destination ISO-3 code.
         contig_col: CEPII contiguity indicator column.
@@ -128,7 +119,6 @@ class BaciConfig:
     # Conversion des quantités en tonnes
     weight_unit_codes: Tuple[int, ...] = (8,)  # 8 = poids en kilogrammes (COMTRADE)
     kg_to_tonne: float = 1e-3
-    dropped_unit_codes: Tuple[int, ...] = ()
     min_mirror_flows: int = 10
     max_conversion_std: float = 2.5
     prefer_netwgt: bool = True
@@ -140,7 +130,6 @@ class BaciConfig:
         "DZA", "GEO", "ZAF", "BWA", "LSO", "NAM", "SWZ",
     )
     fas_countries: Tuple[str, ...] = ("CAN",)
-    reexport_reporters: Tuple[str, ...] = ("HKG", "USA")
     excluded_pairs: Tuple[Tuple[str, str], ...] = (("BEL", "LUX"),)
     # Zones non spécifiées / agrégats
     world_partner_code: int = 0
@@ -164,64 +153,8 @@ _EXP, _IMP, _PROD, _YEAR = "exporter", "importer", "product", "year"
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Chargement des données (COMTRADE + gravité CEPII)
+# Chargement des données (gravité CEPII)
 # ──────────────────────────────────────────────────────────────────────
-
-# Fonction de conversion d'un chemin en littéral SQL à slashes avant
-def _sql_path(path: Union[str, Path]) -> str:
-    """Return a forward-slash string form of a path for SQL literals.
-
-    Args:
-        path: Filesystem path.
-
-    Returns:
-        The path as a forward-slash string (portable inside DuckDB literals).
-    """
-    # Slashes avant : portables dans les littéraux DuckDB, y compris sous Windows
-    return Path(path).as_posix()
-
-
-# Fonction de lecture de la table de faits source (DuckDB en lecture seule)
-def read_comtrade_fact_table(
-    source_catalog: Union[str, Path],
-    source_data_path: Union[str, Path],
-    source_schema: str,
-    columns: Sequence[str],
-) -> pd.DataFrame:
-    """Read selected columns of a COMTRADE DuckLake fact table, read-only.
-
-    Uses a hand-rolled ``ATTACH`` with ``OVERRIDE_DATA_PATH true`` rather than
-    ``DuckLakeConnector.connect()``: the connector fails to re-attach an existing
-    catalog under Windows/OneDrive because of a normalised ``DATA_PATH`` mismatch
-    (same workaround as :func:`macroforecast.trade.vulnerabilities.runner._read_source_fact_table`).
-
-    Args:
-        source_catalog: Path to the source ``.ducklake`` catalog file.
-        source_data_path: Directory of the source Parquet data files.
-        source_schema: Schema holding the ``fact_table``.
-        columns: Columns to project.
-
-    Returns:
-        A pandas DataFrame of the projected fact table.
-    """
-    # Connexion DuckDB en mémoire et chargement de l'extension DuckLake
-    conn = duckdb.connect(":memory:")
-    try:
-        conn.execute("INSTALL ducklake; LOAD ducklake;")
-        # Attachement en lecture seule ; OVERRIDE_DATA_PATH tolère un chemin de
-        # données normalisé différemment de celui stocké dans le catalogue.
-        conn.execute(
-            f"ATTACH 'ducklake:{_sql_path(source_catalog)}' AS src "
-            f"(DATA_PATH '{_sql_path(source_data_path)}/', READ_ONLY, "
-            f"OVERRIDE_DATA_PATH true)"
-        )
-        col_list = ", ".join(f'"{c}"' for c in columns)
-        return conn.execute(
-            f"SELECT {col_list} FROM src.{source_schema}.{_FACT_TABLE}"
-        ).df()
-    finally:
-        conn.close()
-
 
 # Fonction de chargement des variables de gravité CEPII
 def load_gravity_data(
@@ -367,9 +300,12 @@ def build_mirror_flows(
 
     Keeps only import/export declarations between individual countries, applies
     the geographic exclusions of the note (re-exports of Hong Kong/USA are
-    already excluded by keeping only ``M``/``X`` flows; internal ``excluded_pairs``
+    already excluded by keeping only ``M``/``X`` flows; *World* and
+    ``nes_skip_codes`` aggregates dropped upfront; internal ``excluded_pairs``
     dropped), and pivots each direction so both mirror declarations of a flow
     ``(exporter i, importer j, product k, year t)`` sit on the same row.
+    Quantities are kept whatever their unit: those that cannot be converted to
+    tonnes are abandoned later by :class:`TonnageConverter` (value preserved).
 
     Args:
         comtrade_df: Raw COMTRADE fact-table rows.
@@ -391,9 +327,11 @@ def build_mirror_flows(
     # Année entière dérivée de la période (chaîne "YYYY")
     df["_year"] = df[config.period_col].astype(str).str[:4].astype(int)
 
-    # Retrait des unités abandonnées (unités inconnues, kWh)
-    if config.dropped_unit_codes:
-        df = df[~df[config.qty_unit_col].isin(list(config.dropped_unit_codes))]
+    # Exclusion explicite des agrégats non traités : Monde et zones laissées de
+    # côté par la note (ex. « Other Asia, nes », ni réallouées ni pays)
+    df = df[df[config.partner_code_col] != config.world_partner_code]
+    if config.nes_skip_codes:
+        df = df[~df[config.partner_code_col].isin(list(config.nes_skip_codes))]
 
     # Séparation des déclarations d'export et d'import
     is_export = df[config.flow_col] == config.export_code
@@ -640,8 +578,9 @@ class CifGravityModel:
     regressors are ``ln distw``, ``(ln distw)^2``, contiguity, exporter/importer
     landlocked indicators, ``ln UV^k`` and year dummies. Estimation is a weighted
     least squares (weight ``min(Q)/max(Q)``), robustified by dropping influential
-    observations flagged by Cook's distance before the final fit. The predicted
-    value gives the freight rate ``exp(X β̂)``.
+    observations flagged by Cook's distance — computed on the ``√w``-whitened
+    model so the weights are accounted for — before the final fit. The predicted
+    value ``exp(X β̂)`` estimates ``1 + τ`` (see :meth:`predict`).
 
     Args:
         config: Column and threshold conventions.
@@ -752,7 +691,15 @@ class CifGravityModel:
         try:
             from statsmodels.stats.outliers_influence import OLSInfluence
 
-            cook = OLSInfluence(res).cooks_distance[0]
+            # Influence calculée sur le modèle blanchi (OLS sur données
+            # transformées par √w, équivalent exact du WLS) afin que la
+            # distance de Cook tienne compte des poids
+            sqrt_w = np.sqrt(np.asarray(w_fit, dtype="float64"))
+            whitened = sm.OLS(
+                np.asarray(y_fit, dtype="float64") * sqrt_w,
+                X.to_numpy(dtype="float64") * sqrt_w[:, None],
+            ).fit()
+            cook = OLSInfluence(whitened).cooks_distance[0]
             cutoff = cfg.cook_factor / len(cook)
             keep = cook < cutoff
             if keep.sum() > X.shape[1] and (~keep).any():
@@ -879,9 +826,12 @@ class ReportingQualityModel:
     Decomposes the reporting distance ``RD = |ln(V_i / V_j)|`` into additive
     exporter, importer and year fixed effects, the ~5000-modality product
     dimension being absorbed by a within transformation (``linearmodels``'
-    ``AbsorbingLS``). Observations are weighted by ``ln(V_i + V_j)``. Per-country
-    least-square means are turned into standard deviations ``σ̂`` following the
-    note's ad-hoc calibration (eq. 12–13).
+    ``AbsorbingLS``). A single fit yields both the exporter and importer
+    effects, re-expressed in sum-to-zero coding with proper contrast standard
+    errors. Observations are weighted by ``ln(V_i + V_j)`` computed on the
+    declared *values* for both targets, as in the note. Per-country marginal
+    means are turned into standard deviations ``σ̂`` following the note's
+    ad-hoc calibration (eq. 12–13).
 
     Args:
         config: Column conventions.
@@ -919,14 +869,17 @@ class ReportingQualityModel:
         m = mirror.assign(_vi=v_i, _vj=v_j)
         m = m[(m["_vi"] > 0) & (m["_vj"] > 0)].copy()
 
-        # Distance de déclaration et pondération (log de la somme des flux)
+        # Distance de déclaration ; pondération par le log de la somme des
+        # valeurs déclarées (s = ln(V_i + V_j) dans la note), y compris pour la
+        # qualité estimée sur les quantités
         m["_rd"] = np.abs(np.log(m["_vi"] / m["_vj"]))
-        m["_w"] = np.log(m["_vi"] + m["_vj"])
+        m["_w"] = np.log(m["v_x"].fillna(0.0) + m["v_m_fob"].fillna(0.0))
         m = m[(m["_w"] > 0) & np.isfinite(m["_rd"])]
 
-        # Effets marginaux exportateur/importateur estimés par ANOVA absorbée
-        ls_exp, se_exp = _absorbed_anova_effects(m, _EXP, self.config)
-        ls_imp, se_imp = _absorbed_anova_effects(m, _IMP, self.config)
+        # Effets exportateur et importateur extraits d'une même ANOVA absorbée
+        effects = _absorbed_anova_effects(m, self.config)
+        ls_exp, se_exp = effects[_EXP]
+        ls_imp, se_imp = effects[_IMP]
 
         return QualityResult(
             sigma_export=_ls_mean_to_sigma(ls_exp, se_exp),
@@ -934,34 +887,36 @@ class ReportingQualityModel:
         )
 
 
-# Fonction d'estimation des effets marginaux d'une dimension pays par ANOVA absorbée
+# Fonction d'estimation des effets des dimensions pays par ANOVA absorbée
 def _absorbed_anova_effects(
-    m: pd.DataFrame, entity_col: str, config: BaciConfig
-) -> Tuple[pd.Series, pd.Series]:
-    """Estimate the least-square mean of ``RD`` per entity via an absorbed ANOVA.
+    m: pd.DataFrame, config: BaciConfig
+) -> Dict[str, Tuple[pd.Series, pd.Series]]:
+    """Estimate exporter and importer effects of ``RD`` via one absorbed ANOVA.
 
-    Fits ``RD ~ const + exporter + importer + year`` weighted by ``ln(V_i + V_j)``,
-    absorbing the product dimension, and returns the marginal mean and its
-    standard error for the requested entity dimension (exporter or importer).
+    Fits ``RD ~ exporter + importer + year`` weighted by ``ln(V_i + V_j)``,
+    absorbing the product dimension, then re-expresses each country dimension in
+    the note's sum-to-zero coding (eq. 11): a country's effect is its dummy
+    coefficient minus the mean coefficient of its dimension (the reference
+    level counting as zero), and its standard error is that of the
+    corresponding contrast, derived from the full coefficient covariance —
+    including a proper (non-zero) standard error for the reference level.
 
     Args:
         m: Prepared frame with ``_rd`` (dependent), ``_w`` (weight), the entity
             columns and ``year``/``product``.
-        entity_col: Entity dimension to extract effects for (``exporter`` or
-            ``importer``).
         config: Column conventions.
 
     Returns:
-        Tuple ``(ls_mean, std_error)`` of pandas Series indexed by entity code.
+        Mapping ``{dimension: (effects, std_errors)}`` for the ``exporter`` and
+        ``importer`` dimensions, each pair being pandas Series indexed by
+        country code.
     """
     # Importation paresseuse (dépendance économétrique)
     from linearmodels.iv import AbsorbingLS
 
     # Variables explicatives : indicatrices exportateur + importateur + année.
     # Pas de constante explicite : absorbée par les effets fixes produit (elle
-    # deviendrait colinéaire après transformation within). Les effets sont donc
-    # relatifs à la modalité de référence de chaque dimension — suffisant pour le
-    # calage K (qui ne dépend que des écarts à la plus petite moyenne marginale).
+    # deviendrait colinéaire après transformation within).
     exog = pd.get_dummies(
         m[[_EXP, _IMP, _YEAR]].astype(str), drop_first=True
     ).astype("float64")
@@ -969,24 +924,39 @@ def _absorbed_anova_effects(
     # Dimension produit absorbée (transformation within)
     absorb = m[[_PROD]].astype("category")
 
-    # Estimation absorbée pondérée
-    model = AbsorbingLS(m["_rd"], exog, absorb=absorb, weights=m["_w"])
-    res = model.fit()
+    # Estimation absorbée pondérée : un seul ajustement pour les deux dimensions
+    res = AbsorbingLS(m["_rd"], exog, absorb=absorb, weights=m["_w"]).fit()
     params = res.params
-    std_errors = res.std_errors
+    cov = res.cov
 
-    # Reconstruction des moyennes marginales : const + effet de l'entité
-    const = params.get("const", 0.0)
-    entities = sorted(m[entity_col].astype(str).unique())
-    ls_mean: Dict[str, float] = {}
-    se: Dict[str, float] = {}
-    for e in entities:
-        col = f"{entity_col}_{e}"
-        # Entité de référence (absorbée dans la constante) : effet nul
-        coef = params.get(col, 0.0)
-        ls_mean[e] = float(const + coef)
-        se[e] = float(std_errors.get(col, 0.0))
-    return pd.Series(ls_mean), pd.Series(se)
+    out: Dict[str, Tuple[pd.Series, pd.Series]] = {}
+    for entity_col in (_EXP, _IMP):
+        levels = sorted(m[entity_col].astype(str).unique())
+        n_levels = len(levels)
+        # Coefficients en codage de référence (modalité de référence : zéro)
+        coefs = pd.Series(
+            {e: float(params.get(f"{entity_col}_{e}", 0.0)) for e in levels}
+        )
+        # Recentrage somme-nulle (les écarts entre pays sont préservés)
+        effects = coefs - coefs.mean()
+
+        # Écart-type de chaque effet recentré : contraste c = e_i − (1/L)·1 sur
+        # les coefficients estimés (la part de la modalité de référence, sans
+        # coefficient, est nulle dans le contraste)
+        est_cols = [
+            c for c in (f"{entity_col}_{e}" for e in levels) if c in params.index
+        ]
+        col_pos = {c: p for p, c in enumerate(est_cols)}
+        v_mat = cov.loc[est_cols, est_cols].to_numpy()
+        se: Dict[str, float] = {}
+        for e in levels:
+            contrast = np.full(len(est_cols), -1.0 / n_levels)
+            name = f"{entity_col}_{e}"
+            if name in col_pos:
+                contrast[col_pos[name]] += 1.0
+            se[e] = float(np.sqrt(max(contrast @ v_mat @ contrast, 0.0)))
+        out[entity_col] = (effects, pd.Series(se))
+    return out
 
 
 # Fonction de conversion des moyennes marginales en écarts-types σ̂
@@ -1113,9 +1083,13 @@ def _reconcile_pair(
     has_i = v_i > 0
     has_j = v_j > 0
 
-    # Écarts-types propres aux déclarants du flux
-    sigma_i = df[_EXP].map(quality.sigma_export).astype("float64").fillna(0.0).to_numpy()
-    sigma_j = df[_IMP].map(quality.sigma_import).astype("float64").fillna(0.0).to_numpy()
+    # Écarts-types propres aux déclarants du flux ; pays absents de
+    # l'estimation de qualité : fiabilité médiane (plutôt que parfaite) pour ne
+    # pas leur accorder un poids indu
+    default_i = float(quality.sigma_export.median()) if len(quality.sigma_export) else 0.0
+    default_j = float(quality.sigma_import.median()) if len(quality.sigma_import) else 0.0
+    sigma_i = df[_EXP].map(quality.sigma_export).astype("float64").fillna(default_i).to_numpy()
+    sigma_j = df[_IMP].map(quality.sigma_import).astype("float64").fillna(default_j).to_numpy()
     w = _optimal_weight(sigma_i, sigma_j)
 
     # Combinaison convexe lorsque les deux flux existent
@@ -1140,15 +1114,18 @@ class AreaNesReallocator:
     """Reallocate "Areas NES" export flows to identified partners (§ NES).
 
     For each ``(exporter i, product k, year t)`` carrying an "Areas NES" export
-    declaration, compares the sum of the exporter's declared exports to identified
-    partners with the sum of the corresponding mirror imports. When the exporter
-    under-declares, the shortfall ``Σ V_m − Σ V_x`` (capped by the NES value) is
-    distributed across partners in proportion to the per-partner missing imports,
-    and added to the reconciled flows.
+    declaration, compares the sum of the exporter's declared exports on
+    *complete* mirror flows with the sum of the corresponding mirror imports.
+    When the exporter under-declares, the shortfall ``Σ V_m − Σ V_x`` (capped by
+    the NES value) is distributed across partners in proportion to the
+    per-partner missing imports and added to the reconciled flows — but only
+    when this reduces the group's overall mirror gap (safeguard). The residual
+    NES value is then confronted with the imports declared *without* an export
+    mirror, following the note's double-counting rule.
 
     This is the most heuristic step of the methodology and is therefore optional
-    (``apply_nes`` in :func:`run_baci`). "Asia NES" and "Commodities NES" are left
-    untouched.
+    (``apply_nes`` in :func:`run_baci`). "Other Asia, nes" partners are excluded
+    upfront by :func:`build_mirror_flows` (``nes_skip_codes``).
 
     Args:
         config: Column and NES-code conventions.
@@ -1164,6 +1141,20 @@ class AreaNesReallocator:
     ) -> pd.DataFrame:
         """Add reallocated NES value to the reconciled flows.
 
+        Implements the three parts of the note's § NES:
+
+        1. **Reallocation** — for each ``(exporter, product, year)`` where the
+           exporter under-declares on complete mirror flows (``Σ V_x < Σ V_m``),
+           the shortfall (capped by the NES value) is distributed across
+           partners proportionally to the per-partner missing imports.
+        2. **Safeguard** — a group's reallocation is kept only when it reduces
+           the group's total mirror gap ``Σ |ln(V_x / V_m)|``.
+        3. **Residual** — the NES value left after reallocation is compared to
+           the imports declared *without* an export mirror: when smaller, it is
+           considered already counted there and dropped to avoid double
+           counting; otherwise only the excess remains and, having no
+           identifiable partner, is discarded (logged).
+
         Args:
             reconciled: Reconciled flows from :meth:`MirrorReconciler.transform`.
             mirror: Mirror-flow table (for per-partner declared/mirror sums).
@@ -1171,9 +1162,12 @@ class AreaNesReallocator:
 
         Returns:
             The reconciled frame with NES value distributed across identified
-            partners (unchanged when there is nothing to reallocate).
+            partners (unchanged when there is nothing to reallocate; missing
+            reconciled values stay missing).
         """
         cfg = self.config
+        keys3 = [_EXP, _PROD, _YEAR]
+        keys4 = [_EXP, _IMP, _PROD, _YEAR]
         if nes.empty:
             return reconciled
 
@@ -1192,127 +1186,109 @@ class AreaNesReallocator:
             )
         )
 
-        # Sommes déclarées et miroirs par (exportateur, produit, année)
+        # Découpage des flux de chaque exportateur : miroirs complets (les deux
+        # déclarations existent) vs imports déclarés sans miroir export
+        detail = mirror[keys4 + ["v_x", "v_m_fob"]].copy()
+        has_x = detail["v_x"] > 0
+        has_m = detail["v_m_fob"] > 0
+        complete = detail[has_x & has_m].copy()
+
+        # Étape 1 — sous-déclaration mesurée sur les miroirs complets :
+        # Σ V_x vs Σ V_m des déclarations miroirs correspondantes
         sums = (
-            mirror.groupby([_EXP, _PROD, _YEAR])
+            complete.groupby(keys3)
             .agg(sum_vx=("v_x", "sum"), sum_vm=("v_m_fob", "sum"))
             .reset_index()
         )
-        sums = sums.merge(nes_value, on=[_EXP, _PROD, _YEAR], how="inner")
-        # Valeur réallouable : min(V_nes, Σ V_m − Σ V_x) lorsque l'exportateur sous-déclare
-        sums["shortfall"] = (sums["sum_vm"] - sums["sum_vx"]).clip(lower=0.0)
-        sums["reallocate"] = np.minimum(sums["v_nes"], sums["shortfall"])
-        sums = sums[sums["reallocate"] > 0]
-        if sums.empty:
+        alloc = nes_value.merge(sums, on=keys3, how="left")
+        alloc[["sum_vx", "sum_vm"]] = alloc[["sum_vx", "sum_vm"]].fillna(0.0)
+        # Valeur réallouable : min(V_nes, Σ V_m − Σ V_x) si l'exportateur sous-déclare
+        alloc["shortfall"] = (alloc["sum_vm"] - alloc["sum_vx"]).clip(lower=0.0)
+        alloc["realloc"] = np.minimum(alloc["v_nes"], alloc["shortfall"])
+
+        # Répartition proportionnelle au manque par partenaire (V_m − V_x > 0)
+        complete["missing"] = (complete["v_m_fob"] - complete["v_x"]).clip(lower=0.0)
+        shares = complete.merge(
+            alloc.loc[alloc["realloc"] > 0, keys3 + ["realloc"]],
+            on=keys3,
+            how="inner",
+        )
+        add: Optional[pd.DataFrame] = None
+        if not shares.empty:
+            group_missing = shares.groupby(keys3)["missing"].transform("sum")
+            shares["share"] = np.where(
+                group_missing > 0, shares["missing"] / group_missing, 0.0
+            )
+            shares["add_value"] = shares["realloc"] * shares["share"]
+
+            # Étape 2 — garde-fou : réallocation d'un groupe conservée
+            # seulement si elle réduit son écart miroir global Σ |ln(V_x/V_m)|
+            shares["_gap_before"] = np.abs(np.log(shares["v_x"] / shares["v_m_fob"]))
+            shares["_gap_after"] = np.abs(
+                np.log((shares["v_x"] + shares["add_value"]) / shares["v_m_fob"])
+            )
+            gaps = (
+                shares.groupby(keys3)
+                .agg(gap_before=("_gap_before", "sum"), gap_after=("_gap_after", "sum"))
+                .reset_index()
+            )
+            improving = gaps.loc[gaps["gap_after"] < gaps["gap_before"], keys3]
+            shares = shares.merge(improving, on=keys3, how="inner")
+            if not shares.empty:
+                add = shares[keys4 + ["add_value"]]
+
+        # Étape 3 — résidu V_nes' confronté aux imports sans miroir V_m' :
+        # inférieur → déjà compté dans V_m' (ramené à zéro, pas de double
+        # compte) ; sinon seul l'excédent subsiste et, sans partenaire
+        # identifiable, il est écarté
+        if add is not None:
+            allocated = (
+                add.groupby(keys3)["add_value"].sum().rename("allocated").reset_index()
+            )
+            residual = alloc.merge(allocated, on=keys3, how="left")
+        else:
+            residual = alloc.copy()
+            residual["allocated"] = 0.0
+        residual["allocated"] = residual["allocated"].fillna(0.0)
+        residual["v_nes_prime"] = (residual["v_nes"] - residual["allocated"]).clip(lower=0.0)
+        vm_prime = (
+            detail[has_m & ~has_x]
+            .groupby(keys3)["v_m_fob"]
+            .sum()
+            .rename("vm_prime")
+            .reset_index()
+        )
+        residual = residual.merge(vm_prime, on=keys3, how="left")
+        residual["vm_prime"] = residual["vm_prime"].fillna(0.0)
+        residual["unallocated"] = np.where(
+            residual["v_nes_prime"] < residual["vm_prime"],
+            0.0,
+            residual["v_nes_prime"] - residual["vm_prime"],
+        )
+
+        if add is None:
+            logger.info(
+                "AreaNesReallocator: aucune réallocation (%.1f de valeur NES, "
+                "%.1f écartés faute de partenaire identifiable)",
+                float(residual["v_nes"].sum()), float(residual["unallocated"].sum()),
+            )
             return reconciled
 
-        # Manque par partenaire : max(V_m − V_x, 0) sur les flux existants
-        detail = mirror[[_EXP, _IMP, _PROD, _YEAR, "v_x", "v_m_fob"]].copy()
-        detail["missing"] = (detail["v_m_fob"].fillna(0.0) - detail["v_x"].fillna(0.0)).clip(lower=0.0)
-        detail = detail.merge(sums[[_EXP, _PROD, _YEAR, "reallocate"]], on=[_EXP, _PROD, _YEAR], how="inner")
-        # Répartition proportionnelle au manque par partenaire
-        group = detail.groupby([_EXP, _PROD, _YEAR])["missing"].transform("sum")
-        detail["share"] = np.where(group > 0, detail["missing"] / group, 0.0)
-        detail["add_value"] = detail["reallocate"] * detail["share"]
-        add = detail.groupby([_EXP, _IMP, _PROD, _YEAR])["add_value"].sum().reset_index()
+        # Ajout de la valeur réallouée aux flux réconciliés ; les flux sans
+        # réallocation (dont les valeurs réconciliées manquantes) restent intacts
+        out = reconciled.merge(add, on=keys4, how="left")
+        add_value = out.pop("add_value").fillna(0.0)
+        out["reconciled_value"] = out["reconciled_value"] + add_value
 
-        # Ajout de la valeur réallouée aux flux réconciliés
-        out = reconciled.merge(add, on=[_EXP, _IMP, _PROD, _YEAR], how="left")
-        out["add_value"] = out["add_value"].fillna(0.0)
-        out["reconciled_value"] = out["reconciled_value"].fillna(0.0) + out["add_value"]
-        n_realloc = int((out["add_value"] > 0).sum())
-        logger.info("AreaNesReallocator: %d flux enrichis par réallocation NES", n_realloc)
-        return out.drop(columns=["add_value"])
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Écriture du résultat (DuckLake)
-# ──────────────────────────────────────────────────────────────────────
-
-# Fonction de détection de l'existence de la fact table d'un schéma
-def _fact_table_exists(
-    conn: duckdb.DuckDBPyConnection, catalog_alias: str, schema: str
-) -> bool:
-    """Return whether ``{schema}.fact_table`` exists in the attached catalog.
-
-    Args:
-        conn: Open DuckLake connection.
-        catalog_alias: Alias of the attached catalog.
-        schema: Target schema.
-
-    Returns:
-        ``True`` if the fact table already exists.
-    """
-    row = conn.execute(
-        "SELECT count(*) FROM duckdb_tables() "
-        "WHERE database_name = ? AND schema_name = ? AND table_name = ?",
-        [catalog_alias, schema, _FACT_TABLE],
-    ).fetchone()
-    return bool(row and row[0] > 0)
-
-
-# Fonction d'écriture du résultat dans le catalogue DuckLake (création ou upsert)
-def _write_result(
-    result: pd.DataFrame,
-    primary_keys: Sequence[str],
-    result_catalog: Union[str, Path],
-    result_data_path: Union[str, Path],
-    result_schema: str,
-) -> bool:
-    """Create or upsert the reconciled table into the result DuckLake catalog.
-
-    Mirrors :func:`macroforecast.trade.vulnerabilities.runner._write_result`:
-    builds the schema on first encounter, upserts by primary key afterwards.
-
-    Args:
-        result: Reconciled flows to persist.
-        primary_keys: Primary-key columns.
-        result_catalog: Path to the result ``.ducklake`` catalog file.
-        result_data_path: Directory for the result Parquet data files.
-        result_schema: Target schema in the result catalog.
-
-    Returns:
-        ``True`` if the schema was created, ``False`` if it was upserted.
-
-    Raises:
-        ValueError: If the update operation reports failure.
-    """
-    # Préparation des répertoires
-    Path(result_data_path).mkdir(parents=True, exist_ok=True)
-    Path(result_catalog).parent.mkdir(parents=True, exist_ok=True)
-
-    # Connexion au catalogue résultat
-    connector = DuckLakeConnector(str(result_catalog), str(result_data_path))
-    conn = connector.connect()
-    try:
-        # Distinction création / mise à jour selon l'existence de la fact table
-        if _fact_table_exists(conn, connector.catalog_alias, result_schema):
-            updater = DatabaseUpdater(
-                connection=conn, categorical_threshold=None, schema=result_schema
-            )
-            success = updater.update_database(
-                result, use_transaction=True, compact_after_update=True
-            )
-            if not success:
-                raise ValueError("DatabaseUpdater reported failure for result table")
-            logger.info("Upserted %d rows into '%s'", len(result), result_schema)
-            return False
-        # Première construction : métadonnées + fact table
-        builder = DuckLakeTablesBuilder(
-            result,
-            categorical_threshold=None,
-            primary_keys=list(primary_keys),
-            connection=conn,
-            schema=result_schema,
-        )
-        builder.build_schema()
         logger.info(
-            "Created schema '%s' with %d rows (primary keys: %s)",
-            result_schema, len(result), list(primary_keys),
+            "AreaNesReallocator: %d flux enrichis (%.1f réalloués, %.1f absorbés "
+            "par les imports sans miroir, %.1f écartés faute de partenaire)",
+            int((add_value > 0).sum()),
+            float(residual["allocated"].sum()),
+            float((residual["v_nes_prime"] - residual["unallocated"]).sum()),
+            float(residual["unallocated"].sum()),
         )
-        return True
-    finally:
-        conn.close()
+        return out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1325,9 +1301,10 @@ class BaciReport:
     """Summary of a BACI reconstruction run.
 
     Attributes:
-        flows: Number of reconciled flows written.
+        flows: Number of reconciled flows produced.
         mean_freight_rate: Mean estimated freight rate over the mirror flows.
-        created: Whether the result schema was created (vs. upserted).
+        created: Whether the result schema was created (vs. upserted); left
+            ``False`` by :func:`run_baci`, set by the caller after persisting.
     """
     flows: int = 0
     mean_freight_rate: float = float("nan")
@@ -1335,8 +1312,11 @@ class BaciReport:
 
 
 # Colonnes COMTRADE nécessaires au redressement
-def _required_columns(config: BaciConfig) -> List[str]:
+def required_columns(config: BaciConfig = DEFAULT_CONFIG) -> List[str]:
     """Return the COMTRADE columns the pipeline reads.
+
+    Lets the caller project only the needed columns when loading the source
+    fact table before handing it to :func:`run_baci`.
 
     Args:
         config: Column conventions.
@@ -1362,41 +1342,35 @@ def _required_columns(config: BaciConfig) -> List[str]:
     )
 
 
-# Fonction d'orchestration : source COMTRADE → redressement → résultat DuckLake
+# Fonction d'orchestration : flux COMTRADE chargés → flux réconciliés
 def run_baci(
-    source_catalog: Union[str, Path],
-    source_data_path: Union[str, Path],
-    result_catalog: Union[str, Path],
-    result_data_path: Union[str, Path],
+    comtrade: pd.DataFrame,
     dist: pd.DataFrame,
     geo: pd.DataFrame,
     *,
-    source_schema: str,
-    result_schema: str = "baci",
     config: BaciConfig = DEFAULT_CONFIG,
     apply_nes: bool = True,
-) -> BaciReport:
-    """Run the BACI reconstruction end to end and write the reconciled flows.
+) -> Tuple[pd.DataFrame, BaciReport]:
+    """Run the BACI reconstruction end to end on already-loaded data.
 
-    Reads the COMTRADE fact table, assembles the CEPII gravity variables, builds
-    the mirror-flow table, applies the six methodological steps in order, and
-    persists the reconciled value and quantity per
-    ``(exporter, importer, product, year)`` into the result DuckLake catalog.
+    Assembles the CEPII gravity variables, builds the mirror-flow table, applies
+    the six methodological steps in order, and returns the reconciled value and
+    quantity per ``(exporter, importer, product, year)``. The function performs
+    no I/O: reading the COMTRADE fact table and persisting the result belong to
+    the caller (see ``scripts/process_baci.py``).
 
     Args:
-        source_catalog: Path to the source COMTRADE ``.ducklake`` catalog file.
-        source_data_path: Directory of the source Parquet data files.
-        result_catalog: Path to the result ``.ducklake`` catalog file.
-        result_data_path: Directory for the result Parquet data files.
+        comtrade: Raw COMTRADE fact-table rows, holding at least the columns
+            returned by :func:`required_columns`.
         dist: Raw ``dist_cepii`` table, already loaded.
         geo: Raw ``geo_cepii`` table, already loaded.
-        source_schema: Schema of the source COMTRADE ``fact_table``.
-        result_schema: Target schema in the result catalog.
         config: Column and methodological conventions.
         apply_nes: Whether to apply the "Areas NES" reallocation step.
 
     Returns:
-        A :class:`BaciReport` summarising the run.
+        A tuple ``(reconciled, report)``: the reconciled flows and the
+        :class:`BaciReport` of the run (``created`` is left ``False``; the
+        caller sets it once the result is persisted).
 
     Raises:
         ValueError: If the reconciliation produces no flow.
@@ -1404,11 +1378,6 @@ def run_baci(
     # Assemblage de la gravité CEPII
     gravity = load_gravity_data(dist, geo, config)
     valid_iso = sorted(set(gravity["iso_o"]) | set(gravity["iso_d"]))
-
-    # Lecture de la table de faits COMTRADE
-    comtrade = read_comtrade_fact_table(
-        source_catalog, source_data_path, source_schema, _required_columns(config)
-    )
 
     # Construction des flux miroirs (+ flux NES mis de côté)
     mirror, nes = build_mirror_flows(comtrade, valid_iso, config)
@@ -1442,17 +1411,5 @@ def run_baci(
     if reconciled.empty:
         raise ValueError("No reconciled flow produced")
 
-    # Écriture du résultat dans le catalogue DuckLake
-    created = _write_result(
-        reconciled,
-        config.primary_keys,
-        result_catalog,
-        result_data_path,
-        result_schema,
-    )
-
-    return BaciReport(
-        flows=len(reconciled),
-        mean_freight_rate=mean_freight_rate,
-        created=created,
-    )
+    report = BaciReport(flows=len(reconciled), mean_freight_rate=mean_freight_rate)
+    return reconciled, report

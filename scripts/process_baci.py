@@ -6,23 +6,34 @@ retrait des coûts de fret, évaluation de la qualité des déclarants, réconci
 pondérée des flux miroirs, réallocation des zones non spécifiées) et écrit les flux
 réconciliés dans une nouvelle base DuckLake résultat.
 
-Tous les chemins proviennent de ``config/baci.yaml`` (jamais écrits en dur) ;
-``BUCKET`` y est explicitement à ``null`` et passé au loader Excel des fichiers
-CEPII, pour préparer une future migration S3. Le chargement de la configuration
-YAML, la construction de la ``BaciConfig`` et la lecture des fichiers Excel CEPII
-sont réalisés ici : ``macroforecast.trade.processing.baci`` ne reçoit que des
-jeux de données déjà chargés et des paramètres déjà résolus. Peut être
-ordonnancé (Argo, cron) ou intégré comme nœud Kedro via la fonction exportée.
+La séparation des rôles est stricte : ``macroforecast.trade.processing.baci`` ne
+contient que la méthodologie (dataframes, noms de colonnes et paramètres en
+entrée) ; le présent script assume tout l'I/O — chargement de la configuration
+YAML, construction de la ``BaciConfig``, lecture des fichiers Excel CEPII,
+lecture de la table de faits COMTRADE (DuckLake) et écriture du résultat
+(DuckLake). Tous les chemins proviennent de ``config/baci.yaml`` (jamais écrits
+en dur) ; ``BUCKET`` y est explicitement à ``null`` et passé au loader Excel des
+fichiers CEPII, pour préparer une future migration S3. Peut être ordonnancé
+(Argo, cron) ou intégré comme nœud Kedro via la fonction exportée.
 """
 
 import argparse
 import logging
 import sys
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence, Union
 
+import duckdb
+import pandas as pd
 import yaml
+
+# Module de gestion de la connexion à la base de données
+from dt_ducklake_manager import (
+    DatabaseUpdater,
+    DuckLakeConnector,
+    DuckLakeTablesBuilder,
+)
 
 # Racine du dépôt (résolution relative à ce fichier)
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,6 +45,9 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Nom de la table de faits DuckLake (convention dt_ducklake_manager)
+_FACT_TABLE = "fact_table"
 
 
 def _resolve(path: str) -> str:
@@ -48,6 +62,144 @@ def _resolve(path: str) -> str:
     # Résolution relative à la racine du dépôt pour les chemins non absolus
     p = Path(path)
     return str(p if p.is_absolute() else ROOT / p)
+
+
+def _sql_path(path: Union[str, Path]) -> str:
+    """Return a forward-slash string form of a path for SQL literals.
+
+    Args:
+        path: Filesystem path.
+
+    Returns:
+        The path as a forward-slash string (portable inside DuckDB literals).
+    """
+    # Slashes avant : portables dans les littéraux DuckDB, y compris sous Windows
+    return Path(path).as_posix()
+
+
+def _read_comtrade_fact_table(
+    source_catalog: Union[str, Path],
+    source_data_path: Union[str, Path],
+    source_schema: str,
+    columns: Sequence[str],
+) -> pd.DataFrame:
+    """Read selected columns of a COMTRADE DuckLake fact table, read-only.
+
+    Uses a hand-rolled ``ATTACH`` with ``OVERRIDE_DATA_PATH true`` rather than
+    ``DuckLakeConnector.connect()``: the connector fails to re-attach an existing
+    catalog under Windows/OneDrive because of a normalised ``DATA_PATH`` mismatch
+    (same workaround as :func:`macroforecast.trade.vulnerabilities.runner._read_source_fact_table`).
+
+    Args:
+        source_catalog: Path to the source ``.ducklake`` catalog file.
+        source_data_path: Directory of the source Parquet data files.
+        source_schema: Schema holding the ``fact_table``.
+        columns: Columns to project.
+
+    Returns:
+        A pandas DataFrame of the projected fact table.
+    """
+    # Connexion DuckDB en mémoire et chargement de l'extension DuckLake
+    conn = duckdb.connect(":memory:")
+    try:
+        conn.execute("INSTALL ducklake; LOAD ducklake;")
+        # Attachement en lecture seule ; OVERRIDE_DATA_PATH tolère un chemin de
+        # données normalisé différemment de celui stocké dans le catalogue.
+        conn.execute(
+            f"ATTACH 'ducklake:{_sql_path(source_catalog)}' AS src "
+            f"(DATA_PATH '{_sql_path(source_data_path)}/', READ_ONLY, "
+            f"OVERRIDE_DATA_PATH true)"
+        )
+        col_list = ", ".join(f'"{c}"' for c in columns)
+        return conn.execute(
+            f"SELECT {col_list} FROM src.{source_schema}.{_FACT_TABLE}"
+        ).df()
+    finally:
+        conn.close()
+
+
+def _fact_table_exists(
+    conn: duckdb.DuckDBPyConnection, catalog_alias: str, schema: str
+) -> bool:
+    """Return whether ``{schema}.fact_table`` exists in the attached catalog.
+
+    Args:
+        conn: Open DuckLake connection.
+        catalog_alias: Alias of the attached catalog.
+        schema: Target schema.
+
+    Returns:
+        ``True`` if the fact table already exists.
+    """
+    row = conn.execute(
+        "SELECT count(*) FROM duckdb_tables() "
+        "WHERE database_name = ? AND schema_name = ? AND table_name = ?",
+        [catalog_alias, schema, _FACT_TABLE],
+    ).fetchone()
+    return bool(row and row[0] > 0)
+
+
+def _write_result(
+    result: pd.DataFrame,
+    primary_keys: Sequence[str],
+    result_catalog: Union[str, Path],
+    result_data_path: Union[str, Path],
+    result_schema: str,
+) -> bool:
+    """Create or upsert the reconciled table into the result DuckLake catalog.
+
+    Mirrors :func:`macroforecast.trade.vulnerabilities.runner._write_result`:
+    builds the schema on first encounter, upserts by primary key afterwards.
+
+    Args:
+        result: Reconciled flows to persist.
+        primary_keys: Primary-key columns.
+        result_catalog: Path to the result ``.ducklake`` catalog file.
+        result_data_path: Directory for the result Parquet data files.
+        result_schema: Target schema in the result catalog.
+
+    Returns:
+        ``True`` if the schema was created, ``False`` if it was upserted.
+
+    Raises:
+        ValueError: If the update operation reports failure.
+    """
+    # Préparation des répertoires
+    Path(result_data_path).mkdir(parents=True, exist_ok=True)
+    Path(result_catalog).parent.mkdir(parents=True, exist_ok=True)
+
+    # Connexion au catalogue résultat
+    connector = DuckLakeConnector(str(result_catalog), str(result_data_path))
+    conn = connector.connect()
+    try:
+        # Distinction création / mise à jour selon l'existence de la fact table
+        if _fact_table_exists(conn, connector.catalog_alias, result_schema):
+            updater = DatabaseUpdater(
+                connection=conn, categorical_threshold=None, schema=result_schema
+            )
+            success = updater.update_database(
+                result, use_transaction=True, compact_after_update=True
+            )
+            if not success:
+                raise ValueError("DatabaseUpdater reported failure for result table")
+            logger.info("Upserted %d rows into '%s'", len(result), result_schema)
+            return False
+        # Première construction : métadonnées + fact table
+        builder = DuckLakeTablesBuilder(
+            result,
+            categorical_threshold=None,
+            primary_keys=list(primary_keys),
+            connection=conn,
+            schema=result_schema,
+        )
+        builder.build_schema()
+        logger.info(
+            "Created schema '%s' with %d rows (primary keys: %s)",
+            result_schema, len(result), list(primary_keys),
+        )
+        return True
+    finally:
+        conn.close()
 
 
 def load_baci_config(config_path: str) -> Dict:
@@ -71,9 +223,10 @@ def load_baci_config(config_path: str) -> Dict:
 def baci_config_from_params(params: Optional[Dict]):
     """Build a ``BaciConfig`` from the YAML ``parameters`` section.
 
-    Only the keys present in the mapping override the dataclass defaults; every
-    other field keeps its ``BaciConfig`` default. Country lists and pairs are
-    coerced to the tuple types expected by the frozen dataclass.
+    Generic construction: every key matching a ``BaciConfig`` field name
+    overrides the dataclass default; unknown keys are ignored with a warning.
+    YAML lists are coerced to the tuple types expected by the frozen dataclass
+    (including nested pairs such as ``excluded_pairs``).
 
     Args:
         params: The ``parameters`` mapping of ``config/baci.yaml`` (or ``None``).
@@ -81,44 +234,25 @@ def baci_config_from_params(params: Optional[Dict]):
     Returns:
         A ``BaciConfig`` reflecting the configured overrides.
     """
-    from macroforecast.trade.processing import DEFAULT_CONFIG
+    from macroforecast.trade.processing import BaciConfig, DEFAULT_CONFIG
 
     # Aucune surcharge : configuration par défaut
     if not params:
         return DEFAULT_CONFIG
 
+    # Surcharge générique champ à champ, avec coercition listes → tuples
+    valid = {f.name for f in fields(BaciConfig)}
     overrides: Dict[str, object] = {}
-    # Variable de distance
-    if params.get("distance_column"):
-        overrides["distance_column"] = params["distance_column"]
-    # Seuils de conversion en tonnes
-    tonnage = params.get("tonnage") or {}
-    if "min_mirror_flows" in tonnage:
-        overrides["min_mirror_flows"] = int(tonnage["min_mirror_flows"])
-    if "max_std" in tonnage:
-        overrides["max_conversion_std"] = float(tonnage["max_std"])
-    # Robustesse de la gravité
-    gravity = params.get("gravity") or {}
-    if "cook_factor" in gravity:
-        overrides["cook_factor"] = float(gravity["cook_factor"])
-    # Listes de pays
-    countries = params.get("countries") or {}
-    if "non_cif" in countries:
-        overrides["non_cif_countries"] = tuple(countries["non_cif"])
-    if "fas" in countries:
-        overrides["fas_countries"] = tuple(countries["fas"])
-    # Exclusions géographiques
-    exclusions = params.get("exclusions") or {}
-    if "reexport_reporters" in exclusions:
-        overrides["reexport_reporters"] = tuple(exclusions["reexport_reporters"])
-    if "excluded_pairs" in exclusions:
-        overrides["excluded_pairs"] = tuple(tuple(p) for p in exclusions["excluded_pairs"])
-    # Zones non spécifiées
-    nes = params.get("nes") or {}
-    if "partner_codes" in nes:
-        overrides["nes_partner_codes"] = tuple(int(c) for c in nes["partner_codes"])
-    if "skip_codes" in nes:
-        overrides["nes_skip_codes"] = tuple(int(c) for c in nes["skip_codes"])
+    for key, value in params.items():
+        if key not in valid:
+            logger.warning("Paramètre BACI inconnu ignoré : %s", key)
+            continue
+        default = getattr(DEFAULT_CONFIG, key)
+        if isinstance(default, tuple) and isinstance(value, (list, tuple)):
+            value = tuple(
+                tuple(v) if isinstance(v, (list, tuple)) else v for v in value
+            )
+        overrides[key] = value
 
     return replace(DEFAULT_CONFIG, **overrides)
 
@@ -134,7 +268,7 @@ def run(config_path: str, apply_nes: bool = True):
         The :class:`~macroforecast.trade.processing.BaciReport` of the run.
     """
     from macroforecast.storage2 import Loader
-    from macroforecast.trade.processing import run_baci
+    from macroforecast.trade.processing import required_columns, run_baci
 
     # Chargement de la configuration (chemins + paramètres méthodologiques)
     config = load_baci_config(config_path)
@@ -147,18 +281,26 @@ def run(config_path: str, apply_nes: bool = True):
     dist = excel_loader.load(_resolve(paths["dist_cepii"]), bucket=bucket)
     geo = excel_loader.load(_resolve(paths["geo_cepii"]), bucket=bucket)
 
-    # Exécution du redressement sur les jeux de données déjà chargés
-    report = run_baci(
-        source_catalog=_resolve(paths["comtrade_catalog"]),
-        source_data_path=_resolve(paths["comtrade_data"]),
-        result_catalog=_resolve(paths["result_catalog"]),
-        result_data_path=_resolve(paths["result_data"]),
-        dist=dist,
-        geo=geo,
-        source_schema=paths["comtrade_schema"],
-        result_schema=paths["result_schema"],
-        config=baci_config,
-        apply_nes=apply_nes,
+    # Lecture de la table de faits COMTRADE (DuckLake, lecture seule)
+    comtrade = _read_comtrade_fact_table(
+        _resolve(paths["comtrade_catalog"]),
+        _resolve(paths["comtrade_data"]),
+        paths["comtrade_schema"],
+        required_columns(baci_config),
+    )
+
+    # Application de la méthodologie sur les jeux de données chargés
+    reconciled, report = run_baci(
+        comtrade, dist, geo, config=baci_config, apply_nes=apply_nes
+    )
+
+    # Écriture du résultat dans le catalogue DuckLake
+    report.created = _write_result(
+        reconciled,
+        baci_config.primary_keys,
+        _resolve(paths["result_catalog"]),
+        _resolve(paths["result_data"]),
+        paths["result_schema"],
     )
     logger.info("Redressement BACI terminé : %s", report)
     return report

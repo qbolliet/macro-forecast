@@ -4,12 +4,12 @@ from .baci import (
     BaciConfig,
     DEFAULT_CONFIG,
 )
-# Chargement des données
+# Préparation des données
 from .baci import (
     load_gravity_data,
-    read_comtrade_fact_table,
     build_mirror_flows,
     world_median_unit_values,
+    required_columns,
 )
 # Étapes du redressement
 from .baci import (
@@ -32,11 +32,11 @@ __all__ = [
     # Configuration
     "BaciConfig",
     "DEFAULT_CONFIG",
-    # Chargement des données
+    # Préparation des données
     "load_gravity_data",
-    "read_comtrade_fact_table",
     "build_mirror_flows",
     "world_median_unit_values",
+    "required_columns",
     # Étapes du redressement
     "TonnageConverter",
     "CifGravityModel",

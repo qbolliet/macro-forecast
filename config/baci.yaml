@@ -22,32 +22,26 @@ paths:
   result_data:      data/baci
   result_schema:    baci
 
-# Paramètres méthodologiques (surchargent les défauts de BaciConfig)
+# Paramètres méthodologiques : toute clé portant le nom d'un champ de
+# BaciConfig surcharge le défaut correspondant (listes YAML → tuples) ;
+# les clés inconnues sont ignorées avec un avertissement.
 parameters:
   # Variable de distance pondérée population (dist_cepii)
   distance_column: distw
-  # Étape de conversion des quantités en tonnes
-  tonnage:
-    min_mirror_flows: 10
-    max_std: 2.5
+  # Étape de conversion des quantités en tonnes (validation des taux)
+  min_mirror_flows: 10
+  max_conversion_std: 2.5
   # Robustesse de l'équation de gravité (seuil de distance de Cook = facteur / n)
-  gravity:
-    cook_factor: 4.0
-  # Listes de pays (codes ISO-3)
-  countries:
-    # Pays ne déclarant pas leurs importations en CAF (fret jamais retiré)
-    non_cif: [DZA, GEO, ZAF, BWA, LSO, NAM, SWZ]
-    # Pays déclarant en FAS (fret retiré seulement si l'écart miroir diminue)
-    fas:     [CAN]
-  # Exclusions géographiques
-  exclusions:
-    # Réexportations supprimées (déjà exclues en ne gardant que les flux M/X)
-    reexport_reporters: [HKG, USA]
-    # Paires dont les flux internes sont écartés
-    excluded_pairs:     [[BEL, LUX]]
-  # Zones non spécifiées (codes partenaires M49)
-  nes:
-    # « Areas, nes » éligibles à la réallocation
-    partner_codes: [899]
-    # « Other Asia, nes » laissé de côté (Commodities nes exclu au niveau produit)
-    skip_codes:    [490]
+  cook_factor: 4.0
+  # Pays ne déclarant pas leurs importations en CAF (fret jamais retiré)
+  non_cif_countries: [DZA, GEO, ZAF, BWA, LSO, NAM, SWZ]
+  # Pays déclarant en FAS (fret retiré seulement si l'écart miroir diminue)
+  fas_countries: [CAN]
+  # Paires dont les flux internes sont écartés
+  excluded_pairs: [[BEL, LUX]]
+  # Code partenaire M49 de l'agrégat Monde (lignes écartées en amont)
+  world_partner_code: 0
+  # « Areas, nes » éligibles à la réallocation (codes partenaires M49)
+  nes_partner_codes: [899]
+  # Agrégats laissés de côté et écartés des données (« Other Asia, nes »)
+  nes_skip_codes: [490]
