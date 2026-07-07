@@ -1,5 +1,4 @@
 # Importation des modules
-import json
 from typing import Optional
 import pandas as pd
 
@@ -9,7 +8,7 @@ from ._connection import _S3Connection
 
 # Classe de chargement de données depuis S3
 class S3Loader(_S3Connection):
-    """Load JSON data from Amazon S3 buckets.
+    """Load xls data from Amazon S3 buckets.
 
     Args:
         s3_package (str, optional): Package to use for S3 connections
@@ -20,13 +19,13 @@ class S3Loader(_S3Connection):
         s3_package (str): The package being used for S3 connectivity.
 
     Examples:
-        Load JSON from S3 using boto3:
+        Load an xls file from S3 using boto3:
         >>> loader = S3Loader()
         >>> loader.connect(
         ...     aws_access_key_id='YOUR_KEY',
         ...     aws_secret_access_key='YOUR_SECRET'
         ... )
-        >>> data = loader.load(bucket='my-bucket', key='path/to/file.json')
+        >>> data = loader.load(bucket='my-bucket', key='path/to/file.xls')
     """
 
     # Initialisation
@@ -66,7 +65,7 @@ class S3Loader(_S3Connection):
             ValueError: If the key does not end in ``.xls``.
 
         Examples:
-            >>> data = loader.load(bucket='my-bucket', key='data/my-data.xlsx')
+            >>> data = loader.load(bucket='my-bucket', key='data/my-data.xls')
         """
         # Extraction de l'extension
         extension = key.rsplit(".", 1)[-1].lower()
@@ -78,7 +77,7 @@ class S3Loader(_S3Connection):
         # Etablissement d'une connexion si nécessaire
         if not hasattr(self, "s3"):
             self.connect()
-        # Chargement du fichier JSON
+        # Chargement du fichier xls
         if self.s3_package == "boto3":
             s3_file = self.s3.get_object(Bucket=bucket, Key=key)["Body"]
             return pd.read_excel(s3_file.read(), engine="xlrd", **kwargs)
