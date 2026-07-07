@@ -1,0 +1,53 @@
+# Configuration du redressement BACI des flux de commerce international.
+#
+# Tous les chemins sont externalisés ici (jamais écrits en dur dans le module).
+# BUCKET est explicitement à null : il est passé tel quel via bucket=config['BUCKET']
+# au loader des fichiers CEPII (load_gravity_data), pour préparer une future
+# migration S3 (bucket None → lecture locale ; bucket défini → s3://bucket/... ).
+
+# Bucket S3 des fichiers CEPII (null → lecture locale via le loader)
+BUCKET: null
+
+# Chemins des données (relatifs à la racine du dépôt, résolus par l'appelant)
+paths:
+  # Source COMTRADE (catalogue DuckLake produit par scripts/download_comtrade.py)
+  comtrade_catalog: data/comtrade.ducklake
+  comtrade_data:    data/comtrade
+  comtrade_schema:  C_A_HS
+  # Variables de gravité CEPII
+  dist_cepii:       data/dist_cepii.xls
+  geo_cepii:        data/geo_cepii.xls
+  # Résultat (nouvelle base DuckLake créée par run_baci)
+  result_catalog:   data/baci.ducklake
+  result_data:      data/baci
+  result_schema:    baci
+
+# Paramètres méthodologiques (surchargent les défauts de BaciConfig)
+parameters:
+  # Variable de distance pondérée population (dist_cepii)
+  distance_column: distw
+  # Étape de conversion des quantités en tonnes
+  tonnage:
+    min_mirror_flows: 10
+    max_std: 2.5
+  # Robustesse de l'équation de gravité (seuil de distance de Cook = facteur / n)
+  gravity:
+    cook_factor: 4.0
+  # Listes de pays (codes ISO-3)
+  countries:
+    # Pays ne déclarant pas leurs importations en CAF (fret jamais retiré)
+    non_cif: [DZA, GEO, ZAF, BWA, LSO, NAM, SWZ]
+    # Pays déclarant en FAS (fret retiré seulement si l'écart miroir diminue)
+    fas:     [CAN]
+  # Exclusions géographiques
+  exclusions:
+    # Réexportations supprimées (déjà exclues en ne gardant que les flux M/X)
+    reexport_reporters: [HKG, USA]
+    # Paires dont les flux internes sont écartés
+    excluded_pairs:     [[BEL, LUX]]
+  # Zones non spécifiées (codes partenaires M49)
+  nes:
+    # « Areas, nes » éligibles à la réallocation
+    partner_codes: [899]
+    # « Other Asia, nes » laissé de côté (Commodities nes exclu au niveau produit)
+    skip_codes:    [490]
